@@ -1,0 +1,134 @@
+"""Budget Manager (REVISIONS-1.1 R6)。
+
+预算控制在 Agent Runtime（不是 Tool Gateway）: 只有发起 LLM 调用的地方
+才能完整统计多轮对话的输入/输出 Token。
+
+执行逻辑:
+    reserve(estimate) → [模型调用] → settle(actual) / release(r)
+    超预算的 reserve 抛 BudgetExhausted → 调查以当前已知结果收尾。
+
+线程安全说明: P0 单 Worker 串行调查，不设锁；多 Worker 时在 Orchestrator 层
+为每个 Run 分配独立 BudgetManager 实例。
+"""
+from __future__ import annotations
+
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Literal
+
+DEFAULT_MAX_TOKENS = 100_000  # 工程上限（REVISIONS-1.1 R6），不是平均预期
+
+
+class BudgetExhausted(Exception):
+    """预算耗尽/超限。调查流程捕获后走 Inconclusive 收尾，不重试。"""
+
+
+@dataclass
+class Reservation:
+    id: str
+    purpose: str
+    estimate: int
+    settled: bool = False
+    actual: int | None = None
+
+
+@dataclass
+class _LedgerEntry:
+    purpose: str
+    estimate: int
+    actual: int
+    at_epoch: float = field(default_factory=time.time)
+
+
+class BudgetManager:
+    def __init__(
+        self,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        max_tool_calls: int = 50,
+        max_rounds: int = 10,
+        deadline_seconds: float | None = None,
+    ) -> None:
+        self.max_tokens = max_tokens
+        self.max_tool_calls = max_tool_calls
+        self.max_rounds = max_rounds
+        self.deadline_seconds = deadline_seconds
+        self._started = time.monotonic()
+        self._outstanding: dict[str, Reservation] = {}
+        self._tokens_used = 0
+        self._tool_calls = 0
+        self._rounds = 0
+        self._ledger: list[_LedgerEntry] = []
+
+    # ---- token budget (reserve → call → settle/release) ----
+    @property
+    def tokens_used(self) -> int:
+        return self._tokens_used
+
+    @property
+    def tokens_remaining(self) -> int:
+        outstanding = sum(r.estimate for r in self._outstanding.values())
+        return max(0, self.max_tokens - self._tokens_used - outstanding)
+
+    def reserve(self, *, estimate: int, purpose: str) -> Reservation:
+        """调用模型前预留。余额不足直接拒绝——调用不会发生。"""
+        if estimate > self.tokens_remaining:
+            raise BudgetExhausted(
+                f"token budget exhausted: need {estimate}, "
+                f"remaining {self.tokens_remaining} "
+                f"(used {self._tokens_used}, outstanding {sum(r.estimate for r in self._outstanding.values())})"
+            )
+        r = Reservation(id=uuid.uuid4().hex, purpose=purpose, estimate=estimate)
+        self._outstanding[r.id] = r
+        return r
+
+    def settle(self, reservation: Reservation, *, actual: int) -> None:
+        """模型调用完成后按实际用量记账。actual 可超过 estimate（调用已发生）。"""
+        if reservation.settled:
+            return
+        self._outstanding.pop(reservation.id, None)
+        reservation.settled = True
+        reservation.actual = actual
+        self._tokens_used += actual
+        self._ledger.append(_LedgerEntry(purpose=reservation.purpose,
+                                         estimate=reservation.estimate, actual=actual))
+
+    def release(self, reservation: Reservation) -> None:
+        """调用未执行（如模型客户端抛错），释放预留额度。"""
+        self._outstanding.pop(reservation.id, None)
+        reservation.settled = True  # mark terminal, no accounting
+
+    # ---- tool call budget ----
+    def consume_tool_call(self) -> None:
+        self._tool_calls += 1
+        if self._tool_calls > self.max_tool_calls:
+            raise BudgetExhausted(f"tool call budget exhausted: limit {self.max_tool_calls}")
+
+    # ---- round / deadline budget ----
+    def begin_round(self) -> None:
+        self._check_deadline()
+        self._rounds += 1
+        if self._rounds > self.max_rounds:
+            raise BudgetExhausted(f"round budget exhausted: limit {self.max_rounds}")
+
+    def _check_deadline(self) -> None:
+        if self.deadline_seconds is not None and time.monotonic() - self._started > self.deadline_seconds:
+            raise BudgetExhausted(f"deadline exceeded: {self.deadline_seconds}s")
+
+    # ---- persistence ----
+    def snapshot(self) -> dict:
+        """用于 InvestigationRun 持久化的用量快照（blueprint §13.3）。"""
+        return {
+            "tokens_used": self._tokens_used,
+            "tool_calls": self._tool_calls,
+            "rounds": self._rounds,
+            "limits": {
+                "tokens": self.max_tokens,
+                "tool_calls": self.max_tool_calls,
+                "rounds": self.max_rounds,
+            },
+            "ledger": [
+                {"purpose": e.purpose, "estimate": e.estimate, "actual": e.actual, "at": e.at_epoch}
+                for e in self._ledger
+            ],
+        }

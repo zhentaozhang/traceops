@@ -25,9 +25,9 @@ traceops/
 │   ├── events/v1/       #   investigation.requested/updated/completed/failed
 │   └── tests/           #   Python 侧契约测试（CI 种子）
 ├── control-plane/       # Java · Spring Boot（Incident/Alert/Service/Approval/Audit）
-├── agent-runtime/       # Python · LangGraph（Planner/Investigator/Evidence/RCA/Budget）
+├── agent-runtime/       # Python · 证据引擎 + 规则 RCA + 预算 + 工具网关（TDD, 72 tests）
 ├── evaluation/          # 数据集 / 故障场景 / Runner / 指标 / 报告
-└── demo-environment/    # TicketFlow 靶场 + 可观测栈 + Fault Controller
+└── demo-environment/    # 观测栈 + Fault Controller（TicketFlow 靶场后接）
 ```
 
 ## 技术基线（1.1 定稿）
