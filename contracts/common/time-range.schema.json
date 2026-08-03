@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://traceops.dev/contracts/common/time-range.schema.json",
+  "title": "Time Range",
+  "description": "调查时间窗口。所有事件与查询的时间范围统一使用此结构；start 必须 < end，且只允许 UTC RFC 3339。",
+  "type": "object",
+  "required": ["start", "end"],
+  "additionalProperties": false,
+  "properties": {
+    "start": {
+      "type": "string",
+      "format": "date-time",
+      "description": "窗口开始时间（UTC）。"
+    },
+    "end": {
+      "type": "string",
+      "format": "date-time",
+      "description": "窗口结束时间（UTC），必须晚于 start。"
+    }
+  }
+}

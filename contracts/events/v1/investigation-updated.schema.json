@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://traceops.dev/contracts/events/v1/investigation-updated.schema.json",
+  "title": "investigation.updated v1",
+  "description": "Agent Runtime → Control Plane：调查过程中的增量状态更新（节点进度、证据计数、假设变化）。高频事件，消费端只更新最新状态展示，不需要逐条持久化。",
+  "type": "object",
+  "required": ["envelope", "payload"],
+  "additionalProperties": false,
+  "properties": {
+    "envelope": { "$ref": "../../common/event-envelope.schema.json" },
+    "payload": {
+      "type": "object",
+      "required": ["investigation_run_id", "status", "aggregate_version"],
+      "additionalProperties": false,
+      "properties": {
+        "investigation_run_id": { "type": "string" },
+        "status": {
+          "type": "string",
+          "enum": ["RUNNING", "WAITING_FOR_APPROVAL"],
+          "description": "运行中或等待审批（合法挂起态）。终态走 completed/failed 事件。"
+        },
+        "aggregate_version": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Run 版本号，必须比上一条 updated 事件大。"
+        },
+        "current_node": {
+          "type": "string",
+          "description": "LangGraph 当前执行节点名，如 planner / investigator / hypothesis_generator。"
+        },
+        "progress": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "step_index": { "type": "integer", "minimum": 0 },
+            "step_description": { "type": "string" },
+            "evidence_count": { "type": "integer", "minimum": 0 },
+            "hypothesis_count": { "type": "integer", "minimum": 0 },
+            "tool_call_count": { "type": "integer", "minimum": 0 },
+            "tokens_used": { "type": "integer", "minimum": 0 },
+            "rounds_used": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "needs_human": {
+          "type": "boolean",
+          "default": false,
+          "description": "status=WAITING_FOR_APPROVAL 时必须为 true。"
+        }
+      }
+    }
+  }
+}

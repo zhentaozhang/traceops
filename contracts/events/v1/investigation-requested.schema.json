@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://traceops.dev/contracts/events/v1/investigation-requested.schema.json",
+  "title": "investigation.requested v1",
+  "description": "Control Plane → Agent Runtime：请求对某个 Incident 启动一次 InvestigationRun。Agent Worker 消费后创建 Run、加载上下文并开始调查。",
+  "type": "object",
+  "required": ["envelope", "payload"],
+  "additionalProperties": false,
+  "properties": {
+    "envelope": { "$ref": "../../common/event-envelope.schema.json" },
+    "payload": {
+      "type": "object",
+      "required": ["investigation_run_id", "incident_id", "environment", "time_range", "config_version"],
+      "additionalProperties": false,
+      "properties": {
+        "investigation_run_id": {
+          "type": "string",
+          "description": "本次调查的全局唯一 Run ID。消费端以此做幂等检查（重复事件不重复建 Run）。"
+        },
+        "incident_id": { "type": "string" },
+        "environment": {
+          "type": "string",
+          "description": "调查目标环境标识，如 prod / staging。"
+        },
+        "time_range": { "$ref": "../../common/time-range.schema.json" },
+        "config_version": {
+          "type": "string",
+          "description": "调查配置快照版本（模型、Prompt、策略、工具 Schema）。Run 恢复时按此版本取配置。"
+        },
+        "priority": {
+          "type": "string",
+          "enum": ["low", "normal", "high"],
+          "default": "normal"
+        },
+        "budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_tool_calls": { "type": "integer", "minimum": 1 },
+            "max_rounds": { "type": "integer", "minimum": 1 },
+            "max_tokens": { "type": "integer", "minimum": 1000 },
+            "deadline_seconds": { "type": "integer", "minimum": 30 }
+          },
+          "description": "本次调查的执行预算；未提供时使用 Agent Runtime 默认预算（如 100000 tokens）。"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "envelope": { "properties": { "event_type": { "const": "investigation.requested" } } } }
+      },
+      "then": {
+        "properties": {
+          "envelope": { "properties": { "producer": { "const": "control-plane" } } }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://traceops.dev/contracts/common/event-envelope.schema.json",
+  "title": "Event Envelope",
+  "description": "TraceOps 跨系统事件统一信封。Redis Streams 消息体固定为 {envelope, payload} 两层；envelope 负责去重、追踪与版本，payload 由各事件 schema 单独约束。",
+  "type": "object",
+  "required": [
+    "event_id",
+    "event_type",
+    "schema_version",
+    "occurred_at",
+    "correlation_id",
+    "producer"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "pattern": "^evt-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "description": "全局唯一事件 ID（UUIDv4，evt- 前缀）。消费端以此做幂等去重。"
+    },
+    "event_type": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$",
+      "description": "事件类型，点分小写，如 investigation.requested"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+$",
+      "description": "契约版本（semver 前两位）。消费端只接受自身支持的主版本。"
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "事件发生时间（RFC 3339 UTC）。"
+    },
+    "correlation_id": {
+      "type": "string",
+      "description": "全链路关联 ID，通常为 incident_id，贯穿一次事故的所有事件。"
+    },
+    "causation_id": {
+      "type": ["string", "null"],
+      "description": "触发本事件的上游事件 ID；顶层事件为 null。"
+    },
+    "aggregate_id": {
+      "type": "string",
+      "description": "聚合根 ID（如 investigation run id）。"
+    },
+    "aggregate_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "聚合根版本号，单调递增，消费端用于检测乱序。"
+    },
+    "producer": {
+      "type": "string",
+      "enum": ["control-plane", "agent-runtime", "evaluation", "fault-controller"],
+      "description": "事件生产者标识。"
+    }
+  }
+}

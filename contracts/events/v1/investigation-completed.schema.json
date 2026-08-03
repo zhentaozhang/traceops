@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://traceops.dev/contracts/events/v1/investigation-completed.schema.json",
+  "title": "investigation.completed v1",
+  "description": "Agent Runtime → Control Plane：一次调查到达终态 COMPLETED。payload 携带诊断结论摘要与报告引用；完整报告由 Control Plane 按 rca_report_id 通过内部 API 拉取（大对象不进消息体）。",
+  "type": "object",
+  "required": ["envelope", "payload"],
+  "additionalProperties": false,
+  "properties": {
+    "envelope": { "$ref": "../../common/event-envelope.schema.json" },
+    "payload": {
+      "type": "object",
+      "required": ["investigation_run_id", "diagnosis_status", "rca_report_ref"],
+      "additionalProperties": false,
+      "properties": {
+        "investigation_run_id": { "type": "string" },
+        "diagnosis_status": {
+          "type": "string",
+          "enum": ["SUPPORTED", "REFUTED", "INCONCLUSIVE"],
+          "description": "诊断状态：INCONCLUSIVE 是合法结果，表示证据不足。"
+        },
+        "rca_report_ref": {
+          "type": "string",
+          "description": "RCA 报告的引用（run_id 内的持久化对象 ID 或存储 URI）。消息体不携带完整报告。"
+        },
+        "root_cause_candidates": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "required": ["candidate_service", "rank"],
+            "additionalProperties": false,
+            "properties": {
+              "candidate_service": { "type": "string" },
+              "candidate_component": { "type": ["string", "null"] },
+              "fault_type": { "type": ["string", "null"] },
+              "rank": { "type": "integer", "minimum": 1 },
+              "hypothesis_status": {
+                "type": "string",
+                "enum": ["supported", "refuted", "inconclusive", "proposed", "investigating"]
+              }
+            }
+          }
+        },
+        "evidence_summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "total": { "type": "integer", "minimum": 0 },
+            "metrics": { "type": "integer", "minimum": 0 },
+            "logs": { "type": "integer", "minimum": 0 },
+            "traces": { "type": "integer", "minimum": 0 },
+            "events": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "usage": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "tool_calls": { "type": "integer", "minimum": 0 },
+            "tokens": { "type": "integer", "minimum": 0 },
+            "rounds": { "type": "integer", "minimum": 0 },
+            "duration_seconds": { "type": "integer", "minimum": 0 }
+          },
+          "description": "实际消耗，用于成本统计与实验指标。"
+        },
+        "abstained": {
+          "type": "boolean",
+          "default": false,
+          "description": "是否主动放弃确定性诊断（Abstention 指标来源）。与 INCONCLUSIVE 的区别：abstained 是决策，INCONCLUSIVE 是结论类型。"
+        }
+      }
+    }
+  }
+}

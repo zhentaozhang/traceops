@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://traceops.dev/contracts/events/v1/investigation-failed.schema.json",
+  "title": "investigation.failed v1",
+  "description": "Agent Runtime → Control Plane：调查异常终止（FAILED 或 CANCELLED）。Incident 保持开放，可重新发起调查。payload 必须携带可操作的原因分类，禁止只给自由文本。",
+  "type": "object",
+  "required": ["envelope", "payload"],
+  "additionalProperties": false,
+  "properties": {
+    "envelope": { "$ref": "../../common/event-envelope.schema.json" },
+    "payload": {
+      "type": "object",
+      "required": ["investigation_run_id", "terminal_status", "failure_reason", "retryable"],
+      "additionalProperties": false,
+      "properties": {
+        "investigation_run_id": { "type": "string" },
+        "terminal_status": {
+          "type": "string",
+          "enum": ["FAILED", "CANCELLED"]
+        },
+        "failure_reason": {
+          "type": "string",
+          "enum": [
+            "BUDGET_EXHAUSTED",
+            "DEADLINE_EXCEEDED",
+            "MODEL_UNAVAILABLE",
+            "MODEL_TIMEOUT",
+            "MCP_SERVER_UNAVAILABLE",
+            "DATASOURCE_QUERY_ERROR",
+            "DATASOURCE_MISSING",
+            "EVIDENCE_WRITE_ERROR",
+            "CHECKPOINT_RESTORE_FAILED",
+            "INVALID_REQUEST",
+            "CANCELLED_BY_USER",
+            "INTERNAL_ERROR"
+          ],
+          "description": "枚举化的失败原因；未覆盖的新类型必须先扩 schema 再使用。"
+        },
+        "retryable": {
+          "type": "boolean",
+          "description": "true 时 Control Plane 可自动或人工重新派发；false 需人工介入。"
+        },
+        "error_detail": {
+          "type": "string",
+          "maxLength": 2000,
+          "description": "补充细节（异常摘要、失败节点等），不放堆栈全文。"
+        },
+        "failed_node": {
+          "type": "string",
+          "description": "失败时的 LangGraph 节点名。"
+        },
+        "checkpoint_id": {
+          "type": ["string", "null"],
+          "description": "最近一次有效 Checkpoint；恢复调查时以此为起点。"
+        },
+        "usage_at_failure": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "tool_calls": { "type": "integer", "minimum": 0 },
+            "tokens": { "type": "integer", "minimum": 0 },
+            "rounds": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    }
+  }
+}
