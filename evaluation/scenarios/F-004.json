@@ -1,0 +1,18 @@
+{
+  "scenario_id": "F-004",
+  "name": "Availability degradation (metrics only)",
+  "description": "只有错误率指标可见：inventory-service 5xx 从 1% 升到 40%。验证仅凭指标能形成可支持的假设。",
+  "service_hint": "inventory-service",
+  "fault_start": "2026-10-30T10:02:00Z",
+  "window_start": "2026-10-30T10:00:00Z",
+  "window_end": "2026-10-30T10:05:00Z",
+  "signals": {
+    "error_rate_series": [0.01, 0.012, 0.40]
+  },
+  "ground_truth": {
+    "service": "inventory-service",
+    "component": null,
+    "fault_type": "availability_degradation",
+    "expected_diagnosis": "SUPPORTED"
+  }
+}

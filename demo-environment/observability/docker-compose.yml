@@ -1,0 +1,82 @@
+# TraceOps P0 观测栈：Prometheus + Loki + Tempo + Grafana（+ Grafana MCP 所需）
+#
+# 用法:
+#   docker compose up -d
+#   Grafana      http://localhost:3000   (admin / admin)
+#   Prometheus   http://localhost:9090
+#   Loki         http://localhost:3100
+#   Tempo        http://localhost:3200
+#
+# 说明: 这是"能接上适配器的最小集合"，不含 TicketFlow 业务服务与故障注入
+# （见 技术验证记录 S4/S5，需要靶场代码就位后补）。
+
+name: traceops-observability
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  loki:
+    image: grafana/loki:3.1.0
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/local-config.yaml:ro
+    ports:
+      - "3100:3100"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3100/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+
+  tempo:
+    image: grafana/tempo:2.5.0
+    command: -config.file=/etc/tempo/tempo-config.yml
+    volumes:
+      - ./tempo/tempo-config.yml:/etc/tempo/tempo-config.yml:ro
+    ports:
+      - "3200:3200"   # http query
+      - "4317:4317"   # otlp grpc
+      - "4318:4318"   # otlp http
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3200/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # MCP 用只读 service account，这里先关闭匿名访问
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+      tempo:
+        condition: service_healthy
+
+volumes:
+  grafana-data:

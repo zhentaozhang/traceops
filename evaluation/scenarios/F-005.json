@@ -1,0 +1,32 @@
+{
+  "scenario_id": "F-005",
+  "name": "Config change cascade with propagation chain",
+  "description": "REVISIONS-1.1 R4 核心场景：错误配置 T0 -> 资源耗尽 T1 -> 上游受影响 T2 -> 业务损伤 T4。ground truth 为单一初始根因 + 传播链；P0 只能采集单服务证据，因此 chain 只声明、不自动校验（见 EVALUATION.md 局限）。",
+  "service_hint": "order-service",
+  "fault_start": "2026-10-30T10:02:30Z",
+  "window_start": "2026-10-30T10:00:00Z",
+  "window_end": "2026-10-30T10:05:00Z",
+  "signals": {
+    "error_rate_series": [0.006, 0.11, 0.42],
+    "error_logs": [
+      "ERROR order-service: redis pool exhausted, 2100ms waiting for connection",
+      "ERROR order-service: request failed after retry - upstream api-gateway returned 502"
+    ],
+    "slow_spans": [
+      { "name": "redis.command", "duration_ms": 2100 },
+      { "name": "http.gateway.dispatch", "duration_ms": 2600 }
+    ],
+    "config_change": {
+      "changed_at": "2026-10-30T10:01:00Z",
+      "component": "redis-connection-pool",
+      "summary": "maxPoolSize reduced 20 -> 2"
+    }
+  },
+  "ground_truth": {
+    "service": "order-service",
+    "component": "redis-connection-pool",
+    "fault_type": "pool_exhaustion",
+    "expected_diagnosis": "SUPPORTED",
+    "propagation_chain": ["redis-connection-pool", "order-service", "api-gateway"]
+  }
+}

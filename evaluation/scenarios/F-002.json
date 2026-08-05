@@ -1,0 +1,20 @@
+{
+  "scenario_id": "F-002",
+  "name": "Downstream dependency timeout (logs only)",
+  "description": "只有错误日志可见：payment-service 调 billing-api 超时。验证系统能否只靠日志定位服务与故障机制。",
+  "service_hint": "payment-service",
+  "fault_start": "2026-10-30T10:02:00Z",
+  "window_start": "2026-10-30T10:00:00Z",
+  "window_end": "2026-10-30T10:05:00Z",
+  "signals": {
+    "error_logs": [
+      "ERROR payment-service: downstream timeout calling billing-api after 3000ms"
+    ]
+  },
+  "ground_truth": {
+    "service": "payment-service",
+    "component": null,
+    "fault_type": "dependency_timeout",
+    "expected_diagnosis": "SUPPORTED"
+  }
+}

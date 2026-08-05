@@ -1,0 +1,16 @@
+{
+  "scenario_id": "F-000",
+  "name": "Healthy control (no injected fault)",
+  "description": "没有任何异常信号。正确的行为是弃权（INCONCLUSIVE），而不是编造根因。",
+  "service_hint": "order-service",
+  "fault_start": "2026-10-30T10:03:00Z",
+  "window_start": "2026-10-30T10:00:00Z",
+  "window_end": "2026-10-30T10:05:00Z",
+  "signals": {},
+  "ground_truth": {
+    "service": "order-service",
+    "component": null,
+    "fault_type": "none",
+    "expected_diagnosis": "INCONCLUSIVE"
+  }
+}

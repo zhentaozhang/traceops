@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# 靶场服务就位后在这里追加 scrape_configs（job_name: order-service 等）。
+# 现在留空是有意的：没有 target 时 Prometheus 不会凭空产生指标，
+# 也让"适配器查不到数据"这条失败路径可被真实验证。
+scrape_configs: []

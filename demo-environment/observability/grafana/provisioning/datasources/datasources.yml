@@ -1,0 +1,30 @@
+apiVersion: 1
+
+# 固定 uid：MCPDatasourceAdapters 与 adapters.py 默认 uid 与此一致，
+# 改这里就要同步改代码默认值。
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      # Trace → Log 跳转走 Derived Fields（不把 trace_id 做标签索引）
+      derivedFields:
+        - name: traceId
+          matcherRegex: '"trace_id":"([0-9a-f]{16,32})"'
+          url: '$${__value.raw}'
+          datasourceUid: tempo
+
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200

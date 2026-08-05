@@ -1,0 +1,29 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: traceops-control-plane
+  datasource:
+    url: ${TRACEOPS_DB_URL:jdbc:h2:mem:traceops;DB_CLOSE_DELAY=-1}
+    username: ${TRACEOPS_DB_USER:sa}
+    password: ${TRACEOPS_DB_PASSWORD:}
+  jpa:
+    hibernate:
+      ddl-auto: ${TRACEOPS_DDL_AUTO:create-drop}
+    open-in-view: false
+
+traceops:
+  events:
+    redis:
+      enabled: ${TRACEOPS_EVENTS_REDIS_ENABLED:false}
+  outbox:
+    relay-enabled: ${TRACEOPS_OUTBOX_RELAY_ENABLED:true}
+    relay-interval-ms: 1000
+  investigation:
+    environment: ${TRACEOPS_ENVIRONMENT:demo}
+    config-version: ${TRACEOPS_CONFIG_VERSION:cfg-2026.10}
+
+logging:
+  level:
+    dev.traceops: INFO

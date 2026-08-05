@@ -129,7 +129,8 @@ def _context(adapters, *, budget: BudgetManager | None = None) -> RunContext:
     )
 
 
-def test_e2e_produces_supported_report_with_cited_evidence() -> None:
+def test_e2e_tie_is_reported_as_ambiguous_not_overclaimed() -> None:
+    """三条证据各生成一个候选、得分相同 → 必须弃权（歧义），不能任选一个当根因。"""
     payloads = _redis_pool_payloads()
     adapters = ScriptedAdapters()
     adapters.error_rate_payload = payloads["error_rate"]
@@ -139,11 +140,12 @@ def test_e2e_produces_supported_report_with_cited_evidence() -> None:
 
     result = run_investigation(_request(), ctx)
 
-    assert result.status == "SUPPORTED"
+    assert result.status == "INCONCLUSIVE"
     report = result.report
     assert report is not None
-    assert report.diagnosis_status == "SUPPORTED"
-    assert report.abstained is False
+    assert report.diagnosis_status == "INCONCLUSIVE"
+    assert report.abstained is True
+    assert "Ambiguous evidence" in report.summary
     assert report.hypotheses, "expected at least one hypothesis"
     top = report.hypotheses[0]
     assert top.rank == 1

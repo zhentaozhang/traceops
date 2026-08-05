@@ -35,7 +35,8 @@ def build_report(
     """组装并校验诊断报告。
 
     - 排序结果回写到假设的 rank/status
-    - 诊断状态: 首选 SUPPORTED → SUPPORTED; 全部 REFUTED → REFUTED; 否则 INCONCLUSIVE
+    - 诊断状态: 首选 SUPPORTED → SUPPORTED; 首选与次选同分 → INCONCLUSIVE（歧义）
+      全部 REFUTED → REFUTED; 否则 INCONCLUSIVE
     - INCONCLUSIVE / REFUTED 视为主动放弃确定性诊断 (abstained=True)
     - 生成后必须通过引用完整性校验，否则抛 ReportIntegrityError
     """
@@ -52,7 +53,25 @@ def build_report(
     updated_hypotheses.sort(key=lambda h: (h.rank is None, h.rank or 0))
 
     top = ranked[0] if ranked else None
-    if top is not None and top.status == HypothesisStatus.SUPPORTED:
+    # 歧义闸门：多个候选同分时，选谁是任意的。此时给出单一根因就是过度断言，
+    # 故意降级为 INCONCLUSIVE，并把候选一并写进摘要（R7：不确定性进流程）。
+    tied = (
+        [r for r in ranked if r.status == HypothesisStatus.SUPPORTED and r.score == top.score]
+        if top is not None and top.status == HypothesisStatus.SUPPORTED
+        else []
+    )
+    if len(tied) > 1:
+        names = [
+            f"{h.candidate_service}/{h.fault_type}"
+            for h in updated_hypotheses
+            if h.id in {r.hypothesis_id for r in tied}
+        ]
+        diagnosis = "INCONCLUSIVE"
+        summary = (
+            f"Ambiguous evidence: {len(tied)} candidate root causes are equally supported "
+            f"({', '.join(names)}); no rule discriminates them"
+        )
+    elif top is not None and top.status == HypothesisStatus.SUPPORTED:
         diagnosis = "SUPPORTED"
         lead = next((h for h in updated_hypotheses if h.id == top.hypothesis_id), None)
         if lead is not None:

@@ -32,3 +32,10 @@ dist/
 data/
 logs/
 *.log
+
+# Maven local repo (环境适配：~/.m2 不可写，落在工作区内)
+control-plane/.m2repo/
+control-plane/target/
+
+# Python venv
+.venv/
