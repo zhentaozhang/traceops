@@ -66,6 +66,14 @@ class BudgetManager:
         return self._tokens_used
 
     @property
+    def tool_calls(self) -> int:
+        return self._tool_calls
+
+    @property
+    def rounds(self) -> int:
+        return self._rounds
+
+    @property
     def tokens_remaining(self) -> int:
         outstanding = sum(r.estimate for r in self._outstanding.values())
         return max(0, self.max_tokens - self._tokens_used - outstanding)

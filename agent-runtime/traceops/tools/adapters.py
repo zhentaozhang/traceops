@@ -1,0 +1,455 @@
+"""数据源适配器（蓝图 §4.5 工具层、S2 Spike 的落地实现）。
+
+设计要点：
+- 传输层是可替换的：生产用 `UrllibTransport`，测试用 FakeTransport。
+- 适配器只负责"请求构造 + 响应解析"，不做归一化（归一化在 evidence/normalizer.py）。
+- 返回的 payload 与可观测系统原生格式一致，保证 Evidence 可追溯。
+- `GrafanaMCPClient` 走 MCP JSON-RPC（streamable HTTP），响应可能是 JSON 或 SSE。
+"""
+from __future__ import annotations
+
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from typing import Any, Protocol
+
+
+class TransportError(RuntimeError):
+    """网络层或数据源返回错误。"""
+
+    def __init__(self, message: str, *, status: int | None = None, body: Any = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.body = body
+
+
+class MCPError(RuntimeError):
+    """MCP Server 返回 JSON-RPC 错误或工具执行错误。"""
+
+
+class HttpTransport(Protocol):
+    def get(
+        self,
+        url: str,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float = 10.0,
+    ) -> tuple[int, Any]: ...
+
+    def post(
+        self,
+        url: str,
+        payload: Any,
+        headers: dict[str, str] | None = None,
+        timeout: float = 10.0,
+    ) -> tuple[int, Any]: ...
+
+
+class UrllibTransport:
+    """标准库实现。生产路径，无第三方依赖。
+
+    - 2xx 返回 (status, 解析后的 JSON；非 JSON 时返回文本)
+    - 非 2xx 也返回 (status, body)，由调用方决定是否抛错（适配器统一抛 TransportError）
+    """
+
+    def _request(self, req: urllib.request.Request, timeout: float) -> tuple[int, Any]:
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+                return resp.status, _decode(raw, resp.headers.get("Content-Type", ""))
+        except urllib.error.HTTPError as exc:
+            raw = exc.read()
+            return exc.code, _decode(raw, exc.headers.get("Content-Type", "") if exc.headers else "")
+        except urllib.error.URLError as exc:
+            raise TransportError(f"request to {req.full_url} failed: {exc.reason}") from exc
+
+    def get(
+        self,
+        url: str,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float = 10.0,
+    ) -> tuple[int, Any]:
+        if params:
+            url = f"{url}?{urllib.parse.urlencode(params)}"
+        req = urllib.request.Request(url, headers=headers or {}, method="GET")
+        return self._request(req, timeout)
+
+    def post(
+        self,
+        url: str,
+        payload: Any,
+        headers: dict[str, str] | None = None,
+        timeout: float = 10.0,
+    ) -> tuple[int, Any]:
+        data = json.dumps(payload).encode()
+        merged = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+        merged.update(headers or {})
+        req = urllib.request.Request(url, data=data, headers=merged, method="POST")
+        return self._request(req, timeout)
+
+
+def _decode(raw: bytes, content_type: str) -> Any:
+    text = raw.decode("utf-8", errors="replace")
+    ctype = content_type.lower()
+    if "text/event-stream" in ctype or text.lstrip().startswith("event:"):
+        return text
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def _to_epoch_seconds(value: str | datetime) -> float:
+    if isinstance(value, datetime):
+        return value.timestamp()
+    return _parse_iso(value).timestamp()
+
+
+def _to_nanos(value: str | datetime) -> int:
+    if isinstance(value, datetime):
+        return int(value.timestamp() * 1_000_000_000)
+    return int(_parse_iso(value).timestamp() * 1_000_000_000)
+
+
+def _parse_iso(value: str) -> datetime:
+    # 容忍 Z 后缀
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+class _HttpAdapter:
+    def __init__(self, base_url: str, *, transport: HttpTransport | None = None, timeout: float = 10.0) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.transport = transport or UrllibTransport()
+        self.timeout = timeout
+
+    def _get_json(self, path: str, params: dict[str, Any]) -> Any:
+        status, body = self.transport.get(f"{self.base_url}{path}", params, timeout=self.timeout)
+        if status != 200:
+            raise TransportError(
+                f"{self.base_url}{path} returned HTTP {status}", status=status, body=body
+            )
+        if isinstance(body, dict) and body.get("status") == "error":
+            raise TransportError(f"{self.base_url}{path} returned error: {body.get('error')}", body=body)
+        return body
+
+
+class PrometheusAdapter(_HttpAdapter):
+    def query_range(
+        self,
+        expression: str,
+        start: str | datetime,
+        end: str | datetime,
+        step_seconds: int = 60,
+    ) -> dict[str, Any]:
+        return self._get_json(
+            "/api/v1/query_range",
+            {
+                "query": expression,
+                "start": _to_epoch_seconds(start),
+                "end": _to_epoch_seconds(end),
+                "step": step_seconds,
+            },
+        )
+
+    def query_instant(self, expression: str, when: str | datetime | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"query": expression}
+        if when is not None:
+            params["time"] = _to_epoch_seconds(when)
+        return self._get_json("/api/v1/query", params)
+
+    def service_error_rate(
+        self, service: str, start: str | datetime, end: str | datetime, step_seconds: int = 60
+    ) -> dict[str, Any]:
+        """5xx 占比。假设业务指标为 `http_requests_total{service,status}`。"""
+        total = f'sum(rate(http_requests_total{{service="{service}"}}[1m]))'
+        errors = f'sum(rate(http_requests_total{{service="{service}",status=~"5.."}}[1m]))'
+        expression = f"{errors} / clamp_min({total}, 0.000001)"
+        return self.query_range(expression, start, end, step_seconds=step_seconds)
+
+
+class LokiAdapter(_HttpAdapter):
+    def query_range(
+        self,
+        query: str,
+        start: str | datetime,
+        end: str | datetime,
+        *,
+        limit: int = 200,
+        direction: str = "backward",
+    ) -> dict[str, Any]:
+        return self._get_json(
+            "/loki/api/v1/query_range",
+            {
+                "query": query,
+                "start": str(_to_nanos(start)),
+                "end": str(_to_nanos(end)),
+                "limit": limit,
+                "direction": direction,
+            },
+        )
+
+    def service_logs(
+        self,
+        service: str,
+        start: str | datetime,
+        end: str | datetime,
+        *,
+        filter: str | None = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        logql = f'{{service="{service}"}}'
+        if filter:
+            logql += f' |= "{filter}"'
+        return self.query_range(logql, start, end, limit=limit)
+
+
+class TempoAdapter(_HttpAdapter):
+    def search(
+        self,
+        service: str,
+        start: str | datetime,
+        end: str | datetime,
+        *,
+        limit: int = 20,
+        min_duration_ms: int | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "tags": f"service.name={service}",
+            "start": int(_to_epoch_seconds(start)),
+            "end": int(_to_epoch_seconds(end)),
+            "limit": limit,
+        }
+        if min_duration_ms is not None:
+            params["minDuration"] = f"{min_duration_ms}ms"
+        return self._get_json("/api/search", params)
+
+    def get_trace(self, trace_id: str) -> dict[str, Any]:
+        return self._get_json(f"/api/traces/{trace_id}", {})
+
+    def service_traces(
+        self,
+        service: str,
+        start: str | datetime,
+        end: str | datetime,
+        *,
+        limit: int = 20,
+        min_duration_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """搜索 + 逐个拉取，合并成 TraceNormalizer 可直接消费的 OTLP 风格 payload。"""
+        found = self.search(service, start, end, limit=limit, min_duration_ms=min_duration_ms)
+        trace_ids = [t.get("traceID") for t in found.get("traces", []) if t.get("traceID")]
+        batches: list[Any] = []
+        for trace_id in trace_ids:
+            payload = self.get_trace(trace_id)
+            batches.extend(payload.get("batches", []))
+        return {"traces_considered": len(trace_ids), "batches": batches}
+
+
+class GrafanaMCPClient:
+    """Grafana MCP Server 的 JSON-RPC 客户端（streamable HTTP，支持 SSE 响应）。"""
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        transport: HttpTransport | None = None,
+        timeout: float = 30.0,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.base_url = base_url
+        self.transport = transport or UrllibTransport()
+        self.timeout = timeout
+        self.headers = headers or {}
+        self._next_id = 0
+
+    def _rpc(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        self._next_id += 1
+        payload = {"jsonrpc": "2.0", "id": self._next_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        status, body = self.transport.post(self.base_url, payload, headers=self.headers, timeout=self.timeout)
+        if status != 200:
+            raise TransportError(f"MCP server returned HTTP {status}", status=status, body=body)
+        message = _parse_sse_or_json(body)
+        if "error" in message:
+            err = message["error"]
+            raise MCPError(f"MCP error {err.get('code')}: {err.get('message')}")
+        if "result" not in message:
+            raise MCPError(f"MCP response missing result: {message!r}")
+        return message["result"]
+
+    def list_tools(self) -> list[dict[str, Any]]:
+        result = self._rpc("tools/list", {})
+        return result.get("tools", [])
+
+    def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+        result = self._rpc("tools/call", {"name": name, "arguments": arguments or {}})
+        if result.get("isError"):
+            raise MCPError(f"tool {name!r} failed: {_content_text(result)}")
+        return _content_json(result)
+
+
+def _parse_sse_or_json(body: Any) -> dict[str, Any]:
+    if isinstance(body, dict):
+        return body
+    if not isinstance(body, str):
+        raise MCPError(f"unexpected MCP response type: {type(body).__name__}")
+    text = body.strip()
+    if text.startswith("{"):
+        return json.loads(text)
+    # SSE: 取最后一个 data: 行
+    data_lines = [
+        line[len("data:"):].strip()
+        for line in text.splitlines()
+        if line.strip().startswith("data:")
+    ]
+    if not data_lines:
+        raise MCPError(f"MCP response is neither JSON nor SSE: {text[:200]}")
+    return json.loads(data_lines[-1])
+
+
+def _content_text(result: dict[str, Any]) -> str:
+    parts = [c.get("text", "") for c in result.get("content", []) if c.get("type") == "text"]
+    return "\n".join(parts)
+
+
+def _content_json(result: dict[str, Any]) -> Any:
+    text = _content_text(result)
+    if not text:
+        return result
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+class DatasourceAdapters:
+    """把多个数据源适配器聚合成 ToolGateway 内置工具所需的鸭子类型接口。"""
+
+    def __init__(
+        self,
+        *,
+        prometheus: PrometheusAdapter | None = None,
+        loki: LokiAdapter | None = None,
+        tempo: TempoAdapter | None = None,
+    ) -> None:
+        self.prometheus = prometheus
+        self.loki = loki
+        self.tempo = tempo
+
+    def _need(self, adapter: Any, name: str) -> Any:
+        if adapter is None:
+            raise TransportError(f"{name} adapter is not configured")
+        return adapter
+
+    def query_metric_series(self, service: str, metric: str, start: str, end: str) -> Any:
+        prom = self._need(self.prometheus, "prometheus")
+        # 裸指标名 → 带 service 选择器；含 PromQL 语法符号则原样使用
+        expression = metric if any(ch in metric for ch in "()[]{}") else f'{metric}{{service="{service}"}}'
+        return prom.query_range(expression, start, end)
+
+    def query_service_error_rate(self, service: str, start: str, end: str) -> Any:
+        return self._need(self.prometheus, "prometheus").service_error_rate(service, start, end)
+
+    def query_service_logs(
+        self, service: str, start: str, end: str, filter: str | None = None
+    ) -> Any:
+        return self._need(self.loki, "loki").service_logs(service, start, end, filter=filter)
+
+    def query_service_traces(
+        self,
+        service: str,
+        start: str,
+        end: str,
+        min_duration_ms: int | None = None,
+    ) -> Any:
+        return self._need(self.tempo, "tempo").service_traces(
+            service, start, end, min_duration_ms=min_duration_ms
+        )
+
+
+class MCPDatasourceAdapters(DatasourceAdapters):
+    """通过 Grafana MCP Server 提供四个内置工具（生产推荐：不直连各数据源）。"""
+
+    def __init__(
+        self,
+        client: GrafanaMCPClient,
+        *,
+        prometheus_uid: str = "prometheus",
+        loki_uid: str = "loki",
+        tempo_uid: str = "tempo",
+    ) -> None:
+        super().__init__()
+        self.client = client
+        self.prometheus_uid = prometheus_uid
+        self.loki_uid = loki_uid
+        self.tempo_uid = tempo_uid
+
+    def query_metric_series(self, service: str, metric: str, start: str, end: str) -> Any:
+        expression = metric if any(ch in metric for ch in "()[]{}") else f'{metric}{{service="{service}"}}'
+        return self.client.call_tool(
+            "query_prometheus",
+            {
+                "datasourceUid": self.prometheus_uid,
+                "expr": expression,
+                "startRFC3339": start,
+                "endRFC3339": end,
+                "stepSeconds": 60,
+            },
+        )
+
+    def query_service_error_rate(self, service: str, start: str, end: str) -> Any:
+        total = f'sum(rate(http_requests_total{{service="{service}"}}[1m]))'
+        errors = f'sum(rate(http_requests_total{{service="{service}",status=~"5.."}}[1m]))'
+        return self.client.call_tool(
+            "query_prometheus",
+            {
+                "datasourceUid": self.prometheus_uid,
+                "expr": f"{errors} / clamp_min({total}, 0.000001)",
+                "startRFC3339": start,
+                "endRFC3339": end,
+                "stepSeconds": 60,
+            },
+        )
+
+    def query_service_logs(self, service: str, start: str, end: str, filter: str | None = None) -> Any:
+        logql = f'{{service="{service}"}}'
+        if filter:
+            logql += f' |= "{filter}"'
+        return self.client.call_tool(
+            "query_loki_logs",
+            {
+                "datasourceUid": self.loki_uid,
+                "logql": logql,
+                "startRFC3339": start,
+                "endRFC3339": end,
+                "limit": 200,
+            },
+        )
+
+    def query_service_traces(
+        self, service: str, start: str, end: str, min_duration_ms: int | None = None
+    ) -> Any:
+        found = self.client.call_tool(
+            "search_tempo_traces",
+            {
+                "datasourceUid": self.tempo_uid,
+                "q": f'{{service.name="{service}"}}',
+                "startRFC3339": start,
+                "endRFC3339": end,
+                "limit": 20,
+            },
+        )
+        traces = found.get("traces", []) if isinstance(found, dict) else []
+        batches: list[Any] = []
+        for t in traces:
+            trace_id = t.get("traceID") or t.get("traceId")
+            if not trace_id:
+                continue
+            payload = self.client.call_tool("get_tempo_trace", {"datasourceUid": self.tempo_uid, "traceId": trace_id})
+            if isinstance(payload, dict):
+                batches.extend(payload.get("batches", [payload]))
+        return {"traces_considered": len(traces), "batches": batches}

@@ -48,6 +48,9 @@ def build_report(
             h.status = r.status
         updated_hypotheses.append(h)
 
+    # 报告内假设按 rank 排序：rank 1 在最前，消费方无需再排序
+    updated_hypotheses.sort(key=lambda h: (h.rank is None, h.rank or 0))
+
     top = ranked[0] if ranked else None
     if top is not None and top.status == HypothesisStatus.SUPPORTED:
         diagnosis = "SUPPORTED"
