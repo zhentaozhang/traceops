@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-10-31T00:00:34.015943+00:00",
+  "generated_at": "2026-10-31T00:34:05.693988+00:00",
   "scenarios": [
     {
       "scenario_id": "F-000",
@@ -14,9 +14,11 @@
       "citation_precision": 0.0,
       "cited_evidence": 0,
       "fault_injected": false,
+      "chain_declared": false,
+      "chain_order_correct": null,
+      "affected_services_correct": null,
       "tool_calls": 3,
-      "tokens_used": 0,
-      "chain_declared": false
+      "tokens_used": 0
     },
     {
       "scenario_id": "F-001",
@@ -28,12 +30,14 @@
       "diagnosis_correct": true,
       "abstained": false,
       "evidence_recall": 1.0,
-      "citation_precision": 1.0,
+      "citation_precision": 0.75,
       "cited_evidence": 4,
       "fault_injected": true,
+      "chain_declared": false,
+      "chain_order_correct": null,
+      "affected_services_correct": null,
       "tool_calls": 3,
-      "tokens_used": 0,
-      "chain_declared": false
+      "tokens_used": 0
     },
     {
       "scenario_id": "F-002",
@@ -48,9 +52,11 @@
       "citation_precision": 1.0,
       "cited_evidence": 1,
       "fault_injected": true,
+      "chain_declared": false,
+      "chain_order_correct": null,
+      "affected_services_correct": null,
       "tool_calls": 3,
-      "tokens_used": 0,
-      "chain_declared": false
+      "tokens_used": 0
     },
     {
       "scenario_id": "F-003",
@@ -58,16 +64,18 @@
       "service_ac_at_3": true,
       "service_ac_at_5": true,
       "fault_type_at_1": true,
-      "component_at_1": true,
+      "component_at_1": null,
       "diagnosis_correct": true,
       "abstained": false,
       "evidence_recall": 1.0,
       "citation_precision": 1.0,
       "cited_evidence": 1,
       "fault_injected": true,
+      "chain_declared": false,
+      "chain_order_correct": null,
+      "affected_services_correct": null,
       "tool_calls": 3,
-      "tokens_used": 0,
-      "chain_declared": false
+      "tokens_used": 0
     },
     {
       "scenario_id": "F-004",
@@ -82,9 +90,11 @@
       "citation_precision": 1.0,
       "cited_evidence": 1,
       "fault_injected": true,
+      "chain_declared": false,
+      "chain_order_correct": null,
+      "affected_services_correct": null,
       "tool_calls": 3,
-      "tokens_used": 0,
-      "chain_declared": false
+      "tokens_used": 0
     },
     {
       "scenario_id": "F-005",
@@ -96,12 +106,14 @@
       "diagnosis_correct": true,
       "abstained": false,
       "evidence_recall": 1.0,
-      "citation_precision": 1.0,
-      "cited_evidence": 4,
+      "citation_precision": 0.1429,
+      "cited_evidence": 7,
       "fault_injected": true,
-      "tool_calls": 3,
-      "tokens_used": 0,
-      "chain_declared": true
+      "chain_declared": true,
+      "chain_order_correct": false,
+      "affected_services_correct": true,
+      "tool_calls": 9,
+      "tokens_used": 0
     }
   ],
   "aggregate": {
@@ -114,9 +126,11 @@
     "diagnosis_accuracy": 1.0,
     "abstention_rate": 0.1667,
     "evidence_recall_mean": 1.0,
-    "citation_precision_mean": 1.0,
-    "mean_tool_calls": 3.0,
-    "mean_tokens": 0.0
+    "citation_precision_mean": 0.7786,
+    "mean_tool_calls": 4.0,
+    "mean_tokens": 0.0,
+    "chain_order_accuracy": 0.0,
+    "affected_services_accuracy": 1.0
   },
   "note": "synthetic scenarios; not a real-world accuracy claim"
 }

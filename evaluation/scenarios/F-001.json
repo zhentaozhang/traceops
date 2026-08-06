@@ -1,18 +1,25 @@
 {
   "scenario_id": "F-001",
   "name": "Redis connection pool exhaustion after config change",
-  "description": "配置把 maxPoolSize 调到 2，随后连接池耗尽：错误率上升、日志报 redis timeout、慢 span 落在 redis.command。",
+  "description": "配置把 redis 的 maxPoolSize 调到 2，随后 redis 连接池耗尽。order-service 是报告者（日志/指标都来自它），但根因服务是 redis —— 这条边界正是 F-005 级联场景要验证的归因能力。",
   "service_hint": "order-service",
   "fault_start": "2026-10-30T10:02:00Z",
   "window_start": "2026-10-30T10:00:00Z",
   "window_end": "2026-10-30T10:05:00Z",
   "signals": {
-    "error_rate_series": [0.008, 0.012, 0.31],
+    "error_rate_series": [
+      0.008,
+      0.012,
+      0.31
+    ],
     "error_logs": [
       "ERROR order-service: redis timeout after 2000ms - connection pool exhausted (max=2)"
     ],
     "slow_spans": [
-      { "name": "redis.command", "duration_ms": 2000 }
+      {
+        "name": "redis.command",
+        "duration_ms": 2000
+      }
     ],
     "config_change": {
       "changed_at": "2026-10-30T10:01:00Z",
@@ -21,7 +28,7 @@
     }
   },
   "ground_truth": {
-    "service": "order-service",
+    "service": "redis",
     "component": "redis-connection-pool",
     "fault_type": "pool_exhaustion",
     "expected_diagnosis": "SUPPORTED"

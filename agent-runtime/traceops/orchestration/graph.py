@@ -27,7 +27,7 @@ from traceops.domain.models import (
 )
 from traceops.evidence.normalizer import normalize
 from traceops.evidence.store import EvidenceStore
-from traceops.orchestration.detectors import generate_hypotheses
+from traceops.orchestration.detectors import attribute_evidence, generate_hypotheses
 from traceops.rca.ranking import RankedCandidate, derive_signals, rank_hypotheses
 from traceops.rca.report import build_report
 from traceops.runtime.budget import BudgetExhausted, BudgetManager
@@ -88,6 +88,8 @@ class RunContext:
     budget: BudgetManager = field(default_factory=BudgetManager)
     gateway: ToolGateway | None = None
     model: Any | None = None  # P1: LLM 假设生成；P0 未使用
+    topology: Any | None = None  # ServiceTopology；None 时退化为单服务调查
+    scope_depth: int = 1  # 向下游依赖展开的层数
 
 
 @dataclass
@@ -120,26 +122,42 @@ def _parse_dt(value: str | datetime) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def _plan_items(request: InvestigationRequest) -> list[dict[str, Any]]:
-    base = {
-        "service": request.service_hint,
-        "start": request.window_start.isoformat(),
-        "end": request.window_end.isoformat(),
-    }
+def _scope_services(request: InvestigationRequest, ctx: "RunContext") -> list[str]:
+    """调查范围：service_hint + 其下游依赖（按拓扑展开）。
+
+    不向上游展开：调用方看到的是症状，不是根因所在。
+    """
+    if ctx.topology is None:
+        return [request.service_hint]
+    scope = ctx.topology.expand_scope(request.service_hint, depth=ctx.scope_depth)
+    services = sorted(scope)
+    # service_hint 排在最前，便于阅读审计记录
+    services.remove(request.service_hint)
+    return [request.service_hint] + services
+
+
+def _plan_items(request: InvestigationRequest, ctx: "RunContext") -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for tool, source_id, evidence_type, template_id in _PLAN_TEMPLATES:
-        params = dict(base)
-        if tool == "query_service_traces":
-            params["min_duration_ms"] = SLOW_SPAN_THRESHOLD_MS
-        items.append(
-            {
-                "tool": tool,
-                "params": params,
-                "source_id": source_id,
-                "evidence_type": evidence_type,
-                "query_template_id": template_id,
-            }
-        )
+    for service in _scope_services(request, ctx):
+        base = {
+            "service": service,
+            "start": request.window_start.isoformat(),
+            "end": request.window_end.isoformat(),
+        }
+        for tool, source_id, evidence_type, template_id in _PLAN_TEMPLATES:
+            params = dict(base)
+            if tool == "query_service_traces":
+                params["min_duration_ms"] = SLOW_SPAN_THRESHOLD_MS
+            items.append(
+                {
+                    "tool": tool,
+                    "params": params,
+                    "source_id": source_id,
+                    "evidence_type": evidence_type,
+                    "query_template_id": template_id,
+                    "service": service,
+                }
+            )
     if request.config_change is not None:
         changed_at = _parse_dt(request.config_change["changed_at"])
         items.append(
@@ -205,7 +223,7 @@ def _observed_at(raw: dict[str, Any], evidence_type: EvidenceType, fallback: dat
 
 def _plan_node(state: InvestigationState) -> dict[str, Any]:
     request = state["request"]
-    return {"plan": _plan_items(request)}
+    return {"plan": _plan_items(request, state["ctx"])}
 
 
 def _collect_node(state: InvestigationState) -> dict[str, Any]:
@@ -242,7 +260,11 @@ def _collect_node(state: InvestigationState) -> dict[str, Any]:
                 source_id=item["source_id"],
                 incident_id=request.incident_id,
                 run_id=request.investigation_run_id,
-                service_id=request.service_hint if item["evidence_type"] is not EvidenceType.EVENT else None,
+                service_id=(
+                    item.get("service", request.service_hint)
+                    if item["evidence_type"] is not EvidenceType.EVENT
+                    else None
+                ),
                 query_template_id=item["query_template_id"],
                 query_params=item["params"],
                 raw_payload=raw,
@@ -263,7 +285,11 @@ def _collect_node(state: InvestigationState) -> dict[str, Any]:
 def _hypothesize_node(state: InvestigationState) -> dict[str, Any]:
     request = state["request"]
     evidence_list = state.get("evidence", [])
-    hypotheses = generate_hypotheses(evidence_list, investigation_run_id=request.investigation_run_id)
+    hypotheses = generate_hypotheses(
+        evidence_list,
+        investigation_run_id=request.investigation_run_id,
+        topology=state["ctx"].topology,
+    )
     missing = list(state.get("missing_data", []))
     if not hypotheses:
         missing.append("no candidate hypotheses generated from collected evidence")
@@ -292,13 +318,19 @@ def _link_node(state: InvestigationState) -> dict[str, Any]:
                         )
                     )
                 continue
-            if evidence.service_id == hypothesis.candidate_service:
+            # 证据归属优先：order-service 的日志讲 redis，就是关于 redis 的证据
+            attribution = attribute_evidence(evidence, ctx.topology)
+            owner = attribution[0] if attribution else evidence.service_id
+            if owner == hypothesis.candidate_service:
                 links.append(
                     HypothesisEvidence(
                         hypothesis_id=hypothesis.id,
                         evidence_id=evidence.id,
                         relation_type=RelationType.SUPPORTS,
-                        reason=f"{evidence.evidence_type.value} evidence from candidate service",
+                        reason=(
+                            f"{evidence.evidence_type.value} evidence about {owner} "
+                            f"(reported by {evidence.service_id})"
+                        ),
                         created_by=CreatedBy.RULE,
                     )
                 )
@@ -326,7 +358,34 @@ def _rank_node(state: InvestigationState) -> dict[str, Any]:
         derive_signals(h, state.get("links", []), state["ctx"].store, fault_start=request.fault_start)
         for h in hypotheses
     ]
-    return {"ranked": rank_hypotheses(hypotheses, signals)}
+    ranked = rank_hypotheses(hypotheses, signals)
+
+    # 拓扑分层：同分时越靠下游（更可能是根因）的排前。
+    # 规则分不同则不动 —— 证据强度优先，拓扑只做平局裁决。
+    topology = state["ctx"].topology
+    if topology is not None:
+        order = {name: index for index, name in enumerate(topology.blame_order({h.candidate_service for h in hypotheses}))}
+        by_id = {h.id: h for h in hypotheses}
+        ranked.sort(key=lambda r: (-r.score, order.get(by_id[r.hypothesis_id].candidate_service, 999)))
+        for index, candidate in enumerate(ranked, start=1):
+            candidate.rank = index
+    return {"ranked": ranked}
+
+
+def _affected_services(state: InvestigationState) -> list[str]:
+    """影响范围 = 首选根因服务的上游（blast radius），排除根因自身。"""
+    topology = state["ctx"].topology
+    ranked = state.get("ranked") or []
+    hypotheses = state.get("hypotheses") or []
+    if topology is None or not ranked:
+        return []
+    top_id = ranked[0].hypothesis_id
+    lead = next((h for h in hypotheses if h.id == top_id), None)
+    if lead is None:
+        return []
+    radius = topology.blast_radius(lead.candidate_service, depth=2)
+    radius.discard(lead.candidate_service)
+    return sorted(radius)
 
 
 def _report_node(state: InvestigationState) -> dict[str, Any]:
@@ -341,6 +400,7 @@ def _report_node(state: InvestigationState) -> dict[str, Any]:
         fault_start=request.fault_start,
         store=ctx.store,
         missing_data=list(state.get("missing_data", [])),
+        affected_services=_affected_services(state),
     )
     return {"report": report, "status": report.diagnosis_status}
 

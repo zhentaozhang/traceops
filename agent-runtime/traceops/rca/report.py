@@ -31,6 +31,7 @@ def build_report(
     fault_start: datetime,
     store,
     missing_data: list[str] | None = None,
+    affected_services: list[str] | None = None,
 ) -> RCAReport:
     """组装并校验诊断报告。
 
@@ -96,6 +97,7 @@ def build_report(
         hypotheses=updated_hypotheses,
         hypothesis_evidence=links,
         evidence=list(evidence),
+        affected_services=list(affected_services or []),
         missing_data=missing_data or [],
         abstained=diagnosis != "SUPPORTED",
     )

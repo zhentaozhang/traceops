@@ -41,7 +41,9 @@ def _scenario(**overrides) -> Scenario:
             },
         },
         "ground_truth": {
-            "service": "order-service",
+            # 日志里写的是 "redis timeout / pool exhausted"，报告者是 order-service。
+            # 归因规则：被点名的依赖才是根因服务。
+            "service": "redis",
             "component": "redis-connection-pool",
             "fault_type": "pool_exhaustion",
             "expected_diagnosis": "SUPPORTED",
@@ -140,3 +142,49 @@ def test_shipped_scenarios_are_valid_and_cover_five_faults() -> None:
     assert {"pool_exhaustion", "dependency_timeout", "latency_degradation", "availability_degradation"} <= fault_types
     for s in scenarios:
         assert s.fault_start.tzinfo is not None
+
+
+class TestMultiServiceChain:
+    """F-005 级联场景：多服务采集 + 传播链/影响范围校验。"""
+
+    def _cascade(self) -> Scenario:
+        return load_scenario(SCENARIOS_DIR / "F-005.json")
+
+    def test_cascade_scenario_declares_topology(self):
+        scenario = self._cascade()
+        assert scenario.topology_edges, "cascade scenario must declare topology"
+        assert len(scenario.signals.per_service) >= 3
+
+    def test_cascade_identifies_downstream_root_not_upstream_symptom(self):
+        scenario = self._cascade()
+
+        outcome = run_scenario(scenario)
+
+        # 根因是 redis（最下游），api-gateway 只是症状
+        assert outcome.service_ac_at_1 is True
+        assert outcome.fault_type_at_1 is True
+
+    def test_cascade_reports_affected_upstream_services(self):
+        scenario = self._cascade()
+        outcome = run_scenario(scenario)
+
+        # 影响范围来自拓扑 blast radius，不靠 LLM 猜
+        assert outcome.affected_services_correct is True
+
+    def test_cascade_span_offset_encodes_symptom_lag(self):
+        """症状必须晚于根因：span_offset_ms 让 trace 时间戳递增。"""
+        scenario = self._cascade()
+        offsets = {
+            name: signals.span_offset_ms
+            for name, signals in scenario.signals.per_service.items()
+            if signals.slow_spans
+        }
+        assert offsets["redis"] < offsets["order-service"] < offsets["api-gateway"]
+
+    def test_multi_service_citation_precision_is_lownot_perfect(self):
+        """多服务采集的代价：非根因服务的证据会被引用，precision 必然低于 1。
+
+        这是诚实性测试 —— 如果这里变成 1.00，说明指标在撒谎。
+        """
+        outcome = run_scenario(self._cascade())
+        assert outcome.citation_precision < 0.5, outcome.citation_precision

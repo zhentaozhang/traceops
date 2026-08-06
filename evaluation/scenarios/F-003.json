@@ -1,19 +1,22 @@
 {
   "scenario_id": "F-003",
   "name": "Downstream latency degradation (traces only)",
-  "description": "只有慢 trace 可见：redis.command 耗时 1.8s。验证仅凭 trace 能定位到下游依赖而不是本服务。",
+  "description": "只有慢 trace 可见：order-service 的 redis.command span 耗时 1.8s。慢的是 redis 调用，根因服务是 redis。",
   "service_hint": "order-service",
   "fault_start": "2026-10-30T10:02:00Z",
   "window_start": "2026-10-30T10:00:00Z",
   "window_end": "2026-10-30T10:05:00Z",
   "signals": {
     "slow_spans": [
-      { "name": "redis.command", "duration_ms": 1800 }
+      {
+        "name": "redis.command",
+        "duration_ms": 1800
+      }
     ]
   },
   "ground_truth": {
-    "service": "order-service",
-    "component": "redis",
+    "service": "redis",
+    "component": null,
     "fault_type": "latency_degradation",
     "expected_diagnosis": "SUPPORTED"
   }

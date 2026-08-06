@@ -10,10 +10,11 @@ Evidence-driven Agentic RCA Platform —— 面向微服务系统的智能故障
 | 平面 | 状态 | 测试 |
 |---|---|---|
 | Control Plane（Java / Spring Boot） | ✅ 告警接入、事故状态机、事务性 Outbox、契约校验 | 18 passing |
-| Investigation Plane（Python / LangGraph） | ✅ 6 节点确定性调查图、预算守护 | 97 passing（含评估） |
+| Investigation Plane（Python / LangGraph） | ✅ 6 节点图、预算守护、**拓扑感知多服务采集** | 142 passing（含评估） |
 | Evidence Plane（Python） | ✅ 4 类归一化、内容寻址校验、报告引用闸门 | 同上 |
-| Evaluation Plane（Python） | ✅ 6 场景 + 指标 + runner CLI | 同上 |
-| Execution Plane（受控修复） | ⬜ 未实现（P3） | — |
+- Evaluation Plane（Python） | ✅ 6 场景（含三服务级联 F-005）+ 16 指标 + runner | 同上 |
+| Execution Plane（受控修复） | ✅ Action Registry + Policy + Approval + Executor | 21 passing |
+| Topology（服务依赖） | ✅ 双向语义、环检测、平局裁决 | 19 passing |
 | 观测栈（docker compose） | ✅ 文件就绪 | 未拉起（Docker 守护进程未运行） |
 
 **P0 没有 LLM 参与**：这一版全部是确定性代码，目的是把"证据 → 假设 → 排序 → 报告"
@@ -94,11 +95,25 @@ docker compose up -d     # Prometheus 9090 / Loki 3100 / Tempo 3200 / Grafana 30
 3. **契约跨语言校验**：Java 生产出的真实 Outbox payload 直接被 `contracts/` 下的
    JSON Schema 校验（离线内联 `$ref`），Python 侧用同一批 schema。
 
+## 本轮最重要的修正：依赖归因
+
+```
+order-service 的日志： "ERROR redis timeout - connection pool exhausted"
+```
+
+按"谁上报"归因 → 得出 order-service 拥有 redis 池（**错**）
+按"日志在说谁"归因 → redis 才是根因服务（**对**）
+
+`detectors.attribute_evidence` 是唯一事实来源，假设生成 / 证据关联 / 评估 precision 全部走它。
+修正后 F-001~F-005 的 rank 1 全部指向真正的下游依赖服务。
+
 ## 已知局限（不粉饰）
 
 - 评估指标的 1.00 来自**合成场景**，不是真实准确率；六个场景按检测规则反向构造，
   存在"规则自证"风险
-- F-005 声明了传播链 ground truth，但 P0 只采集单服务证据，**链条未自动校验**
+- F-005 已支持三服务采集与影响范围（`affected=Y`），但**传播链校验仍失败**（`chain=0.00`）：
+  api-gateway 的证据被正确归因给 redis，导致它自身没有候选可排。需要 RCAReport 区分
+  「候选根因」与「传播链节点」两个概念（P1 数据结构扩展，不是补丁）
 - Grafana MCP 的参数名与权限边界按文档编写，**未经实测**（S2 待执行）
 - 无 Redis Streams 消费者、无 LangGraph Checkpoint 持久化（P2）
 

@@ -28,6 +28,8 @@ def _format_row(outcome) -> str:
         f"FT@1={'Y' if outcome.fault_type_at_1 else 'n'} "
         f"recall={outcome.evidence_recall:.2f} "
         f"prec={outcome.citation_precision:.2f} "
+        f"chain={'Y' if outcome.chain_order_correct else ('-' if outcome.chain_order_correct is None else 'n')} "
+        f"aff={'Y' if outcome.affected_services_correct else ('-' if outcome.affected_services_correct is None else 'n')} "
         f"calls={outcome.tool_calls}"
     )
 
@@ -60,7 +62,9 @@ def main(argv: list[str] | None = None) -> int:
         f"diag_acc={agg.diagnosis_accuracy:.2f} "
         f"abstain={agg.abstention_rate:.2f} "
         f"recall={agg.evidence_recall_mean:.2f} "
-        f"prec={agg.citation_precision_mean:.2f}"
+        f"prec={agg.citation_precision_mean:.2f} "
+        f"chain={agg.chain_order_accuracy:.2f} "
+        f"affected={agg.affected_services_accuracy:.2f}"
     )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

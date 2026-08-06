@@ -1,32 +1,95 @@
 {
   "scenario_id": "F-005",
-  "name": "Config change cascade with propagation chain",
-  "description": "REVISIONS-1.1 R4 核心场景：错误配置 T0 -> 资源耗尽 T1 -> 上游受影响 T2 -> 业务损伤 T4。ground truth 为单一初始根因 + 传播链；P0 只能采集单服务证据，因此 chain 只声明、不自动校验（见 EVALUATION.md 局限）。",
+  "name": "Config change cascade across three services",
+  "description": "REVISIONS-1.1 R4 核心场景。T0 配置错误（redis 连接池 20→2）→ T1 redis 资源耗尽 → T2 order-service 超时 → T3 api-gateway 5xx。三个服务各有一类证据，症状在时间上晚于根因。",
   "service_hint": "order-service",
-  "fault_start": "2026-10-30T10:02:30Z",
+  "fault_start": "2026-10-30T10:02:00Z",
   "window_start": "2026-10-30T10:00:00Z",
-  "window_end": "2026-10-30T10:05:00Z",
+  "window_end": "2026-10-30T10:06:00Z",
+  "topology_edges": [
+    [
+      "api-gateway",
+      "order-service"
+    ],
+    [
+      "order-service",
+      "redis"
+    ],
+    [
+      "order-service",
+      "mysql"
+    ]
+  ],
+  "scope_depth": 1,
   "signals": {
-    "error_rate_series": [0.006, 0.11, 0.42],
-    "error_logs": [
-      "ERROR order-service: redis pool exhausted, 2100ms waiting for connection",
-      "ERROR order-service: request failed after retry - upstream api-gateway returned 502"
-    ],
-    "slow_spans": [
-      { "name": "redis.command", "duration_ms": 2100 },
-      { "name": "http.gateway.dispatch", "duration_ms": 2600 }
-    ],
     "config_change": {
       "changed_at": "2026-10-30T10:01:00Z",
       "component": "redis-connection-pool",
       "summary": "maxPoolSize reduced 20 -> 2"
+    },
+    "per_service": {
+      "redis": {
+        "error_logs": [
+          "ERROR redis: max number of clients reached (max=2), rejecting connection after 2100ms"
+        ],
+        "error_rate_series": [
+          0.002,
+          0.41,
+          0.44
+        ],
+        "slow_spans": [
+          {
+            "name": "redis.command",
+            "duration_ms": 2100
+          }
+        ],
+        "span_offset_ms": 0
+      },
+      "order-service": {
+        "error_logs": [
+          "ERROR order-service: redis timeout after 2000ms while acquiring connection from pool"
+        ],
+        "error_rate_series": [
+          0.004,
+          0.33,
+          0.38
+        ],
+        "slow_spans": [
+          {
+            "name": "http.downstream.redis",
+            "duration_ms": 2400
+          }
+        ],
+        "span_offset_ms": 200
+      },
+      "api-gateway": {
+        "error_logs": [
+          "ERROR api-gateway: upstream returned 502 for /orders after 2600ms"
+        ],
+        "error_rate_series": [
+          0.003,
+          0.29,
+          0.35
+        ],
+        "slow_spans": [
+          {
+            "name": "http.dispatch",
+            "duration_ms": 2600
+          }
+        ],
+        "span_offset_ms": 400
+      }
     }
   },
   "ground_truth": {
-    "service": "order-service",
+    "service": "redis",
     "component": "redis-connection-pool",
     "fault_type": "pool_exhaustion",
     "expected_diagnosis": "SUPPORTED",
-    "propagation_chain": ["redis-connection-pool", "order-service", "api-gateway"]
+    "propagation_chain": [
+      "redis",
+      "order-service",
+      "api-gateway"
+    ]
   }
 }

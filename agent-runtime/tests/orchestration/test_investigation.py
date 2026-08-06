@@ -141,19 +141,23 @@ def test_e2e_tie_is_reported_as_ambiguous_not_overclaimed() -> None:
     result = run_investigation(_request(), ctx)
 
     assert result.status == "INCONCLUSIVE"
-    report = result.report
+    report = result.result if hasattr(result, "result") else result.report
     assert report is not None
     assert report.diagnosis_status == "INCONCLUSIVE"
     assert report.abstained is True
     assert "Ambiguous evidence" in report.summary
-    assert report.hypotheses, "expected at least one hypothesis"
-    top = report.hypotheses[0]
-    assert top.rank == 1
-    assert top.candidate_service == "order-service"
-    # 三条证据各自生成一个候选；无配置变更时排序由规则表决定
-    fault_types = {h.fault_type for h in report.hypotheses}
-    assert {"availability_degradation", "pool_exhaustion", "latency_degradation"} <= fault_types
-    assert all(h.status.value == "supported" for h in report.hypotheses)
+
+    # 关键语义：日志与链路提到 redis，所以它们必须被归因为"关于 redis"的证据，
+    # 而不是"order-service 自己拥有一个 redis 池"。因此 redis 的候选排在症状服务之前。
+    services = [h.candidate_service for h in report.hypotheses]
+    assert services[0] == "redis", services
+    assert services.index("redis") < services.index("order-service"), services
+
+    # 至少存在一个"pool_exhaustion"候选，且归因到 redis 的连接池
+    pool = next((h for h in report.hypotheses if h.fault_type == "pool_exhaustion"), None)
+    assert pool is not None
+    assert pool.candidate_service == "redis"
+    assert pool.candidate_component == "redis-connection-pool"
     # 证据引用完整性：报告里每条证据都能在 Store 中校验通过
     assert len(report.all_evidence_ids()) >= 3
     for evidence_id in report.all_evidence_ids():

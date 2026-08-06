@@ -141,6 +141,10 @@ class RCAReport(BaseModel):
     hypotheses: list[RootCauseHypothesis] = Field(default_factory=list)
     hypothesis_evidence: list[HypothesisEvidence] = Field(default_factory=list)
     evidence: list[Evidence] = Field(default_factory=list)
+    affected_services: list[str] = Field(
+        default_factory=list,
+        description="影响范围：因根因服务故障而受波及的上游服务（来自拓扑 blast radius）",
+    )
     missing_data: list[str] = Field(default_factory=list)
     abstained: bool = False
     generated_at: datetime = Field(default_factory=_utcnow)
