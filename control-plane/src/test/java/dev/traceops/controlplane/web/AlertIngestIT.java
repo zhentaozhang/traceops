@@ -102,6 +102,8 @@ class AlertIngestIT {
         assertThat(message.at("/envelope/event_type").asText()).isEqualTo("investigation.requested");
         assertThat(message.at("/payload/incident_id").asText()).isNotEmpty();
         assertThat(message.at("/payload/investigation_run_id").asText()).isNotEmpty();
+        // service_hint 必须等于告警服务：Agent 靠它决定调查起点
+        assertThat(message.at("/payload/service_hint").asText()).isEqualTo("order-service");
     }
 
     private JsonSchema loadOfflineSchema(String relativePath) throws Exception {

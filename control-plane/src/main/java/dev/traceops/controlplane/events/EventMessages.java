@@ -32,6 +32,7 @@ public final class EventMessages {
 
     public static Map<String, Object> investigationRequested(
             String incidentId,
+            String serviceHint,
             String runId,
             String environment,
             String configVersion,
@@ -65,11 +66,14 @@ public final class EventMessages {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("investigation_run_id", runId);
         payload.put("incident_id", incidentId);
+        // service_hint 是调查起点：缺失时 Agent 无法启动（契约中为必填）
+        payload.put("service_hint", serviceHint);
         payload.put("environment", environment);
         payload.put("time_range", timeRange);
         payload.put("config_version", configVersion);
         payload.put("priority", priority);
         payload.put("budget", budget);
+        payload.put("scope_depth", 1);
 
         Map<String, Object> message = new LinkedHashMap<>();
         message.put("envelope", envelope);

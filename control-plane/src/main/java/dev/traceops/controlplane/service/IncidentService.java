@@ -71,7 +71,8 @@ public class IncidentService {
 
         String runId = EventMessages.newRunId();
         Map<String, Object> message = EventMessages.investigationRequested(
-                incident.getId(), runId, environment, configVersion, priorityOf(alert), now);
+                incident.getId(), alert.service(), runId, environment, configVersion,
+                priorityOf(alert), now);
         String eventId = String.valueOf(((Map<?, ?>) message.get("envelope")).get("event_id"));
         outbox.save(OutboxEvent.pending(eventId, EventMessages.INVESTIGATION_REQUESTED, runId, 1L,
                 toJson(message), now));

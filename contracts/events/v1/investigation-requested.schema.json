@@ -4,44 +4,126 @@
   "title": "investigation.requested v1",
   "description": "Control Plane → Agent Runtime：请求对某个 Incident 启动一次 InvestigationRun。Agent Worker 消费后创建 Run、加载上下文并开始调查。",
   "type": "object",
-  "required": ["envelope", "payload"],
+  "required": [
+    "envelope",
+    "payload"
+  ],
   "additionalProperties": false,
   "properties": {
-    "envelope": { "$ref": "../../common/event-envelope.schema.json" },
+    "envelope": {
+      "$ref": "../../common/event-envelope.schema.json"
+    },
     "payload": {
       "type": "object",
-      "required": ["investigation_run_id", "incident_id", "environment", "time_range", "config_version"],
+      "required": [
+        "investigation_run_id",
+        "incident_id",
+        "service_hint",
+        "environment",
+        "time_range",
+        "config_version"
+      ],
       "additionalProperties": false,
       "properties": {
         "investigation_run_id": {
           "type": "string",
           "description": "本次调查的全局唯一 Run ID。消费端以此做幂等检查（重复事件不重复建 Run）。"
         },
-        "incident_id": { "type": "string" },
+        "incident_id": {
+          "type": "string"
+        },
+        "service_hint": {
+          "type": "string",
+          "minLength": 1,
+          "description": "受影响服务的名称，作为调查起点。拓扑可用时 Agent 会向下游依赖扩展采集范围。该字段缺失会导致调查无法启动，因此是必填项。"
+        },
         "environment": {
           "type": "string",
           "description": "调查目标环境标识，如 prod / staging。"
         },
-        "time_range": { "$ref": "../../common/time-range.schema.json" },
+        "time_range": {
+          "$ref": "../../common/time-range.schema.json"
+        },
         "config_version": {
           "type": "string",
           "description": "调查配置快照版本（模型、Prompt、策略、工具 Schema）。Run 恢复时按此版本取配置。"
         },
         "priority": {
           "type": "string",
-          "enum": ["low", "normal", "high"],
+          "enum": [
+            "low",
+            "normal",
+            "high"
+          ],
           "default": "normal"
         },
         "budget": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "max_tool_calls": { "type": "integer", "minimum": 1 },
-            "max_rounds": { "type": "integer", "minimum": 1 },
-            "max_tokens": { "type": "integer", "minimum": 1000 },
-            "deadline_seconds": { "type": "integer", "minimum": 30 }
+            "max_tool_calls": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_rounds": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_tokens": {
+              "type": "integer",
+              "minimum": 1000
+            },
+            "deadline_seconds": {
+              "type": "integer",
+              "minimum": 30
+            }
           },
           "description": "本次调查的执行预算；未提供时使用 Agent Runtime 默认预算（如 100000 tokens）。"
+        },
+        "topology_edges": {
+          "type": "array",
+          "description": "依赖边 [[caller, callee], ...]。为空时调查只在 service_hint 单服务内进行。",
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "scope_depth": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3,
+          "default": 1,
+          "description": "沿下游依赖展开的层数。0 表示只查 service_hint 自身。"
+        },
+        "config_change": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "已知的故障前配置变更。存在时 Agent 会作为 EVENT 证据引入并参与排序（R-004）。",
+          "additionalProperties": false,
+          "properties": {
+            "changed_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "component": {
+              "type": "string",
+              "minLength": 1
+            },
+            "summary": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "changed_at",
+            "component"
+          ]
         }
       }
     }
@@ -49,11 +131,25 @@
   "allOf": [
     {
       "if": {
-        "properties": { "envelope": { "properties": { "event_type": { "const": "investigation.requested" } } } }
+        "properties": {
+          "envelope": {
+            "properties": {
+              "event_type": {
+                "const": "investigation.requested"
+              }
+            }
+          }
+        }
       },
       "then": {
         "properties": {
-          "envelope": { "properties": { "producer": { "const": "control-plane" } } }
+          "envelope": {
+            "properties": {
+              "producer": {
+                "const": "control-plane"
+              }
+            }
+          }
         }
       }
     }

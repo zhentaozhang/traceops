@@ -25,12 +25,14 @@ from traceops.domain.models import (
     RelationType,
     RootCauseHypothesis,
 )
+from traceops.evidence.graph import build_evidence_graph, earliest_anomaly, ordering_violations
 from traceops.evidence.normalizer import normalize
 from traceops.evidence.store import EvidenceStore
 from traceops.orchestration.detectors import attribute_evidence, generate_hypotheses
 from traceops.rca.ranking import RankedCandidate, derive_signals, rank_hypotheses
 from traceops.rca.report import build_report
 from traceops.runtime.budget import BudgetExhausted, BudgetManager
+from traceops.runtime.model import ModelGateway, ModelRequest, ModelUnavailable, hypothesis_to_domain
 from traceops.tools.gateway import ToolGateway, register_builtin_tools
 
 SLOW_SPAN_THRESHOLD_MS = 500
@@ -87,7 +89,7 @@ class RunContext:
     adapters: Any
     budget: BudgetManager = field(default_factory=BudgetManager)
     gateway: ToolGateway | None = None
-    model: Any | None = None  # P1: LLM 假设生成；P0 未使用
+    model: Any | None = None  # ModelClient；None 时只用确定性检测器
     topology: Any | None = None  # ServiceTopology；None 时退化为单服务调查
     scope_depth: int = 1  # 向下游依赖展开的层数
 
@@ -110,6 +112,7 @@ class InvestigationState(TypedDict, total=False):
     hypotheses: list[RootCauseHypothesis]
     links: list[HypothesisEvidence]
     ranked: list[RankedCandidate]
+    evidence_graph_summary: dict[str, Any]
     report: RCAReport | None
     status: str
     errors: list[str]
@@ -283,17 +286,68 @@ def _collect_node(state: InvestigationState) -> dict[str, Any]:
 
 
 def _hypothesize_node(state: InvestigationState) -> dict[str, Any]:
+    """确定性检测器 + （可选）模型提案。
+
+    模型提案不替代规则：两者合并，进入同一套规则排序。
+    模型失败只记 missing_data，不降级整个调查 —— 数据源挂掉都不该终止，
+    模型挂掉更不该。
+    """
     request = state["request"]
+    ctx = state["ctx"]
     evidence_list = state.get("evidence", [])
+    missing = list(state.get("missing_data", []))
+
     hypotheses = generate_hypotheses(
         evidence_list,
         investigation_run_id=request.investigation_run_id,
-        topology=state["ctx"].topology,
+        topology=ctx.topology,
     )
-    missing = list(state.get("missing_data", []))
+
+    if ctx.model is not None and evidence_list:
+        allowed = sorted({e.service_id for e in evidence_list if e.service_id})
+        if ctx.topology is not None:
+            allowed = sorted(set(allowed) | ctx.topology.services())
+        model_request = ModelRequest(
+            incident_id=request.incident_id,
+            service_hint=request.service_hint,
+            evidence_summary=_evidence_summary(evidence_list),
+            allowed_services=allowed,
+        )
+        gateway = ModelGateway(ctx.model, ctx.budget)
+        try:
+            response = gateway.propose(model_request)
+        except BudgetExhausted as exc:
+            # 模型预算耗尽：保留已有规则假设，不终止调查
+            missing.append(f"model budget exhausted: {exc}")
+            response = None
+        except ModelUnavailable as exc:
+            missing.append(f"model unavailable: {exc}")
+            response = None
+        if response is not None:
+            existing = {(h.candidate_service, h.fault_type, h.candidate_component) for h in hypotheses}
+            for proposal in response.hypotheses:
+                key = (proposal.candidate_service, proposal.fault_type, proposal.candidate_component)
+                if key in existing:
+                    continue  # 与规则假设重复，不产生并列候选
+                existing.add(key)
+                hypotheses.append(hypothesis_to_domain(
+                    proposal, investigation_run_id=request.investigation_run_id))
+
     if not hypotheses:
         missing.append("no candidate hypotheses generated from collected evidence")
     return {"hypotheses": hypotheses, "missing_data": missing}
+
+
+def _evidence_summary(evidence_list: list[Evidence]) -> dict[str, Any]:
+    """给模型的证据摘要：只给类型/服务/计数，不给原始负载（上下文成本 + 防注入）。"""
+    summary: dict[str, Any] = {}
+    for evidence in evidence_list:
+        key = evidence.evidence_type.value + "s"
+        entry = summary.setdefault(key, {"count": 0, "services": []})
+        entry["count"] += 1
+        if evidence.service_id and evidence.service_id not in entry["services"]:
+            entry["services"].append(evidence.service_id)
+    return summary
 
 
 def _link_node(state: InvestigationState) -> dict[str, Any]:
@@ -349,6 +403,43 @@ def _event_component(evidence: Evidence) -> str | None:
     return None
 
 
+def _correlate_node(state: InvestigationState) -> dict[str, Any]:
+    """证据关联（蓝图 §6.3）：构建证据图，产出时间线与关联统计。
+
+    不产出"因果结论"：这里只回答"哪些证据属于同一次故障链、谁先谁后"，
+    由诊断层负责解释。
+    """
+    ctx = state["ctx"]
+    request = state["request"]
+    evidence_list = state.get("evidence", [])
+    missing = list(state.get("missing_data", []))
+    if not evidence_list:
+        return {"evidence_graph_summary": {}, "missing_data": missing}
+
+    graph = build_evidence_graph(evidence_list, topology=ctx.topology)
+    earliest = earliest_anomaly(evidence_list)
+    summary: dict[str, Any] = {
+        "evidence_nodes": len(graph.evidence),
+        "edges": len(graph.edges),
+        "edge_rules": sorted({edge.rule for edge in graph.edges}),
+        "services": sorted(graph.services()),
+        "timeline": graph.timeline(),
+        "earliest_anomaly_id": earliest.id if earliest else None,
+        "earliest_anomaly_service": earliest.service_id if earliest else None,
+    }
+
+    # 时间线污染检测：若已知拓扑顺序，检查症状是否早于根因
+    if ctx.topology is not None and earliest is not None and earliest.service_id:
+        order = ctx.topology.blame_order(graph.services())
+        violations = ordering_violations(evidence_list, expected_order=order)
+        if violations:
+            summary["timeline_violations"] = violations
+            missing.append(
+                "timeline ordering suspicious: " + "; ".join(violations)
+            )
+    return {"evidence_graph_summary": summary, "missing_data": missing}
+
+
 def _rank_node(state: InvestigationState) -> dict[str, Any]:
     request = state["request"]
     hypotheses = state.get("hypotheses", [])
@@ -388,6 +479,20 @@ def _affected_services(state: InvestigationState) -> list[str]:
     return sorted(radius)
 
 
+def _correlation_notes(state: InvestigationState) -> list[str]:
+    """把关联结论写进报告的 missing_data 之外——用 summary 补充可解释信息。"""
+    summary = state.get("evidence_graph_summary") or {}
+    notes: list[str] = []
+    if summary.get("edges"):
+        notes.append(
+            f"evidence graph: {summary['evidence_nodes']} nodes / {summary['edges']} edges "
+            f"via {', '.join(summary.get('edge_rules', []))}"
+        )
+    if summary.get("earliest_anomaly_service"):
+        notes.append(f"earliest anomaly observed in {summary['earliest_anomaly_service']}")
+    return notes
+
+
 def _report_node(state: InvestigationState) -> dict[str, Any]:
     request = state["request"]
     ctx = state["ctx"]
@@ -401,6 +506,7 @@ def _report_node(state: InvestigationState) -> dict[str, Any]:
         store=ctx.store,
         missing_data=list(state.get("missing_data", [])),
         affected_services=_affected_services(state),
+        correlation_notes=_correlation_notes(state),
     )
     return {"report": report, "status": report.diagnosis_status}
 
@@ -421,6 +527,7 @@ def build_investigation_graph():
     builder.add_node("collect", _collect_node)
     builder.add_node("hypothesize", _hypothesize_node)
     builder.add_node("link", _link_node)
+    builder.add_node("correlate", _correlate_node)
     builder.add_node("rank", _rank_node)
     builder.add_node("report", _report_node)
 
@@ -430,7 +537,8 @@ def build_investigation_graph():
         "collect", _route_after_collect, {"stop": END, "continue": "hypothesize"}
     )
     builder.add_edge("hypothesize", "link")
-    builder.add_edge("link", "rank")
+    builder.add_edge("link", "correlate")
+    builder.add_edge("correlate", "rank")
     builder.add_edge("rank", "report")
     builder.add_edge("report", END)
     return builder.compile()
@@ -449,6 +557,7 @@ def run_investigation(request: InvestigationRequest, ctx: RunContext) -> Investi
         "hypotheses": [],
         "links": [],
         "ranked": [],
+        "evidence_graph_summary": {},
         "report": None,
         "status": "RUNNING",
         "errors": [],

@@ -32,6 +32,7 @@ def build_report(
     store,
     missing_data: list[str] | None = None,
     affected_services: list[str] | None = None,
+    correlation_notes: list[str] | None = None,
 ) -> RCAReport:
     """组装并校验诊断报告。
 
@@ -89,6 +90,9 @@ def build_report(
     else:
         diagnosis = "INCONCLUSIVE"
         summary = "Insufficient evidence for a conclusive diagnosis"
+
+    if correlation_notes:
+        summary = summary.rstrip(".") + ". " + "; ".join(correlation_notes) + "."
 
     report = RCAReport(
         investigation_run_id=investigation_run_id,
