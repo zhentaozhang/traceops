@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-10-31T00:47:38.847673+00:00",
+  "generated_at": "2026-10-31T01:25:48.661429+00:00",
   "scenarios": [
     {
       "scenario_id": "F-000",
@@ -106,13 +106,13 @@
       "diagnosis_correct": true,
       "abstained": false,
       "evidence_recall": 1.0,
-      "citation_precision": 0.1429,
-      "cited_evidence": 7,
+      "citation_precision": 0.1,
+      "cited_evidence": 10,
       "fault_injected": true,
       "chain_declared": true,
-      "chain_order_correct": false,
+      "chain_order_correct": true,
       "affected_services_correct": true,
-      "tool_calls": 9,
+      "tool_calls": 12,
       "tokens_used": 0
     }
   ],
@@ -126,10 +126,10 @@
     "diagnosis_accuracy": 1.0,
     "abstention_rate": 0.1667,
     "evidence_recall_mean": 1.0,
-    "citation_precision_mean": 0.7786,
-    "mean_tool_calls": 4.0,
+    "citation_precision_mean": 0.77,
+    "mean_tool_calls": 4.5,
     "mean_tokens": 0.0,
-    "chain_order_accuracy": 0.0,
+    "chain_order_accuracy": 1.0,
     "affected_services_accuracy": 1.0
   },
   "note": "synthetic scenarios; not a real-world accuracy claim"

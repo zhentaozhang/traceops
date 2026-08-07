@@ -145,6 +145,13 @@ class RCAReport(BaseModel):
         default_factory=list,
         description="影响范围：因根因服务故障而受波及的上游服务（来自拓扑 blast radius）",
     )
+    propagation_chain: list[dict] = Field(
+        default_factory=list,
+        description=(
+            "传播路径：故障沿拓扑传导的节点序列（dict 形式，见 rca/chain.py 的 PropagationNode）。"
+            "与 hypotheses 是两个概念：链上受影响节点不需要有独立故障机制，但必须有证据支撑。"
+        ),
+    )
     missing_data: list[str] = Field(default_factory=list)
     abstained: bool = False
     generated_at: datetime = Field(default_factory=_utcnow)

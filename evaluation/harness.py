@@ -25,7 +25,10 @@ from traceops.runtime.budget import BudgetManager
 from traceops.topology.graph import ServiceTopology
 
 STEP_SECONDS = 60
-MAX_TOOL_CALLS = 10
+# 每次调查的查询计划随拓扑扩大：单服务 = 3 次查询；两层采集（调查层 + 影响层）
+# 在 3 服务场景下需要约 9~12 次。预算必须覆盖完整计划，否则会静默截断采集、
+# 导致传播链天然不完整——这是之前 chain=0.00 的一个隐藏成因。
+MAX_TOOL_CALLS = 40
 
 
 class ScenarioDataUnavailable(RuntimeError):

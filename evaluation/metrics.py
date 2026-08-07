@@ -88,21 +88,19 @@ def _rank_of_service(hypotheses: list, service: str) -> int | None:
     return min(ranks) if ranks else None
 
 
-def _chain_order_correct(ground_truth, hypotheses: list) -> bool | None:
-    """传播链顺序校验：链上各服务的排名必须与链顺序一致（下游在前）。
+def _chain_order_correct(ground_truth, report) -> bool | None:
+    """传播链校验：报告里的 propagation_chain 是否复现了 ground truth 的链。
+
+    用 propagation_chain 而不是 hypotheses —— 链上的受影响节点不该被要求有
+    独立候选假设（那会让系统编造不存在的故障机制）。
 
     返回 None 表示该场景未声明传播链（不参与统计），避免"没声明就算对"。
     """
-    chain = [hop for hop in ground_truth.propagation_chain if hop]
-    if len(chain) < 2:
+    expected = [hop for hop in ground_truth.propagation_chain if hop]
+    if len(expected) < 2 or report is None:
         return None
-    ranks: list[int] = []
-    for hop in chain:
-        found = _rank_of_service(hypotheses, hop)
-        if found is None:
-            return False  # 链上某跳完全没有候选 → 链未识别
-        ranks.append(found)
-    return all(ranks[i] < ranks[i + 1] for i in range(len(ranks) - 1))
+    actual = [node.get("service") for node in report.propagation_chain]
+    return actual == expected
 
 
 def _affected_services_correct(ground_truth, report) -> bool | None:
@@ -178,7 +176,7 @@ def score_scenario(scenario: "Scenario", result: "InvestigationResult") -> Scena
         tool_calls=result.tool_calls,
         tokens_used=result.tokens_used,
         chain_declared=bool(ground_truth.propagation_chain),
-        chain_order_correct=_chain_order_correct(ground_truth, hypotheses),
+        chain_order_correct=_chain_order_correct(ground_truth, report),
         affected_services_correct=_affected_services_correct(ground_truth, report),
     )
 

@@ -319,3 +319,55 @@ class TestInvestigationRunStateMachine:
         assert snap["config"]["workflow_version"] == "p0-v1"
         assert snap["config"]["model_name"] == "deterministic-rules"
         assert snap["terminal"] is False
+
+
+class TestMessageShapeTolerance:
+    """两种合法输入形状都必须能直接工作。
+
+    历史问题：Redis entry 里是一个 payload field 装着整份文档，而 worker 期望
+    契约的两层形状。若不做归一，所有真实 Streams 消息都会被判为 INVALID_REQUEST，
+    而调用方只能靠"记得包一层 adapter"才不炸 —— 这种隐藏依赖迟早出事。
+
+    这里在 worker 入口归一，两种形状都测一遍。
+    """
+
+    def _flattened(self) -> dict:
+        """Redis Streams entry 形状：外层 payload 装整份文档。"""
+        doc = requested_event()
+        return {"id": "1700000000000-1", "payload": doc}
+
+    def test_flattened_shape_is_accepted(self):
+        request = derive_request_from_event(self._flattened())
+        assert request.investigation_run_id == "run-001"
+        assert request.service_hint == "order-service"
+        assert request.incident_id == "inc-001"
+
+    def test_contract_shape_still_accepted(self):
+        request = derive_request_from_event(requested_event())
+        assert request.investigation_run_id == "run-001"
+
+    def test_flattened_shape_end_to_end_through_worker(self):
+        worker, source, sink = make_worker(OkAdapters())
+        source.push(self._flattened())
+
+        stats = worker.poll_once()
+
+        assert stats.succeeded == 1
+        events = [m["envelope"]["event_type"] for m in sink.messages]
+        assert events == ["investigation.updated", "investigation.completed"]
+
+    def test_flattened_shape_still_rejects_wrong_producer(self):
+        doc = requested_event()
+        doc["envelope"]["producer"] = "agent-runtime"
+        with pytest.raises(ValueError, match="producer"):
+            derive_request_from_event({"payload": doc})
+
+    def test_malformed_shape_does_not_create_request(self):
+        """缺字段时明确报错，而不是构造一个半成品请求。"""
+        with pytest.raises(ValueError, match="service_hint"):
+            derive_request_from_event({"payload": {"payload": {
+                "investigation_run_id": "run-x", "incident_id": "inc-x",
+                "environment": "demo",
+                "time_range": {"start": WINDOW_START.isoformat(), "end": WINDOW_END.isoformat()},
+                "config_version": "cfg",
+            }}})

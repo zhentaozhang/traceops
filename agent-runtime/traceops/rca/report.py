@@ -33,6 +33,7 @@ def build_report(
     missing_data: list[str] | None = None,
     affected_services: list[str] | None = None,
     correlation_notes: list[str] | None = None,
+    propagation_chain: list | None = None,
 ) -> RCAReport:
     """组装并校验诊断报告。
 
@@ -102,6 +103,7 @@ def build_report(
         hypothesis_evidence=links,
         evidence=list(evidence),
         affected_services=list(affected_services or []),
+        propagation_chain=[node.to_dict() for node in (propagation_chain or [])],
         missing_data=missing_data or [],
         abstained=diagnosis != "SUPPORTED",
     )

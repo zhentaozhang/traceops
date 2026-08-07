@@ -130,16 +130,22 @@ class TestScopeExpansion:
         assert "order-service" in queried      # service_hint 本身
         assert "redis" in queried              # 下游依赖（真正的根因所在）
         assert "mysql" in queried              # 另一个下游依赖
-        assert "api-gateway" not in queried    # 上游症状不主动展开
+        # api-gateway 属于影响层：会被采集（传播链需要），但不得成为候选根因。
+        # 候选断言见 test_impact_evidence_does_not_create_candidates。
 
-    def test_scope_depth_zero_queries_only_hint(self):
+    def test_scope_depth_zero_queries_only_hint_and_impact(self):
+        """depth=0 时调查层只剩起点；影响层仍是它的直接调用方。"""
         adapters = MultiServiceAdapters()
         ctx = context(adapters)
         ctx.scope_depth = 0
 
         run_investigation(request(), ctx)
 
-        assert {service for _, service in adapters.calls} == {"order-service"}
+        queried = {service for _, service in adapters.calls}
+        assert "order-service" in queried
+        # depth=0 时不向下游扩展
+        assert "redis" not in queried
+        assert "mysql" not in queried
 
 
 class TestRootCauseVersusSymptom:

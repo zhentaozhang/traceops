@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, TypedDict
 
+from langchain_core.runnables import RunnableConfig
+
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -26,9 +28,11 @@ from traceops.domain.models import (
     RootCauseHypothesis,
 )
 from traceops.evidence.graph import build_evidence_graph, earliest_anomaly, ordering_violations
+from traceops.evidence.templates import QueryTemplateError, default_registry
 from traceops.evidence.normalizer import normalize
 from traceops.evidence.store import EvidenceStore
 from traceops.orchestration.detectors import attribute_evidence, generate_hypotheses
+from traceops.rca.chain import build_propagation_chain
 from traceops.rca.ranking import RankedCandidate, derive_signals, rank_hypotheses
 from traceops.rca.report import build_report
 from traceops.runtime.budget import BudgetExhausted, BudgetManager
@@ -91,7 +95,10 @@ class RunContext:
     gateway: ToolGateway | None = None
     model: Any | None = None  # ModelClient；None 时只用确定性检测器
     topology: Any | None = None  # ServiceTopology；None 时退化为单服务调查
-    scope_depth: int = 1  # 向下游依赖展开的层数
+    scope_depth: int = 1  # 向下游依赖展开的层数（调查层）
+    # 影响层：向上游（调用方）采集症状证据，只用于传播链/影响范围，不进候选。
+    # 关掉它就退化为一层采集（症状不会再出现在链上）。
+    impact_scope: bool = True
 
 
 @dataclass
@@ -105,8 +112,14 @@ class InvestigationResult:
 
 
 class InvestigationState(TypedDict, total=False):
+    """图状态。
+
+    **不包含 RunContext**：它持有 EvidenceStore / adapters / model 等运行时对象，
+    不可序列化。放进来会导致 LangGraph checkpoint 失败（msgpack 无法编码），
+    也就等于失去崩溃恢复能力。运行时依赖经 config 传递（见 `_ctx_from`）。
+    """
+
     request: InvestigationRequest
-    ctx: RunContext
     plan: list[dict[str, Any]]
     evidence: list[Evidence]
     hypotheses: list[RootCauseHypothesis]
@@ -119,46 +132,92 @@ class InvestigationState(TypedDict, total=False):
     missing_data: list[str]
 
 
+CTX_CONFIG_KEY = "traceops_ctx"
+
+
+def _ctx_from(config: Any) -> RunContext:
+    """从 config 取运行时依赖。
+
+    依赖不进 state 是有意的：state 会被序列化到 checkpoint，
+    塞进不可序列化对象会直接让 checkpoint 失效。
+    """
+    if config is None:
+        raise ValueError("investigation graph requires run context in config")
+    configurable = config.get("configurable") if hasattr(config, "get") else None
+    ctx = (configurable or {}).get(CTX_CONFIG_KEY)
+    if ctx is None:
+        raise ValueError(f"config.configurable[{CTX_CONFIG_KEY!r}] is missing")
+    return ctx
+
+
 def _parse_dt(value: str | datetime) -> datetime:
     if isinstance(value, datetime):
         return value
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def _scope_services(request: InvestigationRequest, ctx: "RunContext") -> list[str]:
-    """调查范围：service_hint + 其下游依赖（按拓扑展开）。
+INVESTIGATION_TIER = "investigation"
+IMPACT_TIER = "impact"
 
-    不向上游展开：调用方看到的是症状，不是根因所在。
+
+def _scope_services(request: InvestigationRequest, ctx: "RunContext") -> list[tuple[str, str]]:
+    """返回 [(service, tier)]。
+
+    两层语义（见 tests/orchestration/test_two_tier_collection.py 的模块 docstring）：
+    - investigation：起点 + 下游依赖 → 参与假设生成与排序
+    - impact：上游调用方 → 只参与传播链与影响范围
+
+    不把上游并进 investigation，是因为调用方的错误几乎总是症状；
+    让它成为候选等于制造错误根因。
     """
     if ctx.topology is None:
-        return [request.service_hint]
-    scope = ctx.topology.expand_scope(request.service_hint, depth=ctx.scope_depth)
-    services = sorted(scope)
-    # service_hint 排在最前，便于阅读审计记录
-    services.remove(request.service_hint)
-    return [request.service_hint] + services
+        return [(request.service_hint, INVESTIGATION_TIER)]
+
+    investigation = ctx.topology.expand_scope(request.service_hint, depth=ctx.scope_depth)
+    ordered = [request.service_hint] + sorted(investigation - {request.service_hint})
+    tiers = [(service, INVESTIGATION_TIER) for service in ordered]
+
+    if ctx.impact_scope:
+        upstream = ctx.topology.blast_radius(request.service_hint, depth=ctx.scope_depth)
+        extra = sorted(upstream - investigation - {request.service_hint})
+        tiers.extend((service, IMPACT_TIER) for service in extra)
+
+    return tiers
 
 
 def _plan_items(request: InvestigationRequest, ctx: "RunContext") -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for service in _scope_services(request, ctx):
+    for service, tier in _scope_services(request, ctx):
         base = {
             "service": service,
             "start": request.window_start.isoformat(),
             "end": request.window_end.isoformat(),
         }
         for tool, source_id, evidence_type, template_id in _PLAN_TEMPLATES:
-            params = dict(base)
+            template_params: dict[str, Any] = {
+                "service": service, "start": base["start"], "end": base["end"],
+            }
             if tool == "query_service_traces":
-                params["min_duration_ms"] = SLOW_SPAN_THRESHOLD_MS
+                template_params["min_duration_ms"] = SLOW_SPAN_THRESHOLD_MS
+            # 模板渲染失败 = 计划非法：宁可少查一个数据源，也不发出未校验的查询
+            try:
+                rendered_query = default_registry().build(template_id, template_params)
+            except QueryTemplateError as exc:
+                raise ValueError(
+                    f"cannot build query for {service}/{template_id}: {exc}"
+                ) from exc
+
             items.append(
                 {
                     "tool": tool,
-                    "params": params,
+                    # params 必须严格符合工具 schema；rendered_query 单独携带，只进审计
+                    "params": dict(base),
                     "source_id": source_id,
                     "evidence_type": evidence_type,
                     "query_template_id": template_id,
                     "service": service,
+                    "tier": tier,
+                    "rendered_query": rendered_query,
                 }
             )
     if request.config_change is not None:
@@ -224,14 +283,14 @@ def _observed_at(raw: dict[str, Any], evidence_type: EvidenceType, fallback: dat
 
 # ---------------- nodes ----------------
 
-def _plan_node(state: InvestigationState) -> dict[str, Any]:
+def _plan_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
     request = state["request"]
-    return {"plan": _plan_items(request, state["ctx"])}
+    return {"plan": _plan_items(request, _ctx_from(config))}
 
 
-def _collect_node(state: InvestigationState) -> dict[str, Any]:
+def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
     request = state["request"]
-    ctx = state["ctx"]
+    ctx = _ctx_from(config)
     gateway = ctx.gateway or _build_gateway(ctx)
     ctx.gateway = gateway
     evidence_list: list[Evidence] = []
@@ -269,7 +328,7 @@ def _collect_node(state: InvestigationState) -> dict[str, Any]:
                     else None
                 ),
                 query_template_id=item["query_template_id"],
-                query_params=item["params"],
+                query_params={**item["params"], "_tier": item.get("tier", INVESTIGATION_TIER)},
                 raw_payload=raw,
                 observed_at=observed_at,
                 window=window,
@@ -285,7 +344,7 @@ def _collect_node(state: InvestigationState) -> dict[str, Any]:
     return {"evidence": evidence_list, "missing_data": missing}
 
 
-def _hypothesize_node(state: InvestigationState) -> dict[str, Any]:
+def _hypothesize_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
     """确定性检测器 + （可选）模型提案。
 
     模型提案不替代规则：两者合并，进入同一套规则排序。
@@ -293,12 +352,18 @@ def _hypothesize_node(state: InvestigationState) -> dict[str, Any]:
     模型挂掉更不该。
     """
     request = state["request"]
-    ctx = state["ctx"]
+    ctx = _ctx_from(config)
     evidence_list = state.get("evidence", [])
     missing = list(state.get("missing_data", []))
 
+    # 只有调查层证据能生成候选：影响层（上游症状）不产生根因候选，
+    # 否则会把调用方当根因。它们仍进 Store、仍参与传播链。
+    investigation_evidence = [
+        e for e in evidence_list
+        if e.query_params.get("_tier", INVESTIGATION_TIER) == INVESTIGATION_TIER
+    ]
     hypotheses = generate_hypotheses(
-        evidence_list,
+        investigation_evidence,
         investigation_run_id=request.investigation_run_id,
         topology=ctx.topology,
     )
@@ -350,8 +415,8 @@ def _evidence_summary(evidence_list: list[Evidence]) -> dict[str, Any]:
     return summary
 
 
-def _link_node(state: InvestigationState) -> dict[str, Any]:
-    ctx = state["ctx"]
+def _link_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
+    ctx = _ctx_from(config)
     request = state["request"]
     links: list[HypothesisEvidence] = []
     for hypothesis in state.get("hypotheses", []):
@@ -403,13 +468,13 @@ def _event_component(evidence: Evidence) -> str | None:
     return None
 
 
-def _correlate_node(state: InvestigationState) -> dict[str, Any]:
+def _correlate_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
     """证据关联（蓝图 §6.3）：构建证据图，产出时间线与关联统计。
 
     不产出"因果结论"：这里只回答"哪些证据属于同一次故障链、谁先谁后"，
     由诊断层负责解释。
     """
-    ctx = state["ctx"]
+    ctx = _ctx_from(config)
     request = state["request"]
     evidence_list = state.get("evidence", [])
     missing = list(state.get("missing_data", []))
@@ -440,20 +505,20 @@ def _correlate_node(state: InvestigationState) -> dict[str, Any]:
     return {"evidence_graph_summary": summary, "missing_data": missing}
 
 
-def _rank_node(state: InvestigationState) -> dict[str, Any]:
+def _rank_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
     request = state["request"]
     hypotheses = state.get("hypotheses", [])
     if not hypotheses:
         return {"ranked": []}
     signals = [
-        derive_signals(h, state.get("links", []), state["ctx"].store, fault_start=request.fault_start)
+        derive_signals(h, state.get("links", []), _ctx_from(config).store, fault_start=request.fault_start)
         for h in hypotheses
     ]
     ranked = rank_hypotheses(hypotheses, signals)
 
     # 拓扑分层：同分时越靠下游（更可能是根因）的排前。
     # 规则分不同则不动 —— 证据强度优先，拓扑只做平局裁决。
-    topology = state["ctx"].topology
+    topology = _ctx_from(config).topology
     if topology is not None:
         order = {name: index for index, name in enumerate(topology.blame_order({h.candidate_service for h in hypotheses}))}
         by_id = {h.id: h for h in hypotheses}
@@ -463,9 +528,9 @@ def _rank_node(state: InvestigationState) -> dict[str, Any]:
     return {"ranked": ranked}
 
 
-def _affected_services(state: InvestigationState) -> list[str]:
+def _affected_services(state: InvestigationState, config: RunnableConfig) -> list[str]:
     """影响范围 = 首选根因服务的上游（blast radius），排除根因自身。"""
-    topology = state["ctx"].topology
+    topology = _ctx_from(config).topology
     ranked = state.get("ranked") or []
     hypotheses = state.get("hypotheses") or []
     if topology is None or not ranked:
@@ -477,6 +542,24 @@ def _affected_services(state: InvestigationState) -> list[str]:
     radius = topology.blast_radius(lead.candidate_service, depth=2)
     radius.discard(lead.candidate_service)
     return sorted(radius)
+
+
+def _propagation_chain(state: InvestigationState, ctx: RunContext) -> list:
+    """按首选根因构建传播链（含无独立故障机制但受影响的节点）。"""
+    ranked = state.get("ranked") or []
+    hypotheses = state.get("hypotheses") or []
+    evidence_list = state.get("evidence") or []
+    if not ranked:
+        return []
+    top_id = ranked[0].hypothesis_id
+    lead = next((h for h in hypotheses if h.id == top_id), None)
+    if lead is None:
+        return []
+    return build_propagation_chain(
+        root_service=lead.candidate_service,
+        evidence_list=evidence_list,
+        topology=ctx.topology,
+    )
 
 
 def _correlation_notes(state: InvestigationState) -> list[str]:
@@ -493,9 +576,9 @@ def _correlation_notes(state: InvestigationState) -> list[str]:
     return notes
 
 
-def _report_node(state: InvestigationState) -> dict[str, Any]:
+def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
     request = state["request"]
-    ctx = state["ctx"]
+    ctx = _ctx_from(config)
     report = build_report(
         investigation_run_id=request.investigation_run_id,
         hypotheses=state.get("hypotheses", []),
@@ -505,8 +588,9 @@ def _report_node(state: InvestigationState) -> dict[str, Any]:
         fault_start=request.fault_start,
         store=ctx.store,
         missing_data=list(state.get("missing_data", [])),
-        affected_services=_affected_services(state),
+        affected_services=_affected_services(state, config),
         correlation_notes=_correlation_notes(state),
+        propagation_chain=_propagation_chain(state, ctx),
     )
     return {"report": report, "status": report.diagnosis_status}
 
@@ -521,7 +605,14 @@ def _route_after_collect(state: InvestigationState) -> str:
     return "stop" if state.get("status") == "FAILED" else "continue"
 
 
-def build_investigation_graph():
+def build_investigation_graph(*, checkpointer: Any | None = None,
+                              interrupt_before: list[str] | None = None):
+    """构建调查图。
+
+    Args:
+        checkpointer: LangGraph checkpointer；提供时支持中断/恢复（P2）。
+        interrupt_before: 在这些节点前中断（用于模拟崩溃点、验证恢复语义）。
+    """
     builder = StateGraph(InvestigationState)
     builder.add_node("plan", _plan_node)
     builder.add_node("collect", _collect_node)
@@ -541,17 +632,12 @@ def build_investigation_graph():
     builder.add_edge("correlate", "rank")
     builder.add_edge("rank", "report")
     builder.add_edge("report", END)
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer, interrupt_before=interrupt_before or [])
 
 
-def run_investigation(request: InvestigationRequest, ctx: RunContext) -> InvestigationResult:
-    """执行一次完整调查。异常只允许在编程错误时抛出；业务失败进 result。"""
-    if ctx.gateway is None:
-        ctx.gateway = _build_gateway(ctx)
-    graph = build_investigation_graph()
-    initial: InvestigationState = {
+def _initial_state(request: InvestigationRequest) -> InvestigationState:
+    return {
         "request": request,
-        "ctx": ctx,
         "plan": [],
         "evidence": [],
         "hypotheses": [],
@@ -563,7 +649,26 @@ def run_investigation(request: InvestigationRequest, ctx: RunContext) -> Investi
         "errors": [],
         "missing_data": [],
     }
-    final = graph.invoke(initial)
+
+
+def run_investigation(request: InvestigationRequest, ctx: RunContext, *,
+                      thread_id: str | None = None,
+                      checkpointer: Any | None = None) -> InvestigationResult:
+    """执行一次完整调查。异常只允许在编程错误时抛出；业务失败进 result。
+
+    Args:
+        thread_id: 提供时用作 checkpoint 的线程标识（同一 thread 的多次调用共享
+            进度，用于崩溃恢复）。
+        checkpointer: 提供时启用 checkpointing。
+    """
+    if ctx.gateway is None:
+        ctx.gateway = _build_gateway(ctx)
+    graph = build_investigation_graph(checkpointer=checkpointer)
+    configurable: dict[str, Any] = {CTX_CONFIG_KEY: ctx}
+    if thread_id:
+        configurable["thread_id"] = thread_id
+    config = {"configurable": configurable}
+    final = graph.invoke(_initial_state(request), config)
     report = final.get("report")
     status = final.get("status", "FAILED")
     if report is None and status != "FAILED":

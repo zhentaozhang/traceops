@@ -19,6 +19,12 @@ from typing import Any, Callable, Protocol
 
 from traceops.orchestration.graph import InvestigationRequest, RunContext, run_investigation
 from traceops.runtime.budget import BudgetExhausted, BudgetManager
+from traceops.runtime.deadletter import (
+    DeadLetterRecord,
+    FailureCategory,
+    classify_failure,
+    now_iso,
+)
 from traceops.runtime.investigation_run import InvestigationConfigSnapshot, InvestigationRun, RunStatus
 
 SCHEMA_VERSION = "1.0"
@@ -189,12 +195,15 @@ class InvestigationWorker:
         derive_request: DeriveRequest,
         build_context: BuildContext,
         known_run_ids: set[str] | None = None,
+        dead_letters: Any | None = None,
     ) -> None:
         self.source = source
         self.sink = sink
         self.derive_request = derive_request
         self.build_context = build_context
         self._known_run_ids = set(known_run_ids or ())
+        # 坏消息不能静默 ACK 掉：转移到死信流，保留审计痕迹
+        self.dead_letters = dead_letters
 
     def poll_once(self, *, limit: int = 50) -> WorkerStats:
         stats = WorkerStats()
@@ -212,10 +221,25 @@ class InvestigationWorker:
             stats.processed += 1
         return stats
 
+    def _dead_letter(self, message: dict[str, Any], exc: Exception) -> None:
+        if self.dead_letters is None:
+            return
+        self.dead_letters.send(DeadLetterRecord(
+            original_entry_id=str(message.get("id", "unknown")),
+            stream=str(message.get("_stream", "traceops.events")),
+            group=str(message.get("_group", "traceops-workers")),
+            consumer=str(message.get("_consumer", "worker")),
+            category=classify_failure(str(exc)),
+            reason=str(exc)[:2000],
+            raw=str(message)[: DeadLetterRecord.MAX_RAW_CHARS],
+            occurred_at=now_iso(),
+        ))
+
     def _handle(self, message: dict[str, Any], stats: WorkerStats) -> None:
         try:
             request = self.derive_request(message)
         except Exception as exc:  # 请求本身非法 → 不重试
+            self._dead_letter(message, exc)
             self.sink.publish(_invalid_request_event(message, str(exc)))
             stats.failed += 1
             return
@@ -291,14 +315,30 @@ def _invalid_request_event(message: dict[str, Any], detail: str) -> dict[str, An
 
 # ---------------- 默认派生器 ----------------
 
+def _normalise_message_shape(message: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """统一两种合法输入形状。
+
+    A) 契约文档形状（推荐）：{"envelope": {...}, "payload": {...}}
+    B) Redis Streams 摊平形状：{"payload": {"envelope": {...}, "payload": {...}}, "id": ...}
+       —— entry 里只有一个 payload field 装着整份文档（生产者通常这么写）
+
+    两种都必须支持：形状差异不应该让调用方"记得包 adapter"才能正常工作，
+    那是隐藏的易错点。这里在入口处归一到契约形状。
+    """
+    outer = message.get("payload") or {}
+    if isinstance(outer, dict) and "envelope" in outer and "payload" in outer:
+        # B 形状：外层 payload 实际是整份文档
+        return outer.get("envelope") or {}, outer.get("payload") or {}
+    return message.get("envelope") or {}, outer
+
+
 def derive_request_from_event(message: dict[str, Any]) -> InvestigationRequest:
     """把 investigation.requested 的 payload 转成调查请求。
 
     契约里 time_range 是 [start, end]；fault_start 取窗口末尾（告警触发时刻），
     这是 P0 的合理近似 —— 精确故障起点需要真实告警时间戳，属 S4 待验证项。
     """
-    payload = message.get("payload") or {}
-    envelope = message.get("envelope") or {}
+    envelope, payload = _normalise_message_shape(message)
 
     if envelope.get("event_type") not in (None, "investigation.requested"):
         raise ValueError(f"unexpected event_type: {envelope.get('event_type')!r}")
