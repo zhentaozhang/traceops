@@ -141,25 +141,33 @@ def generate_hypotheses(
     topology: object | None = None,
 ) -> list[RootCauseHypothesis]:
     """从证据生成候选假设（确定性）。同一 (service, fault_type, component) 只生成一次。"""
-    seen: set[tuple[str, str, str | None]] = set()
+    # 去重键 = (service, fault_type)。**不含 component**：
+    # 同一条慢链路可能从日志推出 "redis-connection-pool"、从 span 推出 None，
+    # 那是同一种故障机制的两种描述，不该算成两个候选。否则候选集被同一服务灌满，
+    # 触发歧义闸门 → 把本来明确的根因降级成 INCONCLUSIVE。
+    # component 作"最具体者胜"合并：先有的保留，后来更具体的覆盖。
+    seen: dict[tuple[str, str], RootCauseHypothesis] = {}
     hypotheses: list[RootCauseHypothesis] = []
 
     def _add(service: str, fault_type: str, component: str | None, mechanism: str) -> None:
-        key = (service, fault_type, component)
-        if key in seen:
+        key = (service, fault_type)
+        existing = seen.get(key)
+        if existing is not None:
+            # 更具体的组件信息优先，但不新增候选
+            if component and not existing.candidate_component:
+                existing.candidate_component = component
             return
-        seen.add(key)
-        hypotheses.append(
-            RootCauseHypothesis(
-                investigation_run_id=investigation_run_id,
-                candidate_service=service,
-                candidate_component=component,
-                fault_type=fault_type,
-                failure_mechanism=mechanism,
-                predicted_observations=[],
-                status=HypothesisStatus.PROPOSED,
-            )
+        hypothesis = RootCauseHypothesis(
+            investigation_run_id=investigation_run_id,
+            candidate_service=service,
+            candidate_component=component,
+            fault_type=fault_type,
+            failure_mechanism=mechanism,
+            predicted_observations=[],
+            status=HypothesisStatus.PROPOSED,
         )
+        seen[key] = hypothesis
+        hypotheses.append(hypothesis)
 
     for ev in evidence_list:
         if ev.service_id is None:
@@ -199,9 +207,11 @@ def generate_hypotheses(
                 _add(owner_service, "latency_degradation", owner_component,
                      f"slow span on {owner_service} observed by {ev.service_id}")
             else:
-                prefix = span_name.split(".")[1] if "." in span_name else ""
-                component = prefix or None
-                _add(ev.service_id, "latency_degradation", component,
-                     "slow span on downstream dependency")
+                # 慢链路但没有可归因的依赖时，**不要**从 span 名切出"组件"。
+                # `redis.command` 的第二段是动词（command/get/set），不是组件名。
+                # 把动词当组件会让它错误地拿到"组件具体"加分，进而与真实组件
+                # （redis-connection-pool）并列，最终只能按 UUID 随机排序。
+                _add(ev.service_id, "latency_degradation", None,
+                     "slow span on downstream dependency (component unknown)")
 
     return hypotheses

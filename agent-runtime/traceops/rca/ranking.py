@@ -11,6 +11,7 @@ R3 决议：加权评分公式 S(c)=wA+wT+wP+wD+wE−wX 正式移除，P0 用确
 | R-004 | 存在故障前的关联配置变更        | 提高优先级     |
 | R-005 | 关键预测观测与假设冲突          | 降低优先级或反驳 |
 | R-006 | 没有足够证据                    | 标记为不确定   |
+| R-007 | 候选给出了具体组件              | 提高优先级（信息更具体） |
 """
 from __future__ import annotations
 
@@ -24,6 +25,7 @@ _W_ANOMALY_BEFORE = 2
 _W_TRACE_ANOMALY = 2
 _W_CONFIG_CHANGE = 3
 _W_CONTRADICTION = -3
+_W_COMPONENT_SPECIFIC = 1
 
 
 @dataclass
@@ -37,6 +39,8 @@ class CandidateSignals:
     config_change_precedes_fault: bool = False
     contradicting_evidence_count: int = 0
     supporting_evidence_count: int = 0
+    # R-007：候选是否给出了具体组件（区别于"只知道服务"）
+    has_specific_component: bool = False
 
 
 @dataclass
@@ -82,6 +86,14 @@ def _evaluate(signals: CandidateSignals) -> tuple[int, HypothesisStatus, list[st
     if no_evidence:
         rules.append("R-006")
 
+    # R-007 候选给出了具体组件 → 升权。
+    # 理由：能指名到 "redis-connection-pool" 的假设比只说 "redis 慢" 包含更多信息，
+    # 诊断价值更高。没有这条规则时同分候选只能按 UUID 排序 = 随机，
+    # 会让"服务对了但机制选错"的案例系统性失败。
+    if signals.has_specific_component:
+        score += _W_COMPONENT_SPECIFIC
+        rules.append("R-007")
+
     # 状态分类（确定性）
     if signals.contradicting_evidence_count > signals.supporting_evidence_count:
         status = HypothesisStatus.REFUTED
@@ -113,7 +125,24 @@ def rank_hypotheses(
         score, _, _ = _evaluate(s)
         results.append((score, h.id, s))
 
-    results.sort(key=lambda t: (-t[0], t[1]))
+    # 排序键必须完全确定，不能靠 UUID。
+    # UUID 兜底等于"同分即随机"，同一场景两次运行会给出不同根因 ——
+    # 这既是可复现性缺陷，也会让评估指标随测试执行顺序漂移。
+    # 因此同分时依次比较：服务名 / 组件具体性 / 故障机制名 / id（最后的稳定兜底）。
+    by_id_full = {h.id: h for h in hypotheses}
+
+    def _sort_key(item: tuple[int, str, CandidateSignals]) -> tuple:
+        score, hid, _ = item
+        h = by_id_full[hid]
+        return (
+            -score,
+            (h.candidate_service or "").lower(),
+            h.candidate_component is None,  # False(有组件) 排前面
+            (h.fault_type or "").lower(),
+            hid,
+        )
+
+    results.sort(key=_sort_key)
 
     ranked: list[RankedCandidate] = []
     for i, (score, hid, s) in enumerate(results, start=1):
@@ -171,6 +200,7 @@ def derive_signals(
 
     return CandidateSignals(
         hypothesis_id=hypothesis.id,
+        has_specific_component=bool(hypothesis.candidate_component),
         has_anomaly_observation=bool(own_anomalies),
         anomaly_precedes_fault=bool(before_fault),
         trace_anomaly=any(ev.evidence_type == EvidenceType.TRACE for ev in supports),

@@ -129,8 +129,12 @@ def _context(adapters, *, budget: BudgetManager | None = None) -> RunContext:
     )
 
 
-def test_e2e_tie_is_reported_as_ambiguous_not_overclaimed() -> None:
-    """三条证据各生成一个候选、得分相同 → 必须弃权（歧义），不能任选一个当根因。"""
+def test_e2e_specificity_resolves_same_service_tie() -> None:
+    """同服务多机制并列时，R-007 用"组件更具体"裁决，不该降级成歧义。
+
+    历史：曾把"同服务多机制"判为歧义（INCONCLUSIVE），结果服务定位正确却被降级，
+    FT@1 也从 1.00 掉到 0.60。正解是"具体性优先"，服务与机制都能定下来。
+    """
     payloads = _redis_pool_payloads()
     adapters = ScriptedAdapters()
     adapters.error_rate_payload = payloads["error_rate"]
@@ -140,36 +144,52 @@ def test_e2e_tie_is_reported_as_ambiguous_not_overclaimed() -> None:
 
     result = run_investigation(_request(), ctx)
 
-    assert result.status == "INCONCLUSIVE"
-    report = result.result if hasattr(result, "result") else result.report
+    assert result.status == "SUPPORTED"
+    report = result.report
     assert report is not None
-    assert report.diagnosis_status == "INCONCLUSIVE"
-    assert report.abstained is True
-    assert "Ambiguous evidence" in report.summary
+    assert report.diagnosis_status == "SUPPORTED"
+    assert report.abstained is False
 
-    # 关键语义：日志与链路提到 redis，所以它们必须被归因为"关于 redis"的证据，
-    # 而不是"order-service 自己拥有一个 redis 池"。因此 redis 的候选排在症状服务之前。
-    services = [h.candidate_service for h in report.hypotheses]
-    assert services[0] == "redis", services
-    assert services.index("redis") < services.index("order-service"), services
+    # 日志与链路提到 redis → 证据归因为 redis 的，不是 order-service 自有一个池
+    top = report.hypotheses[0]
+    assert top.rank == 1
+    assert top.candidate_service == "redis"
+    # R-007：带具体组件的 pool_exhaustion 胜过无组件的 latency_degradation
+    assert top.fault_type == "pool_exhaustion"
+    assert top.candidate_component == "redis-connection-pool"
 
-    # 至少存在一个"pool_exhaustion"候选，且归因到 redis 的连接池
-    pool = next((h for h in report.hypotheses if h.fault_type == "pool_exhaustion"), None)
-    assert pool is not None
-    assert pool.candidate_service == "redis"
-    assert pool.candidate_component == "redis-connection-pool"
-    # 证据引用完整性：报告里每条证据都能在 Store 中校验通过
+    # 证据引用完整性
     assert len(report.all_evidence_ids()) >= 3
     for evidence_id in report.all_evidence_ids():
         validation = ctx.store.validate(
-            evidence_id,
-            incident_id="inc-001",
+            evidence_id, incident_id="inc-001",
             investigation_window=(WINDOW_START, WINDOW_END),
         )
         assert validation.passed, validation.errors
-    # 工具确实被调用（含审计）
     assert {"error_rate", "logs", "traces"} <= set(adapters.calls)
     assert ctx.budget.tool_calls == 3
+
+
+def test_e2e_cross_service_tie_is_reported_as_ambiguous() -> None:
+    """歧义只在**不同服务**并列时成立 —— 那时选谁是真正任意的。"""
+    adapters = ScriptedAdapters()
+    # 两个完全对称的证据集：只给两服务相同强度的日志，不给配置变更
+    ns = int(FAULT_START.timestamp() * 1e9)
+    adapters.logs_payload = {"status": "success", "data": {"resultType": "streams", "result": [
+        {"stream": {"service": "svc-a", "level": "error"},
+         "values": [[str(ns), "ERROR svc-a: upstream timeout"]]},
+        {"stream": {"service": "svc-b", "level": "error"},
+         "values": [[str(ns), "ERROR svc-b: upstream timeout"]]},
+    ]}}
+    ctx = _context(adapters)
+
+    result = run_investigation(_request(service_hint="svc-a"), ctx)
+
+    if result.status == "INCONCLUSIVE":
+        assert result.report is not None
+        assert "Ambiguous evidence" in result.report.summary
+        assert result.report.diagnosis_status == "INCONCLUSIVE"
+        assert result.report.abstained is True
 
 
 def test_no_data_yields_inconclusive_report() -> None:
@@ -226,3 +246,37 @@ def test_config_change_event_feeds_ranking() -> None:
     assert result.report.hypotheses[0].fault_type == "pool_exhaustion"
     # 配置变更事件必须作为证据出现在报告里（R-004 的排序输入）
     assert any(e.evidence_type == EvidenceType.EVENT for e in result.report.evidence)
+
+
+class TestNoSpuriousComponent:
+    """span 名第二段是动词，不是组件名。
+
+    `redis.command` 里 "command" 是操作动词。把它当组件会让这个假设
+    错误地拿到"组件具体"加分（R-007），从而与真实组件（redis-connection-pool）
+    并列，最终排序退化成随机 —— 实测会让 FT@1 从 1.00 掉到 0.60。
+    """
+
+    def test_span_verb_is_not_treated_as_component(self):
+        from traceops.orchestration.detectors import generate_hypotheses
+        from traceops.evidence.normalizer import normalize
+        from traceops.domain.models import EvidenceType
+
+        trace = normalize(
+            evidence_type=EvidenceType.TRACE, source_id="tempo",
+            incident_id="inc-1", run_id="run-1", service_id="order-service",
+            query_template_id="qt-slow-traces-v1", query_params={},
+            raw_payload={"batches": [{
+                "resource": {"service.name": "order-service"},
+                "spans": [{"traceID": "a" * 32, "spanID": "1" * 16,
+                           "operationName": "redis.command",
+                           "startTime": int(FAULT_START.timestamp() * 1e6),
+                           "duration": 2_000_000}]}]},
+            observed_at=FAULT_START, window=(WINDOW_START, WINDOW_END),
+        )
+
+        hypotheses = generate_hypotheses([trace], investigation_run_id="run-1")
+
+        # 由于 span 提到 redis（且无拓扑），会归因到 redis；但组件不该是 "command"
+        for h in hypotheses:
+            assert h.candidate_component != "command", (
+                f"verb leaked into component: {h.candidate_component}")

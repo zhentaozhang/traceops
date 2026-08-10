@@ -63,7 +63,18 @@ def build_report(
         if top is not None and top.status == HypothesisStatus.SUPPORTED
         else []
     )
-    if len(tied) > 1:
+    # 歧义只在"**不同服务**并列"时成立。
+    #
+    # 同一服务的多个故障机制并列（redis 既是 pool_exhaustion 又是 latency_degradation）
+    # 不是歧义：服务定位已经确定，只是解释待细化。把它判成 INCONCLUSIVE 会让
+    # 本来明确的根因服务被降级，等于用"机制不确定"否定了"服务确定"。
+    # 正确做法：服务确定就报服务，机制并列写进摘要作为待细化项。
+    tied_services = {
+        next((h.candidate_service for h in updated_hypotheses if h.id == r.hypothesis_id), None)
+        for r in tied
+    }
+    tied_services.discard(None)
+    if len(tied) > 1 and len(tied_services) > 1:
         names = [
             f"{h.candidate_service}/{h.fault_type}"
             for h in updated_hypotheses
@@ -71,8 +82,9 @@ def build_report(
         ]
         diagnosis = "INCONCLUSIVE"
         summary = (
-            f"Ambiguous evidence: {len(tied)} candidate root causes are equally supported "
-            f"({', '.join(names)}); no rule discriminates them"
+            f"Ambiguous evidence: {len(tied)} candidate root causes across "
+            f"{len(tied_services)} services ({', '.join(sorted(tied_services))}) are equally "
+            f"supported ({', '.join(names)}); no rule discriminates them"
         )
     elif top is not None and top.status == HypothesisStatus.SUPPORTED:
         diagnosis = "SUPPORTED"

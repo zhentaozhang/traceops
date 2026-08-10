@@ -282,9 +282,16 @@ class InvestigationWorker:
 
 
 def _extract_run_id(message: dict[str, Any]) -> str | None:
-    payload = message.get("payload")
+    """取 investigation_run_id，两种消息形状都要支持。
+
+    摊平形状（Redis entry）下 message["payload"] 是整份文档，
+    run_id 在更深一层；只看第一层会让幂等完全失效（重复消息被当新消息处理）。
+    """
+    _, payload = _normalise_message_shape(message)
     if isinstance(payload, dict):
-        return payload.get("investigation_run_id")
+        run_id = payload.get("investigation_run_id")
+        if isinstance(run_id, str) and run_id:
+            return run_id
     return None
 
 

@@ -137,3 +137,95 @@ class TestRankingShape:
         hyps = [make_hypothesis("h-a")]
         with pytest.raises(ValueError, match="signal"):
             rank_hypotheses(hyps, [sig("h-missing")])
+
+
+class TestR007ComponentSpecificity:
+    """R-007：给出了具体组件的候选优先。
+
+    没有这条规则时，同分候选按 hypothesis_id（即 UUID）排序 = 随机。
+    结果是"定位对了服务、但故障机制选错"，FT@1 会系统性下滑
+    （F-001 实测从 1.00 掉到 0.60）。
+    """
+
+    def test_specific_component_wins_tie(self):
+        hyps = [make_hypothesis("h-vague"), make_hypothesis("h-specific")]
+        signals = [
+            sig("h-vague"),
+            sig("h-specific", has_specific_component=True),
+        ]
+        ranked = rank_hypotheses(hyps, signals)
+        assert ranked[0].hypothesis_id == "h-specific"
+        assert "R-007" in ranked[0].applied_rules
+
+    def test_vague_does_not_get_r007(self):
+        hyps = [make_hypothesis("h-vague")]
+        ranked = rank_hypotheses(hyps, [sig("h-vague", has_specific_component=False)])
+        assert "R-007" not in ranked[0].applied_rules
+
+    def test_r007_does_not_override_stronger_signals(self):
+        """具体性只是小加分（+1），不能压过配置变更（+3）。"""
+        hyps = [make_hypothesis("h-vague-with-config"), make_hypothesis("h-specific-no-config")]
+        signals = [
+            sig("h-vague-with-config", config_change_precedes_fault=True, has_specific_component=False),
+            sig("h-specific-no-config", has_specific_component=True),
+        ]
+        ranked = rank_hypotheses(hyps, signals)
+        assert ranked[0].hypothesis_id == "h-vague-with-config"
+
+    def test_specificity_ordering_is_deterministic(self):
+        """同一输入两次排序必须一致（UUID 排序会违反这一点）。"""
+        hyps = [make_hypothesis("h-a"), make_hypothesis("h-b"), make_hypothesis("h-c")]
+        signals = [
+            sig("h-a", has_specific_component=True),
+            sig("h-b"),
+            sig("h-c", has_specific_component=True),
+        ]
+        first = rank_hypotheses(hyps, signals)
+        second = rank_hypotheses(list(reversed(hyps)), signals)
+        assert [r.hypothesis_id for r in first] == [r.hypothesis_id for r in second]
+
+
+class TestDeterministicTieBreak:
+    """同分排序必须完全确定 —— 不能靠 UUID。
+
+    这是可复现性的底线：同一场景两次运行若给出不同根因，
+    既无法调试，也会让评估指标随测试执行顺序漂移（实际踩过：
+    FT@1 在混合跑测试时从 1.00 掉到 0.60）。
+    """
+
+    def test_tie_breaks_by_service_then_component_then_fault_type(self):
+        # 三个假设完全同分，只在服务名/组件/机制上不同
+        hyps = [
+            RootCauseHypothesis(
+                investigation_run_id="run-001", candidate_service="svc-b",
+                fault_type="t", failure_mechanism="m", predicted_observations=[]),
+            RootCauseHypothesis(
+                investigation_run_id="run-001", candidate_service="svc-a",
+                candidate_component="comp", fault_type="t", failure_mechanism="m",
+                predicted_observations=[]),
+            RootCauseHypothesis(
+                investigation_run_id="run-001", candidate_service="svc-a",
+                fault_type="u", failure_mechanism="m", predicted_observations=[]),
+        ]
+        signals = [
+            sig(hyps[0].id, supporting_evidence_count=1),
+            sig(hyps[1].id, supporting_evidence_count=1),
+            sig(hyps[2].id, supporting_evidence_count=1),
+        ]
+        ranked = rank_hypotheses(hyps, signals)
+        # svc-a 排 svc-b 前；同服务内有组件的排前面
+        assert ranked[0].hypothesis_id == hyps[1].id
+        assert ranked[1].hypothesis_id == hyps[2].id
+        assert ranked[2].hypothesis_id == hyps[0].id
+
+    def test_same_input_same_order_regardless_of_list_order(self):
+        hyps = [
+            RootCauseHypothesis(investigation_run_id="r", candidate_service=f"svc-{i}",
+                                fault_type="t", failure_mechanism="m",
+                                predicted_observations=[])
+            for i in range(5)
+        ]
+        signals = [sig(h.id, supporting_evidence_count=1) for h in hyps]
+        first = [r.hypothesis_id for r in rank_hypotheses(hyps, signals)]
+        second = [r.hypothesis_id for r in rank_hypotheses(list(reversed(hyps)), list(reversed(signals)))]
+        assert first == second

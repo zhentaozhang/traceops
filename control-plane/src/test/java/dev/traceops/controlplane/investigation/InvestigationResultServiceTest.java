@@ -3,6 +3,7 @@ package dev.traceops.controlplane.investigation;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import dev.traceops.controlplane.domain.Incident;
@@ -490,5 +491,65 @@ class InvestigationResultServiceTest {
                 .isEqualTo(IncidentStatus.DIAGNOSED);
         // 信封里那个事故不受影响
         assertThat(currentStatus()).isEqualTo(IncidentStatus.NEW);
+    }
+
+    // ---------- 测试消息本身必须真的是契约合法消息 ----------
+
+    @Test
+    void completedMessageMatchesTheVersionedContract() throws Exception {
+        // 如果测试构造的消息不符合契约，那么"服务能处理它"证明的是服务能处理假消息。
+        // 用与 AlertIngestIT 相同的离线内联方式校验，保证测试输入来自真正的事实来源。
+        assertThat(validateAgainstSchema("events/v1/investigation-completed.schema.json",
+                completed(evt(), run(), "SUPPORTED"))).isEmpty();
+    }
+
+    @Test
+    void failedMessageMatchesTheVersionedContract() throws Exception {
+        assertThat(validateAgainstSchema("events/v1/investigation-failed.schema.json",
+                failed(evt(), run(), "MCP_SERVER_UNAVAILABLE", true))).isEmpty();
+    }
+
+    private java.util.Set<com.networknt.schema.ValidationMessage> validateAgainstSchema(
+            String relativePath, String json) throws Exception {
+        java.nio.file.Path contracts = java.nio.file.Path.of("..", "contracts");
+        JsonNode schemaNode = mapper.readTree(
+                java.nio.file.Files.readString(contracts.resolve(relativePath)));
+        JsonNode envelopeNode = mapper.readTree(java.nio.file.Files.readString(
+                contracts.resolve("common/event-envelope.schema.json")));
+        JsonNode timeRangeNode = mapper.readTree(java.nio.file.Files.readString(
+                contracts.resolve("common/time-range.schema.json")));
+
+        var root = (ObjectNode) schemaNode;
+        var defs = root.putObject("$defs");
+        defs.set("event-envelope", stripIds(envelopeNode));
+        defs.set("time-range", stripIds(timeRangeNode));
+        inlineRef(root, "../../common/event-envelope.schema.json", "#/$defs/event-envelope");
+        inlineRef(root, "../../common/time-range.schema.json", "#/$defs/time-range");
+
+        com.networknt.schema.JsonSchemaFactory factory =
+                com.networknt.schema.JsonSchemaFactory.getInstance(
+                        com.networknt.schema.SpecVersion.VersionFlag.V202012);
+        return factory.getSchema(root).validate(mapper.readTree(json));
+    }
+
+    private JsonNode stripIds(JsonNode node) {
+        var copy = node.deepCopy();
+        if (copy instanceof ObjectNode obj) {
+            obj.remove("$id");
+            obj.remove("$schema");
+        }
+        return copy;
+    }
+
+    private void inlineRef(JsonNode node, String oldRef, String newRef) {
+        if (node.isObject()) {
+            var obj = (ObjectNode) node;
+            if (oldRef.equals(obj.path("$ref").asText())) {
+                obj.put("$ref", newRef);
+            }
+            obj.elements().forEachRemaining(child -> inlineRef(child, oldRef, newRef));
+        } else if (node.isArray()) {
+            node.elements().forEachRemaining(child -> inlineRef(child, oldRef, newRef));
+        }
     }
 }

@@ -423,16 +423,21 @@ def _link_node(state: InvestigationState, config: RunnableConfig) -> dict[str, A
         for evidence in state.get("evidence", []):
             if evidence.evidence_type is EvidenceType.EVENT:
                 component = _event_component(evidence)
-                # 配置变更只支持 "候选组件与之匹配" 的假设；组件不明则不给 R-004 加分
-                if component and hypothesis.candidate_component and (
-                    component.lower() == hypothesis.candidate_component.lower()
-                ):
+                if not component:
+                    continue  # 组件不明 → 不给任何假设加 R-004，避免瞎归因
+                # 组件匹配分三档（从强到弱），任一成立即算"这次变更解释了该假设"：
+                #   1) 组件名完全相等
+                #   2) 组件名包含候选服务的名字（redis-connection-pool ⊃ redis）
+                #   3) 候选服务包含组件名的前缀（order-service ⊂ order-service-thread-pool）
+                # 只比字符串会让 redis 的假设永远拿不到 R-004，
+                # 因为检测器推出的组件名是 "redis-connection-pool" 而候选常是 None。
+                if _component_matches(component, hypothesis):
                     links.append(
                         HypothesisEvidence(
                             hypothesis_id=hypothesis.id,
                             evidence_id=evidence.id,
                             relation_type=RelationType.SUPPORTS,
-                            reason=f"configuration change on {component or 'candidate'} preceded fault",
+                            reason=f"configuration change on {component} preceded fault",
                             created_by=CreatedBy.RULE,
                         )
                     )
@@ -455,6 +460,26 @@ def _link_node(state: InvestigationState, config: RunnableConfig) -> dict[str, A
                 )
     # 交叉检查：事件证据的服务（若有）不属于候选服务的假设不获得 R-004 支持
     return {"links": links}
+
+
+def _component_matches(component: str, hypothesis: RootCauseHypothesis) -> bool:
+    """配置变更组件与候选假设是否指同一对象。"""
+    component_lower = component.lower()
+    service_lower = (hypothesis.candidate_service or "").lower()
+    candidate_component = (hypothesis.candidate_component or "").lower()
+
+    if not component_lower:
+        return False
+    if candidate_component and component_lower == candidate_component:
+        return True
+    # 组件名里含服务名：redis-connection-pool 属于 redis
+    if service_lower and service_lower in component_lower:
+        return True
+    # 候选组件名里含服务名，且变更组件以前者开头（order-service-thread-pool）
+    if candidate_component and service_lower and service_lower in candidate_component \
+            and component_lower == candidate_component:
+        return True
+    return False
 
 
 def _event_component(evidence: Evidence) -> str | None:
