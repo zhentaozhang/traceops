@@ -25,6 +25,7 @@ from traceops.runtime.deadletter import (
     classify_failure,
     now_iso,
 )
+from traceops.runtime.retry import RetryPolicy, RetryTracker, is_retryable
 from traceops.runtime.investigation_run import InvestigationConfigSnapshot, InvestigationRun, RunStatus
 
 SCHEMA_VERSION = "1.0"
@@ -196,6 +197,7 @@ class InvestigationWorker:
         build_context: BuildContext,
         known_run_ids: set[str] | None = None,
         dead_letters: Any | None = None,
+        retry_policy: RetryPolicy | None = None,
     ) -> None:
         self.source = source
         self.sink = sink
@@ -204,6 +206,15 @@ class InvestigationWorker:
         self._known_run_ids = set(known_run_ids or ())
         # 坏消息不能静默 ACK 掉：转移到死信流，保留审计痕迹
         self.dead_letters = dead_letters
+        # 重试策略：按 failure_reason 分类，不盲目重试（见 runtime/retry.py）
+        self.retry_policy = retry_policy or RetryPolicy()
+
+    def _retry_decision(self, reason: str):
+        """独立的记账器：一次失败 → 一个决策。放在这里而不是 Run 上，
+        因为单次 poll_once 就是一次尝试。"""
+        tracker = RetryTracker(policy=self.retry_policy)
+        tracker.record_failure(reason=reason)
+        return tracker.decide(reason=reason)
 
     def poll_once(self, *, limit: int = 50) -> WorkerStats:
         stats = WorkerStats()
@@ -262,9 +273,9 @@ class InvestigationWorker:
             if result.status == "FAILED":
                 reason = _classify_failure(result.errors)
                 run.fail(reason=reason, node="collect")
-                # 预算耗尽不可重试：同样的预算再跑一次必然再次耗尽（蓝图 §9.2 拒绝无意义重试）
+                # 是否可重试由统一策略决定，不在各处零散判断
                 self.sink.publish(failed_event(run, reason=reason,
-                                               retryable=reason not in (FAILURE_INVALID, FAILURE_BUDGET),
+                                               retryable=is_retryable(reason),
                                                detail="; ".join(result.errors)))
                 stats.failed += 1
                 return
@@ -273,11 +284,15 @@ class InvestigationWorker:
             stats.succeeded += 1
         except BudgetExhausted as exc:
             run.fail(reason=FAILURE_BUDGET, node="collect")
-            self.sink.publish(failed_event(run, reason=FAILURE_BUDGET, retryable=False, detail=str(exc)))
+            self.sink.publish(failed_event(run, reason=FAILURE_BUDGET,
+                                           retryable=is_retryable(FAILURE_BUDGET),
+                                           detail=str(exc)))
             stats.failed += 1
         except Exception as exc:  # 未预期错误：保留 checkpoint 供恢复
             run.fail(reason=FAILURE_INTERNAL, node=run.current_node)
-            self.sink.publish(failed_event(run, reason=FAILURE_INTERNAL, retryable=True, detail=repr(exc)))
+            self.sink.publish(failed_event(run, reason=FAILURE_INTERNAL,
+                                           retryable=is_retryable(FAILURE_INTERNAL),
+                                           detail=repr(exc)))
             stats.failed += 1
 
 

@@ -371,3 +371,37 @@ class TestMessageShapeTolerance:
                 "time_range": {"start": WINDOW_START.isoformat(), "end": WINDOW_END.isoformat()},
                 "config_version": "cfg",
             }}})
+
+
+class TestPersistentStoreIntegration:
+    """worker 跑完后证据必须落盘 —— 否则进程重启后无法审计。"""
+
+    def _worker_with_db(self, db_path):
+        from traceops.evidence.store import EvidenceStore
+        from traceops.runtime.worker import (
+            InMemoryEventSink, InMemoryEventSource, InvestigationWorker,
+            derive_request_from_event,
+        )
+
+        store = EvidenceStore(path=db_path)
+        source = InMemoryEventSource()
+        sink = InMemoryEventSink()
+        worker = InvestigationWorker(
+            source=source, sink=sink, derive_request=derive_request_from_event,
+            build_context=lambda r: RunContext(store=store, adapters=OkAdapters(),
+                                               budget=BudgetManager(max_tool_calls=10)))
+        return worker, source, sink, store
+
+    def test_evidence_persisted_after_run(self, tmp_path):
+        db = tmp_path / "evidence.db"
+        worker, source, sink, store = self._worker_with_db(db)
+        source.push(requested_event())
+        worker.poll_once()
+
+        # 用全新 Store 从同一个文件读，证据必须还在
+        from traceops.evidence.store import EvidenceStore
+        reopened = EvidenceStore(path=db)
+        rows = reopened.list(incident_id="inc-001")
+        assert rows, "evidence must survive process restart"
+        assert all(reopened.validate(r.id, incident_id="inc-001").checks["checksum"] == "PASS"
+                   for r in rows)
