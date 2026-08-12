@@ -43,13 +43,30 @@ public class InvestigationResultService {
 
     private final IncidentRepository incidents;
     private final AppliedInvestigationEventRepository appliedEvents;
+    private final InvestigationFindingRepository findings;
     private final ObjectMapper mapper;
 
     public InvestigationResultService(IncidentRepository incidents,
-            AppliedInvestigationEventRepository appliedEvents, ObjectMapper mapper) {
+            AppliedInvestigationEventRepository appliedEvents,
+            InvestigationFindingRepository findings,
+            ObjectMapper mapper) {
         this.incidents = incidents;
         this.appliedEvents = appliedEvents;
+        this.findings = findings;
         this.mapper = mapper;
+    }
+
+    /**
+     * 记录/更新该事故的"当前诊断结论"。
+     *
+     * <p>为什么放在这里而不是 REST 层：结论是与状态机推进同事务产生的，
+     * 分开写会出现"事故已 DIAGNOSED 但查不到结论"的中间状态。
+     *
+     * <p>INCONCLUSIVE 也写结论：证据不足本身是有价值的信息（缺什么、有哪些候选），
+     * 不写等于把"为什么没结论"丢掉。是否需要人工由 needsHumanReview 表达。
+     */
+    private void recordFinding(String incidentId, InvestigationResult result) {
+        findings.save(InvestigationFinding.from(incidentId, result, Instant.now()));
     }
 
     @Transactional
@@ -123,6 +140,7 @@ public class InvestigationResultService {
             // 硬造一个会破坏白名单语义，也不该在别的状态里夹带诊断进度。
             String reason = "diagnosis_status=" + result.diagnosisStatus()
                     + " is not a completed diagnosis; human review required";
+            recordFinding(incident.getId(), result);
             log.info("investigation completed without a supported diagnosis: incident={} status={} reason={}",
                     incident.getId(), previous, result.diagnosisStatus());
             return new Applied(result.eventId(), result.investigationRunId(), result.incidentId(),
@@ -208,6 +226,8 @@ public class InvestigationResultService {
             }
         }
         incidents.save(incident);
+        // 结论与状态机推进同事务写入：避免出现"已 DIAGNOSED 但查不到结论"
+        recordFinding(incident.getId(), result);
         return new Applied(result.eventId(), result.investigationRunId(), result.incidentId(),
                 Applied.Outcome.APPLIED, previous, incident.getStatus(), result.diagnosisStatus(),
                 false, result.retryable(), result.reportRef(), null);
