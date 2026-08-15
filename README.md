@@ -9,10 +9,10 @@ Evidence-driven Agentic RCA Platform —— 面向微服务系统的智能故障
 
 | 平面 | 状态 | 测试 |
 |---|---|---|
-| Control Plane（Java / Spring Boot） | ✅ 告警接入、事故状态机、事务性 Outbox、契约校验 | 18 passing |
-| Investigation Plane（Python / LangGraph） | ✅ 6 节点图、预算守护、**拓扑感知多服务采集** | 142 passing（含评估） |
-| Evidence Plane（Python） | ✅ 4 类归一化、内容寻址校验、报告引用闸门 | 同上 |
-- Evaluation Plane（Python） | ✅ 6 场景（含三服务级联 F-005）+ 16 指标 + runner | 同上 |
+| Control Plane（Java / Spring Boot） | ✅ 告警接入、事故关联、状态机、Outbox、结果消费、**诊断结论 REST 查询** | 60 passing |
+| Investigation Plane（Python / LangGraph） | ✅ 7 节点图、双层采集、传播链、checkpoint 恢复、重试分类 | 364 passing（含评估） |
+| Evidence Plane（Python） | ✅ 4 类归一化、内容寻址校验、**SQLite 持久化**、查询模板、证据图 | 同上 |
+| Evaluation Plane（Python） | ✅ 6 场景（含三服务级联 F-005）+ 18 指标 + runner | 同上 |
 | Execution Plane（受控修复） | ✅ Action Registry + Policy + Approval + Executor | 21 passing |
 | Topology（服务依赖） | ✅ 双向语义、环检测、平局裁决 | 19 passing |
 | 观测栈（docker compose） | ✅ 文件就绪 | 未拉起（Docker 守护进程未运行） |
@@ -49,6 +49,16 @@ traceops/
 ```
 
 ## 快速开始
+
+### 一条命令验证闭环
+
+```bash
+cd traceops
+PYTHONPATH=agent-runtime .venv/bin/python -m scripts.smoke_loop     # 闭环冒烟
+PYTHONPATH=agent-runtime .venv/bin/python -m traceops.cli.worker --mode memory --once --self-check
+```
+
+前者验证 Java→Python→Java 的整个链路装配（含契约校验），后者是可运行的 worker 自检。
 
 ### Python 侧（证据引擎 + 调查 + 评估）
 
@@ -106,6 +116,19 @@ order-service 的日志： "ERROR redis timeout - connection pool exhausted"
 
 `detectors.attribute_evidence` 是唯一事实来源，假设生成 / 证据关联 / 评估 precision 全部走它。
 修正后 F-001~F-005 的 rank 1 全部指向真正的下游依赖服务。
+
+## 本轮补上的关键能力
+
+| 能力 | 为什么必须有 |
+|---|---|
+| **证据 SQLite 持久化** | 进程崩溃后内存证据全丢 = 可信性归零；篡改能被 checksum 发现 |
+| **重试分类** | 预算耗尽重试只是烧钱；用户取消不该被"好心"重试；未知原因默认不重试 |
+| **传播链 vs 候选根因拆分** | 旧设计逼系统给症状服务编造故障机制 |
+| **双层采集** | 调查只向下游（防误判根因）与传播链需要上游证据的冲突 |
+| **查询模板** | Agent 不能自己生成 PromQL/LogQL（防注入、可审计） |
+| **checkpoint 恢复** | `RunContext` 不可序列化曾让 checkpoint 完全不可用 |
+| **诊断结论 REST 查询** | 结论只活在事件里，一次 ACK 后就只剩账本一行 |
+| **死信流** | 坏消息被静默 ACK 会让数据无声消失 |
 
 ## 已知局限（不粉饰）
 
