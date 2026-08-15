@@ -15,7 +15,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import timedelta
 
-from traceops.domain.models import Evidence, EvidenceType
+from traceops.domain.models import (
+    Evidence,
+    EvidenceRelation,
+    EvidenceRelationType,
+    EvidenceType,
+)
 
 DEFAULT_CORRELATION_WINDOW = timedelta(minutes=5)
 
@@ -150,3 +155,60 @@ def ordering_violations(evidence_list: list[Evidence], *, expected_order: list[s
                 f"({first_seen[after].observed_at.isoformat()} < {first_seen[before].observed_at.isoformat()})"
             )
     return violations
+
+
+# ---------------- 内部边 → 领域关系 ----------------
+
+# 内部规则名 → 领域关系类型的映射。
+# 不是一一对应：内部 SERVICE_LINK 表达"两个服务有拓扑关系"，
+# 对外最合适的表达是 AFFECTS（这条证据影响了那个服务）。
+_RULE_TO_RELATION = {
+    SAME_TRACE.name: EvidenceRelationType.SAME_TRACE,
+    TEMPORAL.name: EvidenceRelationType.PRECEDES,
+    SERVICE_LINK.name: EvidenceRelationType.AFFECTS,
+    CAUSAL_PRECEDES.name: EvidenceRelationType.PRECEDES,
+}
+
+
+def promote_relations(graph: EvidenceGraph) -> list[EvidenceRelation]:
+    """把内部 EvidenceEdge 提升为可持久化的领域 EvidenceRelation。
+
+    为什么需要这一步：`EvidenceEdge` 是"图构建过程"的中间产物，
+    住在内存里；`EvidenceRelation` 才是可以写库、可以查询、可以被审计的
+    领域对象。不提升，关系就随进程一起消失。
+
+    只提升映射表里有的规则：未知规则宁可不持久化，也不要猜一个语义出去。
+    """
+    relations: list[EvidenceRelation] = []
+    for edge in graph.edges:
+        relation_type = _RULE_TO_RELATION.get(edge.rule)
+        if relation_type is None:
+            continue
+
+        source = graph.evidence.get(edge.source_id)
+        target = graph.evidence.get(edge.target_id)
+        if source is None or target is None:
+            continue
+        if source.id == target.id:
+            continue  # 模型层禁止自环，这里同样不构造
+
+        kwargs: dict = {
+            "source_evidence_id": source.id,
+            "target_evidence_id": target.id,
+            "relation_type": relation_type,
+            "explanation": edge.explanation,
+        }
+        if relation_type is EvidenceRelationType.SAME_TRACE:
+            kwargs["trace_id"] = source.trace_id
+        elif relation_type is EvidenceRelationType.PRECEDES:
+            kwargs["time_delta_seconds"] = max(0.0, edge.time_delta_seconds or 0.0)
+        elif relation_type is EvidenceRelationType.AFFECTS:
+            kwargs["affected_service"] = target.service_id or source.service_id
+
+        try:
+            relations.append(EvidenceRelation(**kwargs))
+        except ValueError:
+            # 单条关系不满足模型约束（如 AFFECTS 缺服务名）时跳过它，
+            # 而不是让整张图的关系都不可用。
+            continue
+    return relations

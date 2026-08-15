@@ -27,7 +27,12 @@ from traceops.domain.models import (
     RelationType,
     RootCauseHypothesis,
 )
-from traceops.evidence.graph import build_evidence_graph, earliest_anomaly, ordering_violations
+from traceops.evidence.graph import (
+    build_evidence_graph,
+    earliest_anomaly,
+    ordering_violations,
+    promote_relations,
+)
 from traceops.evidence.templates import QueryTemplateError, default_registry
 from traceops.evidence.normalizer import normalize
 from traceops.evidence.store import EvidenceStore
@@ -508,6 +513,10 @@ def _correlate_node(state: InvestigationState, config: RunnableConfig) -> dict[s
 
     graph = build_evidence_graph(evidence_list, topology=ctx.topology)
     earliest = earliest_anomaly(evidence_list)
+    # 内部边提升为领域关系并持久化：否则关系只活在内存里，重启即丢
+    relations = promote_relations(graph)
+    for relation in relations:
+        ctx.store.add_relation(relation, incident_id=request.incident_id)
     summary: dict[str, Any] = {
         "evidence_nodes": len(graph.evidence),
         "edges": len(graph.edges),
@@ -516,6 +525,7 @@ def _correlate_node(state: InvestigationState, config: RunnableConfig) -> dict[s
         "timeline": graph.timeline(),
         "earliest_anomaly_id": earliest.id if earliest else None,
         "earliest_anomaly_service": earliest.service_id if earliest else None,
+        "relations_persisted": len(relations),
     }
 
     # 时间线污染检测：若已知拓扑顺序，检查症状是否早于根因

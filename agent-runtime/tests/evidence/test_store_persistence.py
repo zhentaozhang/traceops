@@ -177,3 +177,61 @@ class TestConcurrentSafety:
         fresh = EvidenceStore(path=db)
         ids = {e.id for e in fresh.list(incident_id="inc-001")}
         assert {evidence_a.id, evidence_b.id} <= ids
+
+
+class TestRelationPersistence:
+    """证据间关系也必须跨重启可读。
+
+    为什么单独测：关系表与证据表是独立的。证据落盘做对了，
+    不代表关系也落盘了 —— 如果关系只存内存，重启后"这两条证据曾同属
+    一条链路"这个事实就消失了，影响分析会退化成重新猜测。
+    """
+
+    def _relation(self, source_id: str, target_id: str):
+        from traceops.domain.models import EvidenceRelation, EvidenceRelationType
+
+        return EvidenceRelation(
+            source_evidence_id=source_id, target_evidence_id=target_id,
+            relation_type=EvidenceRelationType.PRECEDES, time_delta_seconds=20.0,
+        )
+
+    def test_relations_survive_restart(self, tmp_path: Path):
+        db = tmp_path / "evidence.db"
+        store = EvidenceStore(path=db)
+        store.register_source("prometheus")
+        a = store.add(make_evidence("redis", run_id="run-a"))
+        b = store.add(make_evidence("mysql", run_id="run-b"))
+        store.add_relation(self._relation(a.id, b.id), incident_id="inc-001")
+
+        reopened = EvidenceStore(path=db)
+        relations = reopened.list_relations(incident_id="inc-001")
+
+        assert len(relations) == 1
+        assert relations[0].source_evidence_id == a.id
+        assert relations[0].relation_type.value == "PRECEDES"
+        assert relations[0].time_delta_seconds == 20.0
+
+    def test_relations_filtered_by_incident(self, tmp_path: Path):
+        db = tmp_path / "evidence.db"
+        store = EvidenceStore(path=db)
+        store.register_source("prometheus")
+        a = store.add(make_evidence("redis", run_id="run-a"))
+        b = store.add(make_evidence("mysql", run_id="run-b"))
+        store.add_relation(self._relation(a.id, b.id), incident_id="inc-001")
+
+        assert reopened_relations(db, "inc-001")
+        assert reopened_relations(db, "inc-other") == []
+
+    def test_in_memory_mode_still_lists_relations(self):
+        store = EvidenceStore()
+        store.register_source("prometheus")
+        a = store.add(make_evidence("redis", run_id="run-a"))
+        b = store.add(make_evidence("mysql", run_id="run-b"))
+        store.add_relation(self._relation(a.id, b.id), incident_id="inc-001")
+        assert len(store.list_relations()) == 1
+
+
+def reopened_relations(db, incident_id):
+    from traceops.evidence.store import EvidenceStore as Store
+
+    return Store(path=db).list_relations(incident_id=incident_id)

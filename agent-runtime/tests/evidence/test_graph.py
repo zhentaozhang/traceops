@@ -149,3 +149,69 @@ class TestRootCauseTiming:
     def test_ordering_skips_missing_services(self):
         root = ev("redis", EvidenceType.LOG, at=TS)
         assert ordering_violations([root], expected_order=["redis", "api-gateway"]) == []
+
+
+class TestRelationPromotion:
+    """证据图必须能产出 EvidenceRelation，而不只是内部的 EvidenceEdge。
+
+    P0 的 `EvidenceEdge` 是内部表示（rule + explanation）；
+    R2 的 `EvidenceRelation` 是对外领域对象（可持久化、可查询、可审计）。
+    两者必须能转换，否则关系只能活在内存里，重启即丢。
+    """
+
+    def test_graph_edges_promoted_to_domain_relations(self):
+        from traceops.domain.models import EvidenceRelationType
+        from traceops.evidence.graph import promote_relations
+
+        a = ev("redis", EvidenceType.LOG, at=TS, trace_id="t-1")
+        b = ev("order-service", EvidenceType.TRACE, at=TS + timedelta(seconds=10), trace_id="t-1")
+        graph = build_evidence_graph([a, b])
+
+        relations = promote_relations(graph)
+
+        assert relations
+        assert all(r.source_evidence_id and r.target_evidence_id for r in relations)
+        assert any(r.relation_type is EvidenceRelationType.SAME_TRACE for r in relations)
+
+    def test_temporal_edge_promoted_to_precedes(self):
+        from traceops.domain.models import EvidenceRelationType
+        from traceops.evidence.graph import promote_relations
+
+        a = ev("redis", EvidenceType.METRIC, at=TS)
+        b = ev("order-service", EvidenceType.LOG, at=TS + timedelta(seconds=20))
+        graph = build_evidence_graph([a, b])
+
+        relations = promote_relations(graph)
+        precedes = [r for r in relations if r.relation_type is EvidenceRelationType.PRECEDES]
+        assert precedes
+        assert precedes[0].time_delta_seconds == 20.0
+
+    def test_service_link_promoted_to_affects(self):
+        from traceops.domain.models import EvidenceRelationType
+        from traceops.evidence.graph import promote_relations
+
+        a = ev("order-service", EvidenceType.LOG, at=TS)
+        b = ev("redis", EvidenceType.TRACE, at=TS + timedelta(seconds=5))
+        graph = build_evidence_graph([a, b], topology=topology())
+
+        relations = promote_relations(graph)
+        affects = [r for r in relations if r.relation_type is EvidenceRelationType.AFFECTS]
+        assert affects, [r.relation_type for r in relations]
+
+    def test_promotion_never_creates_self_relations(self):
+        """模型层拒绝自环 —— 提升逻辑必须保证不构造出非法关系。"""
+        from traceops.evidence.graph import promote_relations
+
+        graph = build_evidence_graph([ev("redis", EvidenceType.METRIC)])
+        relations = promote_relations(graph)
+        assert all(r.source_evidence_id != r.target_evidence_id for r in relations)
+
+    def test_promotion_is_deterministic(self):
+        from traceops.evidence.graph import promote_relations
+
+        items = [ev("redis", EvidenceType.LOG, at=TS), ev("order-service", EvidenceType.LOG, at=TS)]
+        g1 = build_evidence_graph(items)
+        g2 = build_evidence_graph(list(reversed(items)))
+        r1 = [(r.source_evidence_id, r.target_evidence_id, r.relation_type) for r in promote_relations(g1)]
+        r2 = [(r.source_evidence_id, r.target_evidence_id, r.relation_type) for r in promote_relations(g2)]
+        assert r1 == r2

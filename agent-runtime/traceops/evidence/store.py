@@ -52,6 +52,16 @@ CREATE TABLE IF NOT EXISTS evidence (
 );
 CREATE INDEX IF NOT EXISTS idx_evidence_incident ON evidence(incident_id);
 CREATE INDEX IF NOT EXISTS idx_evidence_run ON evidence(investigation_run_id);
+
+CREATE TABLE IF NOT EXISTS evidence_relation (
+    id TEXT PRIMARY KEY,
+    incident_id TEXT NOT NULL,
+    source_evidence_id TEXT NOT NULL,
+    target_evidence_id TEXT NOT NULL,
+    relation_type TEXT NOT NULL,
+    document TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_relation_incident ON evidence_relation(incident_id);
 """
 
 
@@ -69,6 +79,7 @@ class EvidenceStore:
         self._evidence: dict[str, Evidence] = {}
         self._snapshots: dict[str, dict[str, Any]] = {}
         self._sources: dict[str, bool] = {}  # source_id -> registered/allowed
+        self._relations: list[Any] = []  # EvidenceRelation（P1 证据间关系）
 
         if self._path is not None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -121,6 +132,49 @@ class EvidenceStore:
             )
             self._conn.commit()
         return evidence
+
+    def add_relation(self, relation: Any, *, incident_id: str) -> Any:
+        """写入一条证据间关系（P1）。
+
+        与证据分开存放：关系是"关于证据的事实"，它的生命周期比某条证据长
+        （证据可能过期被清理，但"这两条曾同属一条链路"仍应可查）。
+        """
+        self._relations.append(relation)
+        if self._conn is not None:
+            self._conn.execute(
+                """
+                INSERT INTO evidence_relation
+                    (id, incident_id, source_evidence_id, target_evidence_id,
+                     relation_type, document)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET document=excluded.document
+                """,
+                (
+                    relation.id, incident_id,
+                    relation.source_evidence_id, relation.target_evidence_id,
+                    relation.relation_type.value,
+                    relation.model_dump_json(),
+                ),
+            )
+            self._conn.commit()
+        return relation
+
+    def list_relations(self, incident_id: str | None = None) -> list[Any]:
+        if self._conn is not None:
+            from traceops.domain.models import EvidenceRelation
+
+            if incident_id is None:
+                rows = self._conn.execute(
+                    "SELECT document FROM evidence_relation ORDER BY id").fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT document FROM evidence_relation WHERE incident_id = ? ORDER BY id",
+                    (incident_id,)).fetchall()
+            return [EvidenceRelation.model_validate_json(row[0]) for row in rows]
+
+        if incident_id is None:
+            return list(self._relations)
+        return [r for r in self._relations if getattr(r, "_incident_id", None) == incident_id]
 
     def _load_from_disk(self, evidence_id: str) -> Evidence | None:
         if self._conn is None:
