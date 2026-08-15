@@ -37,6 +37,20 @@ class RelationType(str, Enum):
     CONTRADICTS = "CONTRADICTS"
 
 
+class EvidenceRelationType(str, Enum):
+    """证据 ↔ 证据的关系（P1，R2）。
+
+    与 `RelationType`（证据 → 假设的 SUPPORTS/CONTRADICTS）是**两个不同维度**：
+    前者描述事实之间怎么相连，后者描述事实支持哪个结论。
+    混在一起会导致"想查支持某假设的证据"时把证据间关系也捞出来。
+    """
+
+    PRECEDES = "PRECEDES"          # A 在时间上早于 B（时间先后，不是因果证明）
+    SAME_TRACE = "SAME_TRACE"      # 两条证据来自同一条调用链
+    CORRELATED_WITH = "CORRELATED_WITH"  # 统计相关，需 strength 表达强弱
+    AFFECTS = "AFFECTS"            # A 影响了某个服务
+
+
 class CreatedBy(str, Enum):
     RULE = "rule"
     MODEL = "model"
@@ -98,6 +112,53 @@ class Evidence(BaseModel):
             raise ValueError(
                 f"observed_at ({self.observed_at}) after window_end ({self.window_end})"
             )
+        return self
+
+
+class EvidenceRelation(BaseModel):
+    """证据之间的事实关系（P1）。
+
+    只表达"事实之间怎么相连"，不表达因果。`PRECEDES` 仅仅意味着时间更早，
+    真正的因果必须由诊断层基于证据论证，不能靠一张关系表宣布。
+    """
+
+    model_config = ConfigDict(validate_assignment=True, extra="forbid")
+
+    id: str = Field(default_factory=lambda: _new_id("rel"))
+    source_evidence_id: str
+    target_evidence_id: str
+    relation_type: EvidenceRelationType
+    created_by: CreatedBy = CreatedBy.RULE
+    # 供审计的一句话解释（人或模型产生的都要能说清依据）
+    explanation: str | None = None
+    # 仅 PRECEDES：source 比 target 早多少秒
+    time_delta_seconds: float | None = None
+    # 仅 SAME_TRACE：共享的 trace_id，没有它这条关系无法验证
+    trace_id: str | None = None
+    # 仅 CORRELATED_WITH：相关强度（0..1），不是概率
+    strength: float | None = None
+    # 仅 AFFECTS：被影响的服务
+    affected_service: str | None = None
+
+    @model_validator(mode="after")
+    def _check(self) -> "EvidenceRelation":
+        if self.source_evidence_id == self.target_evidence_id:
+            raise ValueError("evidence relation cannot point to itself")
+
+        if self.relation_type is EvidenceRelationType.SAME_TRACE and not self.trace_id:
+            raise ValueError("SAME_TRACE relation requires trace_id")
+
+        if self.relation_type is EvidenceRelationType.PRECEDES:
+            if self.time_delta_seconds is not None and self.time_delta_seconds < 0:
+                raise ValueError("PRECEDES time_delta_seconds must be non-negative")
+
+        if self.relation_type is EvidenceRelationType.CORRELATED_WITH:
+            if self.strength is not None and not (0.0 <= self.strength <= 1.0):
+                raise ValueError("CORRELATED_WITH strength must be within [0, 1]")
+
+        if self.relation_type is EvidenceRelationType.AFFECTS and not self.affected_service:
+            raise ValueError("AFFECTS relation requires affected_service")
+
         return self
 
 
