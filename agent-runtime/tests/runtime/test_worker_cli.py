@@ -89,3 +89,34 @@ class _Args:
 
 def _args(topology: str = "", *, prometheus: str = "", loki: str = "", tempo: str = "") -> _Args:
     return _Args(topology, prometheus, loki, tempo)
+
+
+class TestRedisModeFailure:
+    """连不上 Redis 时必须"可读地失败"，而不是栈炸或静默成功。
+
+    为什么重要：容器编排里退出码决定是否重启/告警。
+    返回 0 会让一个根本没连上 Redis 的 worker 看起来"正常运行"，
+    这是最危险的假阳性。
+    """
+
+    def test_unreachable_redis_exits_nonzero_with_readable_message(self):
+        result = _run_redis_cli(["--mode", "redis", "--port", "6399", "--once"])
+
+        assert result.returncode == 3, result.stderr
+        assert "cannot connect to Redis" in result.stderr
+        # 不应该把整个栈泼给用户
+        assert "Traceback" not in result.stderr
+
+    def test_message_names_the_target(self):
+        result = _run_redis_cli(["--mode", "redis", "--port", "6399", "--once"])
+        assert "localhost:6399" in result.stderr
+
+
+def _run_redis_cli(args: list[str]) -> subprocess.CompletedProcess:
+    import os
+    from pathlib import Path
+
+    env = {**os.environ}
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+    return subprocess.run([sys.executable, "-m", "traceops.cli.worker", *args],
+                          capture_output=True, text=True, timeout=60, env=env)

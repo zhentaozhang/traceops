@@ -75,10 +75,15 @@ class RedisCommandTransport(Protocol):
         ...
 
     def xautoclaim(self, stream: str, group: str, consumer: str, min_idle_ms: int,
-                   start_id: str, count: int) -> list[tuple[str, dict[str, str]]]:
+                   start_id: str, count: int) -> Any:
         """`XAUTOCLAIM s g c min-idle-time start COUNT n` 能被重试的 pending 条目。
 
-        返回 `[(entry_id, fields), ...]`：已被重新分配、现在归本 consumer 处理的消息。
+        返回形状：**真实 Redis 的三元素** `[next_cursor, [(entry_id, fields), ...],
+        [deleted_id, ...]]`。允许简化形状（纯条目列表），由 `_extract_cursor` /
+        `_extract_entries` 统一兼容。
+
+        为什么注解是 `Any` 而不是具体类型：两种形状都合法，写死成 `list[tuple[...]]`
+        会让真实实现（返回三元组）在类型上与契约冲突 —— 这正是此前暴露的问题。
         真实的 XAUTOCLAIM 还会返回"下一个游标"和"被删除但仍留 PEL 的 id"，
         本层暂时只需要前一部分；实现方可以把他们丢掉，但**不要**把已删除的
         id 当成正常消息伪装回来（见 `UnimplementedRedisTransport` 的注释）。
@@ -185,11 +190,16 @@ class RedisStreamEventSource:
             self.min_idle_ms, self._claim_cursor, limit,
         )
         self._claim_cursor = self._extract_cursor(claimed)
-        for entry_id, fields in self._extract_entries(claimed):
+        claimed_entries = self._extract_entries(claimed)
+        for entry_id, fields in claimed_entries:
             messages.append(decode_entry(entry_id, fields))
 
-        # 2) 剩下的配额读新消息。count 取剩余额度，避免一次 poll 超过 limit
-        remaining = limit - len(claimed)
+        # 2) 剩下的配额读新消息。count 取剩余额度，避免一次 poll 超过 limit。
+        #
+        # 注意：**必须用条目数而不是 len(claimed)**。真实 XAUTOCLAIM 返回的是
+        # [next_cursor, entries, deleted_ids] 三元组，len() 恒为 3 ——
+        # 之前这里算成 limit-1，每轮都超发配额（还会随 cursor/deleted 长度漂移）。
+        remaining = limit - len(claimed_entries)
         if remaining > 0:
             streams = self.transport.xreadgroup(
                 self.group, self.consumer, self.stream, remaining, self.block_ms,

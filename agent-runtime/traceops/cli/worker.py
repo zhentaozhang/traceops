@@ -139,7 +139,13 @@ def main(argv: list[str] | None = None) -> int:
         from traceops.runtime.redis_source import RedisStreamEventSource
 
         transport = RespRedisTransport(host=args.host, port=args.port)
-        transport.connect()
+        try:
+            transport.connect()
+        except Exception as exc:
+            # 连不上是配置/环境问题，不是崩溃：给一行可读信息 + 非零退出码，
+            # 让容器/CI 能判定失败，而不是被栈淹没后误以为启动了
+            print(f"cannot connect to Redis at {args.host}:{args.port}: {exc}", file=sys.stderr)
+            return 3
         source = RedisStreamEventSource(
             transport, stream=args.stream, group=args.group, consumer=args.consumer)
     else:

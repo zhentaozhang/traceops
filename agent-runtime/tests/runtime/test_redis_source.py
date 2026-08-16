@@ -408,3 +408,59 @@ class TestProductionStub:
         with pytest.raises(NotImplementedError, match="redis"):
             stub.xautoclaim(stream=STREAM, group=GROUP, consumer=CONSUMER,
                             min_idle_ms=1000, start_id=DEFAULT_RECLAIM_START_ID, count=10)
+
+
+class TestQuotaAccounting:
+    """配额必须按"条目数"算，不能按 XAUTOCLAIM 返回值的 len。
+
+    真实 XAUTOCLAIM 返回 [next_cursor, entries, deleted_ids] —— 三元素。
+    之前的实现用 len(claimed) 算剩余配额，得到的是 limit-3 这种荒谬值，
+    每轮都会超发；而这个 bug 在简化形状（纯列表）的测试桩下永远不会暴露。
+    """
+
+    def _source_with_claimed(self, claimed_entries_count: int):
+        from traceops.runtime.redis_source import RedisStreamEventSource
+
+        class Transport:
+            def __init__(self):
+                self.xreadgroup_counts = []
+                self.xautoclaim_calls = 0
+
+            def xautoclaim(self, stream, group, consumer, min_idle_ms, start_id, count):
+                self.xautoclaim_calls += 1
+                # 真实三元素形状：cursor=0-0（表示扫完了）
+                entries = [(f"{i}-0", {"payload": "{}"})
+                           for i in range(claimed_entries_count)]
+                return ["0-0", entries, []]
+
+            def xreadgroup(self, group, consumer, stream, count, block_ms):
+                self.xreadgroup_counts.append(count)
+                return []
+
+            def xack(self, stream, group, entry_id):
+                return 1
+
+        transport = Transport()
+        return RedisStreamEventSource(transport, stream="s", group="g", consumer="c"), transport
+
+    def test_remaining_quota_subtracts_entry_count_not_tuple_length(self):
+        source, transport = self._source_with_claimed(10)
+
+        source.poll(limit=50)
+
+        # 认领 10 条后，新消息配额应是 40（而不是 47 或 48）
+        assert transport.xreadgroup_counts == [40], transport.xreadgroup_counts
+
+    def test_all_quota_consumed_by_claimed_skips_read(self):
+        source, transport = self._source_with_claimed(50)
+
+        source.poll(limit=50)
+
+        assert transport.xreadgroup_counts == [], "no quota left -> must not call XREADGROUP"
+
+    def test_zero_claimed_uses_full_quota(self):
+        source, transport = self._source_with_claimed(0)
+
+        source.poll(limit=50)
+
+        assert transport.xreadgroup_counts == [50]
