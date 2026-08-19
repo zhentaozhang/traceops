@@ -28,6 +28,7 @@ from traceops.orchestration.graph import InvestigationRequest, RunContext
 from traceops.runtime.budget import BudgetManager
 from traceops.runtime.deadletter import InMemoryDeadLetterSink
 from traceops.runtime.retry import RetryPolicy
+from traceops.runtime.run_ledger import RunLedger
 from traceops.runtime.worker import (
     InMemoryEventSink,
     InMemoryEventSource,
@@ -121,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="caller:callee pairs separated by ';'")
     parser.add_argument("--evidence-db", default=os.environ.get("TRACEOPS_EVIDENCE_DB"),
                         help="SQLite path; omit for in-memory evidence")
+    parser.add_argument("--ledger-db", default=os.environ.get("TRACEOPS_LEDGER_DB"),
+                        help="SQLite path for run dedup; omit for in-memory")
     parser.add_argument("--max-tool-calls", type=int, default=int(
         os.environ.get("TRACEOPS_MAX_TOOL_CALLS", "40")))
     parser.add_argument("--once", action="store_true", help="process a single batch then exit")
@@ -132,6 +135,8 @@ def main(argv: list[str] | None = None) -> int:
     adapters = build_adapters(args)
     topology = build_topology(args)
     dead_letters = InMemoryDeadLetterSink()
+    # 账本必须持久化：否则重启后未 ACK 的消息会被重复调查
+    ledger = RunLedger(path=Path(args.ledger_db) if args.ledger_db else None)
     sink = InMemoryEventSink()
 
     if args.mode == "redis":
@@ -170,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:
         source=source, sink=sink, derive_request=derive_request_from_event,
         build_context=build_context, dead_letters=dead_letters,
         retry_policy=RetryPolicy(max_attempts=3),
+        ledger=ledger,
     )
 
     print(f"worker started: mode={args.mode} stream={args.stream} group={args.group} "

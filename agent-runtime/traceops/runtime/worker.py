@@ -26,6 +26,7 @@ from traceops.runtime.deadletter import (
     now_iso,
 )
 from traceops.runtime.retry import RetryPolicy, RetryTracker, is_retryable
+from traceops.runtime.run_ledger import RunLedger
 from traceops.runtime.investigation_run import InvestigationConfigSnapshot, InvestigationRun, RunStatus
 
 SCHEMA_VERSION = "1.0"
@@ -198,11 +199,14 @@ class InvestigationWorker:
         known_run_ids: set[str] | None = None,
         dead_letters: Any | None = None,
         retry_policy: RetryPolicy | None = None,
+        ledger: RunLedger | None = None,
     ) -> None:
         self.source = source
         self.sink = sink
         self.derive_request = derive_request
         self.build_context = build_context
+        # 账本优先：跨重启有效的去重。known_run_ids 保留作向后兼容的预置集合。
+        self.ledger = ledger if ledger is not None else RunLedger()
         self._known_run_ids = set(known_run_ids or ())
         # 坏消息不能静默 ACK 掉：转移到死信流，保留审计痕迹
         self.dead_letters = dead_letters
@@ -221,7 +225,10 @@ class InvestigationWorker:
         batch = self.source.poll(limit=limit)
         for message in batch:
             run_id = _extract_run_id(message)
-            if run_id is not None and run_id in self._known_run_ids:
+            already_seen = run_id is not None and (
+                run_id in self._known_run_ids or self.ledger.is_seen(run_id)
+            )
+            if already_seen:
                 stats.skipped_duplicate += 1
                 self.source.ack(message["id"])
                 continue
@@ -274,22 +281,26 @@ class InvestigationWorker:
                 reason = _classify_failure(result.errors)
                 run.fail(reason=reason, node="collect")
                 # 是否可重试由统一策略决定，不在各处零散判断
+                self.ledger.record(run.run_id, outcome=f"FAILED:{reason}")
                 self.sink.publish(failed_event(run, reason=reason,
                                                retryable=is_retryable(reason),
                                                detail="; ".join(result.errors)))
                 stats.failed += 1
                 return
             run.complete()
+            self.ledger.record(run.run_id, outcome="COMPLETED")
             self.sink.publish(completed_event(run, result.report))
             stats.succeeded += 1
         except BudgetExhausted as exc:
             run.fail(reason=FAILURE_BUDGET, node="collect")
+            self.ledger.record(run.run_id, outcome=f"FAILED:{FAILURE_BUDGET}")
             self.sink.publish(failed_event(run, reason=FAILURE_BUDGET,
                                            retryable=is_retryable(FAILURE_BUDGET),
                                            detail=str(exc)))
             stats.failed += 1
         except Exception as exc:  # 未预期错误：保留 checkpoint 供恢复
             run.fail(reason=FAILURE_INTERNAL, node=run.current_node)
+            self.ledger.record(run.run_id, outcome=f"FAILED:{FAILURE_INTERNAL}")
             self.sink.publish(failed_event(run, reason=FAILURE_INTERNAL,
                                            retryable=is_retryable(FAILURE_INTERNAL),
                                            detail=repr(exc)))
