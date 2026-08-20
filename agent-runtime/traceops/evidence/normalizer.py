@@ -157,6 +157,7 @@ def normalize(
     trace_id: str | None = None,
     span_id: str | None = None,
     source_link: str | None = None,
+    rendered_query: str | None = None,
     max_records: int = DEFAULT_MAX_RECORDS,
 ) -> Evidence:
     """统一入口: 类型分派适配器 → 归一化 → 组装 Evidence。"""
@@ -188,6 +189,7 @@ def normalize(
         trace_id=trace_id,
         span_id=span_id,
         source_link=source_link,
+        rendered_query=rendered_query,
     )
     evidence._raw_payload = raw_payload  # noqa: SLF001 — 供 Store 快照，不序列化
     return evidence

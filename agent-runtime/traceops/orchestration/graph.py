@@ -334,6 +334,8 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
                 ),
                 query_template_id=item["query_template_id"],
                 query_params={**item["params"], "_tier": item.get("tier", INVESTIGATION_TIER)},
+                # 审计链路：证据必须带上"实际执行了什么查询"
+                rendered_query=item.get("rendered_query"),
                 raw_payload=raw,
                 observed_at=observed_at,
                 window=window,

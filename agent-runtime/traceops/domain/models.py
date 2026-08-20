@@ -89,6 +89,15 @@ class Evidence(BaseModel):
     collected_at: datetime = Field(default_factory=_utcnow)
     query_template_id: str
     query_params: dict[str, Any]
+    rendered_query: str | None = Field(
+        default=None,
+        description=(
+            "模板渲染后实际发给数据源的查询语句（PromQL/LogQL/TraceQL）。"
+            "审计必需：同一模板+参数在不同模板版本下可能生成不同语句，"
+            "只存 template_id 追溯不到真正执行了什么。"
+            "变更事件类证据没有查询语句，因此可为 None。"
+        ),
+    )
     normalized_data: dict[str, Any]
     raw_snapshot_ref: str | None = None
     trace_id: str | None = None
