@@ -15,7 +15,7 @@ Evidence-driven Agentic RCA Platform —— 面向微服务系统的智能故障
 | Evaluation Plane（Python） | ✅ 6 场景（含三服务级联 F-005）+ 18 指标 + runner | 同上 |
 | Execution Plane（受控修复） | ✅ Action Registry + Policy + Approval + Executor | 21 passing |
 | Topology（服务依赖） | ✅ 双向语义、环检测、平局裁决 | 19 passing |
-| 观测栈（docker compose） | ✅ 文件就绪 | 未拉起（Docker 守护进程未运行） |
+| 观测栈（docker compose） | ✅ 配置校验通过（离线） | 未拉起（Docker 守护进程不可用） |
 
 **P0 没有 LLM 参与**：这一版全部是确定性代码，目的是把"证据 → 假设 → 排序 → 报告"
 这条数据流先做实，再做模型。E1–E5 消融实验因此还跑不了，见 `评测口径` §4。
@@ -118,6 +118,14 @@ order-service 的日志： "ERROR redis timeout - connection pool exhausted"
 修正后 F-001~F-005 的 rank 1 全部指向真正的下游依赖服务。
 
 ## 本轮补上的关键能力
+
+| 能力 | 为什么必须有 |
+|---|---|
+| **Redis RESP2 传输层** | 手写流式解析（逐字节喂入测试）；暴露了 `redis_source` 的配额 bug |
+| **Run 账本持久化** | 内存去重重启即失效 → 同一 run 被重复调查 |
+| **证据保留策略** | 三条硬约束：未关闭不删、被引用不删、默认 dry-run |
+| **双向契约验证** | Java 用手写严格解析器，schema 合法不代表它能吃下 |
+
 
 | 能力 | 为什么必须有 |
 |---|---|

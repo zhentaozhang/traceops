@@ -164,7 +164,6 @@ def main() -> int:
     check("message acknowledged", source.acked == ["1700000000000-1"], str(source.acked))
 
     # 4. 结论正确
-    report = ctx.store  # placeholder to keep flake quiet
     completed = [m for m in sink.messages if m["envelope"]["event_type"] == "investigation.completed"]
     check("completed event emitted", len(completed) == 1)
     if not completed:
