@@ -28,6 +28,7 @@ from traceops.orchestration.graph import InvestigationRequest, RunContext
 from traceops.runtime.budget import BudgetManager
 from traceops.runtime.deadletter import InMemoryDeadLetterSink
 from traceops.runtime.retry import RetryPolicy
+from traceops.evidence.retention import RetentionPolicy
 from traceops.runtime.run_ledger import RunLedger
 from traceops.runtime.worker import (
     InMemoryEventSink,
@@ -127,6 +128,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-tool-calls", type=int, default=int(
         os.environ.get("TRACEOPS_MAX_TOOL_CALLS", "40")))
     parser.add_argument("--once", action="store_true", help="process a single batch then exit")
+    parser.add_argument("--purge", action="store_true",
+                        help="run evidence retention cleanup then exit (requires --evidence-db)")
+    parser.add_argument("--purge-dry-run", action="store_true",
+                        help="with --purge: report what would be deleted, delete nothing")
+    parser.add_argument("--retain-days", type=int, default=int(
+        os.environ.get("TRACEOPS_RETAIN_DAYS", "30")))
+    parser.add_argument("--closed-incidents", default=os.environ.get("TRACEOPS_CLOSED_INCIDENTS", ""),
+                        help="comma separated incident ids considered closed")
     parser.add_argument("--self-check", action="store_true",
                         help="memory mode: inject one synthetic event to verify wiring")
     args = parser.parse_args(argv)
@@ -138,6 +147,28 @@ def main(argv: list[str] | None = None) -> int:
     # 账本必须持久化：否则重启后未 ACK 的消息会被重复调查
     ledger = RunLedger(path=Path(args.ledger_db) if args.ledger_db else None)
     sink = InMemoryEventSink()
+
+    if args.purge:
+        if args.evidence_db is None:
+            print("--purge requires --evidence-db (refusing to guess a database)", file=sys.stderr)
+            return 2
+        closed = {i.strip() for i in args.closed_incidents.split(",") if i.strip()}
+        if not closed:
+            # 没有"已关闭事故"清单时，require_closed_incident=True 会保护一切。
+            # 明确告知，而不是让用户以为清理跑过了。
+            print("warning: no closed incidents supplied; closed-incident protection "
+                  "will retain everything", file=sys.stderr)
+        from datetime import UTC as _UTC, datetime as _datetime
+
+        result = store.purge(
+            policy=RetentionPolicy(retain_days=args.retain_days),
+            now=_datetime.now(_UTC),
+            closed_incidents=closed,
+            dry_run=args.purge_dry_run,
+        )
+        print(f"purge: purged={result.purged} protected={result.protected} "
+              f"retained={result.retained} dry_run={result.dry_run}", file=sys.stderr)
+        return 0
 
     if args.mode == "redis":
         from traceops.runtime.redis_transport import RespRedisTransport

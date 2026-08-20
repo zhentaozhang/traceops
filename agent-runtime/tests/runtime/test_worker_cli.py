@@ -120,3 +120,46 @@ def _run_redis_cli(args: list[str]) -> subprocess.CompletedProcess:
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
     return subprocess.run([sys.executable, "-m", "traceops.cli.worker", *args],
                           capture_output=True, text=True, timeout=60, env=env)
+
+
+class TestPurgeCommand:
+    """--purge 的安全行为：必须拒绝在没有明确数据库/SOP 的情况下"清理"。"""
+
+    def test_purge_without_evidence_db_refuses(self):
+        """不指定数据库就清理是不可接受的 —— 可能删错东西。"""
+        result = _run([sys.executable, "-m", "traceops.cli.worker", "--purge"])
+        assert result.returncode == 2
+        assert "requires --evidence-db" in result.stderr
+
+    def test_purge_dry_run_deletes_nothing(self, tmp_path):
+        import os
+        from pathlib import Path
+
+        db = tmp_path / "e.db"
+        env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
+        result = subprocess.run(
+            [sys.executable, "-m", "traceops.cli.worker", "--purge",
+             "--evidence-db", str(db), "--purge-dry-run"],
+            capture_output=True, text=True, timeout=60, env=env)
+        assert result.returncode == 0
+        assert "dry_run=True" in result.stderr
+
+    def test_empty_closed_list_warns_instead_of_pretending(self, tmp_path):
+        """没有"已关闭事故"时，保护规则会保留一切 —— 必须明说，不能让人误以为清理过。"""
+        import os
+        from pathlib import Path
+
+        db = tmp_path / "e2.db"
+        env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
+        result = subprocess.run(
+            [sys.executable, "-m", "traceops.cli.worker", "--purge", "--evidence-db", str(db)],
+            capture_output=True, text=True, timeout=60, env=env)
+        assert "no closed incidents supplied" in result.stderr
+
+
+def _run(args: list[str]) -> subprocess.CompletedProcess:
+    import os
+
+    env = {**os.environ}
+    env["PYTHONPATH"] = str(__import__("pathlib").Path(__file__).resolve().parents[2])
+    return subprocess.run(args, capture_output=True, text=True, timeout=60, env=env)

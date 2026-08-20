@@ -19,6 +19,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from traceops.domain.models import Evidence, RCAReport
+from traceops.evidence.retention import RetentionPolicy, RetentionResult
 
 
 def compute_checksum(evidence: Evidence) -> str:
@@ -175,6 +176,58 @@ class EvidenceStore:
         if incident_id is None:
             return list(self._relations)
         return [r for r in self._relations if getattr(r, "_incident_id", None) == incident_id]
+
+    # ---- retention ----
+    def purge(
+        self,
+        *,
+        policy: RetentionPolicy,
+        now: Any,
+        closed_incidents: set[str],
+        dry_run: bool = False,
+    ) -> RetentionResult:
+        """按策略清理陈旧证据。
+
+        保护规则（见 retention.py 的模块文档）：
+        - 事故未关闭 → 不删（即使超期）
+        - 证据被任一关系引用 → 不删（否则关系悬空）
+        """
+        from datetime import timedelta
+
+        result = RetentionResult(dry_run=dry_run)
+        cutoff = now - timedelta(days=policy.retain_days)
+
+        referenced: set[str] = set()
+        for relation in self.list_relations():
+            referenced.add(relation.source_evidence_id)
+            referenced.add(relation.target_evidence_id)
+
+        # 需要从磁盘读全部候选：内存模式与持久化模式都要能算
+        candidates = self.list()
+
+        for evidence in candidates:
+            if evidence.observed_at >= cutoff:
+                result.retained += 1
+                continue
+            if policy.require_closed_incident and evidence.incident_id not in closed_incidents:
+                result.retained += 1
+                continue
+            if evidence.id in referenced:
+                result.protected += 1
+                continue
+
+            result.purged += 1
+            if dry_run:
+                continue  # 只是报告会删什么
+            self._delete(evidence.id)
+        return result
+
+    def _delete(self, evidence_id: str) -> None:
+        self._evidence.pop(evidence_id, None)
+        self._snapshots.pop(evidence_id, None)
+        if self._conn is not None:
+            self._conn.execute("DELETE FROM evidence WHERE id = ?", (evidence_id,))
+            self._conn.commit()
 
     def _load_from_disk(self, evidence_id: str) -> Evidence | None:
         if self._conn is None:
