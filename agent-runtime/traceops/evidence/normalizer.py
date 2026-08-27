@@ -86,13 +86,25 @@ class LogNormalizer:
 
 
 def _decode_otlp_id(value: str | None) -> str | None:
-    """OTLP 的 traceId/spanId 是 base64；下游要十六进制（Loki 日志里也是十六进制）。"""
+    """把 OTLP 的 traceId/spanId 归一为十六进制。
+
+    **两种编码都要处理**，这是实测出来的差异：
+    - OTLP 规范：base64（如 `S/kvNXezTaajzpKdDg5HNg==`）
+    - Tempo 2.5 的 /api/traces 实际返回：也可能是十六进制（如 `4bf92f35...`）
+
+    区分方式：十六进制是纯 [0-9a-f] 且长度 32/16；base64 含 `=` 或非 hex 字符。
+    不要用"先试 base64"的方式判断 —— 纯 hex 字符串也能被 base64 解码成垃圾。
+    """
     if not value:
         return None
+    lowered = value.strip().lower()
+    hex_chars = set("0123456789abcdef")
+    if lowered and all(c in hex_chars for c in lowered) and len(lowered) in (16, 32):
+        return lowered  # 已经是十六进制
     try:
         return base64.b64decode(value).hex()
     except Exception:
-        return value  # 已经是十六进制或无法解码：原样返回，不丢数据
+        return value  # 无法解码：原样返回，不丢数据
 
 
 def _otlp_resource_service(resource: dict[str, Any] | None) -> str | None:

@@ -161,3 +161,61 @@ class TestRealTempoRegression:
         assert span["service"] == "order-service"
         assert span["duration_us"] == 2_000_000
         assert span["error"] is True
+
+
+class TestIdEncodingVariants:
+    """traceId/spanId 的编码在真实世界里不止一种。
+
+    OTLP 规范说 base64；但实测 Tempo 2.5 的 /api/traces 也返回十六进制。
+    两种都要正确归一，否则 trace 与日志永远关联不上（日志里是十六进制）。
+    """
+
+    def test_hex_id_is_passed_through(self):
+        payload = {"batches": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "redis"}}]},
+            "scopeSpans": [{"spans": [{
+                "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                "spanId": "00f067aa0ba902b7",
+                "name": "redis.command",
+                "startTimeUnixNano": "1793414383835237120",
+                "endTimeUnixNano": "1793414385835237120",
+            }]}]}]}
+        out = TraceNormalizer().normalize(payload, max_records=500)
+        assert out["spans"][0]["trace_id"] == "4bf92f3577b34da6a3ce929d0e0e4736"
+        assert out["spans"][0]["span_id"] == "00f067aa0ba902b7"
+
+    def test_base64_id_is_decoded(self):
+        import base64
+        hex_trace = "4bf92f3577b34da6a3ce929d0e0e4736"
+        payload = {"batches": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "redis"}}]},
+            "scopeSpans": [{"spans": [{
+                "traceId": base64.b64encode(bytes.fromhex(hex_trace)).decode(),
+                "spanId": base64.b64encode(bytes.fromhex("00f067aa0ba902b7")).decode(),
+                "name": "redis.command",
+                "startTimeUnixNano": "1793414383835237120",
+                "endTimeUnixNano": "1793414385835237120",
+            }]}]}]}
+        out = TraceNormalizer().normalize(payload, max_records=500)
+        # 两种输入都应该归一成同一个十六进制值
+        assert out["spans"][0]["trace_id"] == hex_trace
+
+    def test_hex_that_looks_like_base64_is_not_mangled(self):
+        """纯 hex 字符串也能被 base64 解码成垃圾 —— 必须先判 hex 再判 base64。
+
+        这正是此前踩过的坑：如果先试 base64，合法 hex 会被解成无意义字节。
+        """
+        payload = {"batches": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "redis"}}]},
+            "scopeSpans": [{"spans": [{
+                "traceId": "abcdef0123456789abcdef0123456789",
+                "spanId": "abcdef0123456789",
+                "name": "x",
+                "startTimeUnixNano": "1793414383835237120",
+                "endTimeUnixNano": "1793414385835237120",
+            }]}]}]}
+        out = TraceNormalizer().normalize(payload, max_records=500)
+        assert out["spans"][0]["trace_id"] == "abcdef0123456789abcdef0123456789"
