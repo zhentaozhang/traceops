@@ -434,13 +434,16 @@ class MCPDatasourceAdapters(DatasourceAdapters):
         self, service: str, start: str, end: str, min_duration_ms: int | None = None
     ) -> Any:
         found = self.client.call_tool(
+            # 参数名以**实测**为准，不是文档：mcp-grafana v2.1.1 的
+            # search_tempo_traces 接受 datasourceUid / query / start / end，
+            # 没有 q、startRFC3339、limit；get_tempo_trace 用 trace_id。
+            # 写错误名会被服务端明确拒绝（"unknown arguments"），所以这里必须准确。
             "search_tempo_traces",
             {
                 "datasourceUid": self.tempo_uid,
-                "q": f'{{service.name="{service}"}}',
-                "startRFC3339": start,
-                "endRFC3339": end,
-                "limit": 20,
+                "query": f'{{ resource.service.name = "{service}" }}',
+                "start": start,
+                "end": end,
             },
         )
         traces = found.get("traces", []) if isinstance(found, dict) else []
@@ -449,7 +452,11 @@ class MCPDatasourceAdapters(DatasourceAdapters):
             trace_id = t.get("traceID") or t.get("traceId")
             if not trace_id:
                 continue
-            payload = self.client.call_tool("get_tempo_trace", {"datasourceUid": self.tempo_uid, "traceId": trace_id})
+            # Tempo 返回的 traceID 可能是短形式；存储的是 32 位十六进制
+            if len(trace_id) < 32:
+                trace_id = trace_id.rjust(32, "0")
+            payload = self.client.call_tool(
+                "get_tempo_trace", {"datasourceUid": self.tempo_uid, "trace_id": trace_id})
             if isinstance(payload, dict):
                 batches.extend(payload.get("batches", [payload]))
         return {"traces_considered": len(traces), "batches": batches}
