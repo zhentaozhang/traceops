@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import base64
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -84,16 +85,90 @@ class LogNormalizer:
                 "total_records": total, "truncated": truncated}
 
 
+def _decode_otlp_id(value: str | None) -> str | None:
+    """OTLP 的 traceId/spanId 是 base64；下游要十六进制（Loki 日志里也是十六进制）。"""
+    if not value:
+        return None
+    try:
+        return base64.b64decode(value).hex()
+    except Exception:
+        return value  # 已经是十六进制或无法解码：原样返回，不丢数据
+
+
+def _otlp_resource_service(resource: dict[str, Any] | None) -> str | None:
+    """OTLP 把服务名放在 resource.attributes 数组里，而不是 resource["service.name"]。"""
+    for attribute in (resource or {}).get("attributes", []) or []:
+        if attribute.get("key") == "service.name":
+            value = attribute.get("value") or {}
+            return value.get("stringValue") or value.get("value")
+    return (resource or {}).get("service.name")
+
+
+def _otlp_resource_tags(resource: dict[str, Any] | None) -> dict[str, Any]:
+    tags: dict[str, Any] = {}
+    for attribute in (resource or {}).get("attributes", []) or []:
+        key = attribute.get("key")
+        if not key:
+            continue
+        value = attribute.get("value") or {}
+        tags[key] = value.get("stringValue", value.get("intValue", value.get("boolValue")))
+    return tags
+
+
+def _is_otlp_span(span: dict[str, Any]) -> bool:
+    return "traceId" in span or "startTimeUnixNano" in span
+
+
 class TraceNormalizer:
+    """Trace 归一化。
+
+    **同时支持两种格式**，这是被真实环境抓出来的必要性：
+    - Jaeger 风格：`batches[].spans[]`，`traceID` 十六进制，直接给 `duration`
+    - OTLP 标准：`batches[].scopeSpans[].spans[]`，`traceId` base64，
+      只有 `startTimeUnixNano` / `endTimeUnixNano`，duration 要算差值
+
+    真实 Tempo 的 `/api/traces/{id}` 返回的是 OTLP。只支持 Jaeger 会让所有
+    真实 trace 证据被判为"空 trace"而丢弃 —— 假传输层永远发现不了这个问题，
+    因为假数据是按 Normalizer 的期望造的。
+    """
+
     kind = "trace"
 
     def normalize(self, raw: dict[str, Any], max_records: int) -> dict[str, Any]:
-        # Tempo/Jaeger trace: {batches: [{resource: {...}, spans: [...]}]}
         if "batches" not in raw:
             raise ValueError("trace payload: expected Tempo shape {batches: [...]}")
         spans: list[dict[str, Any]] = []
         for batch in raw["batches"]:
-            service = (batch.get("resource") or {}).get("service.name")
+            resource = batch.get("resource") or {}
+            # OTLP：scopeSpans 是数组；Jaeger：spans 直接在 batch 下
+            otlp_scopes = batch.get("scopeSpans") or batch.get("instrumentationLibrarySpans") or []
+            if otlp_scopes:
+                service = _otlp_resource_service(resource)
+                resource_tags = _otlp_resource_tags(resource)
+                for scope in otlp_scopes:
+                    for sp in scope.get("spans", []) or []:
+                        start = sp.get("startTimeUnixNano")
+                        end = sp.get("endTimeUnixNano")
+                        duration_us = None
+                        if start is not None and end is not None:
+                            try:
+                                duration_us = (int(end) - int(start)) // 1000
+                            except (TypeError, ValueError):
+                                duration_us = None
+                        status = sp.get("status") or {}
+                        spans.append({
+                            "trace_id": _decode_otlp_id(sp.get("traceId")),
+                            "span_id": _decode_otlp_id(sp.get("spanId")),
+                            "service": service,
+                            "operation_name": sp.get("name"),
+                            "start_time": start,
+                            "duration_us": duration_us,
+                            "error": status.get("code") == "STATUS_CODE_ERROR",
+                            "tags": {**resource_tags, "status.message": status.get("message")},
+                        })
+                continue
+
+            service = resource.get("service.name")
             for sp in batch.get("spans", []):
                 tags = _norm_tags(sp.get("tags"))
                 spans.append({
