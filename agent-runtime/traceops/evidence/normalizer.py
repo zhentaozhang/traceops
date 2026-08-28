@@ -251,6 +251,12 @@ def normalize(
     if evidence_type not in _NORMALIZERS:
         raise ValueError(f"no normalizer for evidence type {evidence_type!r}")
     norm = _NORMALIZERS[evidence_type].normalize(raw_payload, max_records)
+    # 采集层可能标记"这是一份降级数据"（如 Tempo 只能用 search 的 spanSet 兜底）。
+    # 该标记必须跟着证据走：引用完整性校验能过，但语义上它不是完整 span 树，
+    # 丢掉标记等于默许下游把摘要当全量引用。
+    if isinstance(raw_payload, dict) and raw_payload.get("degraded"):
+        norm["degraded"] = True
+        norm["degraded_reason"] = raw_payload.get("degraded_reason", "")
 
     # promote correlation fields from first record/span if not given explicitly
     if trace_id is None:

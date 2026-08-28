@@ -82,7 +82,19 @@ def build_adapters(args) -> DatasourceAdapters | None:
 
     未配置的适配器留 None —— 对应的工具调用会抛错，编排层把它记入
     missing_data 并继续（这是设计好的降级路径，不是缺陷）。
+
+    两条接入方式，**MCP 优先**：
+    - `--mcp-url`：走 Grafana MCP Server（生产推荐，不直连各数据源）
+    - `--prometheus-url` / `--loki-url` / `--tempo-url`：直连各数据源（调试用）
+
+    两者都配时选 MCP：同一次调查的证据不能一半来自直连、一半来自 MCP，
+    否则"这条证据是从哪个数据源来的"就说不清（破坏证据可追溯性）。
     """
+    if getattr(args, "mcp_url", None):
+        from traceops.tools.adapters import GrafanaMCPClient, MCPDatasourceAdapters
+
+        return MCPDatasourceAdapters(GrafanaMCPClient(args.mcp_url))
+
     prom = PrometheusAdapter(args.prometheus_url) if args.prometheus_url else None
     loki = LokiAdapter(args.loki_url) if args.loki_url else None
     tempo = TempoAdapter(args.tempo_url) if args.tempo_url else None
@@ -107,6 +119,28 @@ def build_topology(args) -> ServiceTopology | None:
     return ServiceTopology.from_edges(edges)
 
 
+def _describe_adapters(adapters, args) -> list[str]:
+    """打印实际生效的数据源。
+
+    为什么不直接读 `adapters.prometheus/loki/tempo`：那是**直连**实现的内部属性，
+    `MCPDatasourceAdapters` 不设这些字段。曾经因此打出 `adapters=[]`，
+    明明 MCP 已经采到了证据，日志却说"没有数据源"——排查时会把方向带偏。
+    """
+    if adapters is None:
+        return []
+    if type(adapters).__name__ == "MCPDatasourceAdapters":
+        return [f"mcp:{getattr(args, 'mcp_url', '')}"]
+    return [
+        name
+        for name, adapter in (
+            ("prometheus", adapters.prometheus),
+            ("loki", adapters.loki),
+            ("tempo", adapters.tempo),
+        )
+        if adapter
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="TraceOps investigation worker")
     parser.add_argument("--mode", choices=["memory", "redis"], default="memory")
@@ -116,6 +150,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stream", default=os.environ.get("TRACEOPS_STREAM", "traceops.events"))
     parser.add_argument("--group", default=os.environ.get("TRACEOPS_GROUP", "traceops-workers"))
     parser.add_argument("--consumer", default=os.environ.get("TRACEOPS_CONSUMER", "worker-1"))
+    parser.add_argument("--mcp-url", default=os.environ.get("TRACEOPS_MCP_URL"),
+                        help="Grafana MCP Server URL (production path); overrides the three direct URLs")
     parser.add_argument("--prometheus-url", default=os.environ.get("TRACEOPS_PROMETHEUS_URL"))
     parser.add_argument("--loki-url", default=os.environ.get("TRACEOPS_LOKI_URL"))
     parser.add_argument("--tempo-url", default=os.environ.get("TRACEOPS_TEMPO_URL"))
@@ -210,7 +246,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print(f"worker started: mode={args.mode} stream={args.stream} group={args.group} "
-          f"consumer={args.consumer} adapters={[n for n, a in [('prometheus', adapters and adapters.prometheus), ('loki', adapters and adapters.loki), ('tempo', adapters and adapters.tempo)] if a] if adapters else []}",
+          f"consumer={args.consumer} adapters={_describe_adapters(adapters, args)}",
           file=sys.stderr)
 
     try:

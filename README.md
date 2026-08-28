@@ -9,13 +9,14 @@ Evidence-driven Agentic RCA Platform —— 面向微服务系统的智能故障
 
 | 平面 | 状态 | 测试 |
 |---|---|---|
-| Control Plane（Java / Spring Boot） | ✅ 告警接入、事故关联、状态机、Outbox、结果消费、**诊断结论 REST 查询** | 60 passing |
-| Investigation Plane（Python / LangGraph） | ✅ 7 节点图、双层采集、传播链、checkpoint 恢复、重试分类 | 364 passing（含评估） |
+| Control Plane（Java / Spring Boot） | ✅ 告警接入、事故关联、状态机、Outbox、结果消费、**诊断结论 REST 查询** | 70 passing |
+| Investigation Plane（Python / LangGraph） | ✅ 7 节点图、双层采集、传播链、重试分类 | 510 passing（含评估） |
 | Evidence Plane（Python） | ✅ 4 类归一化、内容寻址校验、**SQLite 持久化**、查询模板、证据图 | 同上 |
 | Evaluation Plane（Python） | ✅ 6 场景（含三服务级联 F-005）+ 18 指标 + runner | 同上 |
 | Execution Plane（受控修复） | ✅ Action Registry + Policy + Approval + Executor | 21 passing |
 | Topology（服务依赖） | ✅ 双向语义、环检测、平局裁决 | 19 passing |
-| 观测栈（docker compose） | ✅ 配置校验通过（离线） | 未拉起（Docker 守护进程不可用） |
+| 观测栈（docker compose） | ✅ **已拉起**：Prometheus/Loki/Tempo/Grafana + mcp-grafana | 4 服务 healthy |
+| MCP 数据源接入 | ⚠️ Prometheus/Loki 可用；Tempo `get_tempo_trace` 受 Tempo 版本限制 | 13 条形状/签名测试 |
 
 **P0 没有 LLM 参与**：这一版全部是确定性代码，目的是把"证据 → 假设 → 排序 → 报告"
 这条数据流先做实，再做模型。E1–E5 消融实验因此还跑不了，见 `评测口径` §4。
@@ -67,8 +68,8 @@ cd traceops
 python -m venv --system-site-packages .venv
 .venv/bin/python -m pip install -e agent-runtime --no-build-isolation
 
-# 全部测试（97）
-.venv/bin/python -m pytest agent-runtime/tests evaluation -q
+# 全部测试（510）
+PYTHONPATH=agent-runtime .venv/bin/python -m pytest agent-runtime/tests evaluation -q
 
 # 跑评估：6 场景 + 指标
 .venv/bin/python -m evaluation.runner
@@ -142,16 +143,22 @@ order-service 的日志： "ERROR redis timeout - connection pool exhausted"
 
 - 评估指标的 1.00 来自**合成场景**，不是真实准确率；六个场景按检测规则反向构造，
   存在"规则自证"风险
-- F-005 已支持三服务采集与影响范围（`affected=Y`），但**传播链校验仍失败**（`chain=0.00`）：
-  api-gateway 的证据被正确归因给 redis，导致它自身没有候选可排。需要 RCAReport 区分
-  「候选根因」与「传播链节点」两个概念（P1 数据结构扩展，不是补丁）
-- Grafana MCP 的参数名与权限边界按文档编写，**未经实测**（S2 待执行）
-- 无 Redis Streams 消费者、无 LangGraph Checkpoint 持久化（P2）
+- F-005 的 `chain=1.00` 已通过（拆出 `propagation_chain` + 双层采集后修复）。
+  但 F-005 的 citation precision 只有 0.10：多服务采集会把症状服务证据也收进来，
+  这是"多查服务"与"引用要精确"的固有权衡
+- **Tempo 2.5 下 `get_tempo_trace` 恒 404**（Tempo 缺 `/api/v2/traces` 端点）。
+  已降级为用 `search_tempo_traces` 的 spanSet 构造证据，并在
+  `Evidence.normalized_data` 标记 `degraded=True`。升到 Tempo ≥ 2.6 可恢复完整 span 树
+- MCP 的 Prometheus/Loki 参数名与**响应形状**此前全错（形状不对时证据会被静默丢弃）。
+  已修正，并有 13 条用真实响应做 fixture 的测试锁定
+- LangGraph Checkpoint 只用于单次运行：worker 调用 `run_investigation` 时
+  **未传 `checkpointer` / `thread_id`**，跨进程崩溃恢复尚未接线（P2）
+- 无 CI：`.github/workflows` 不存在，S3 的「CI 契约测试绿」尚未满足
 
 ## 下一步（按依赖）
 
 ```
-S1 Trace→Log 关联  →  S2 Grafana MCP Tempo PoC  →  S3 事件契约端到端
-→ LLM 假设生成节点（解锁 E1–E5）  →  多服务/拓扑感知采集（解锁 F-005 链条）
-→ Redis 消费者 + Checkpoint（P2）  →  受控修复（P3）
+S3 事件契约 CI 回填  →  LLM 假设生成节点（解锁 E1–E5）
+→ 真实靶场注入 S4/S5（解锁真实准确率）  →  Tempo 升版恢复完整 span 树
+→ Redis 消费者 Checkpoint 接线（P2）  →  受控修复（P3）
 ```

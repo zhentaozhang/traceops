@@ -79,16 +79,61 @@ class TestAdapterWiring:
         assert adapters.prometheus and adapters.loki and adapters.tempo
 
 
+class TestMCPAdapterWiring:
+    """MCP 是「生产推荐」的数据源接入方式，必须能从 CLI 启用。
+
+    背景：`MCPDatasourceAdapters` 早就写好了，但**没有任何生产调用点**——
+    worker CLI 只有 --prometheus-url / --loki-url / --tempo-url 三个直连开关，
+    `MCPDatasourceAdapters` 只被 `scripts/verify_stack_config.py` 反射检查过参数名。
+    也就是说这条「推荐路径」其实是悬空的：配了也没法启用。
+    """
+
+    def test_mcp_url_builds_mcp_adapters(self):
+        adapters = build_adapters(_args("", mcp="http://localhost:8000/mcp"))
+        assert adapters is not None
+        # 必须是 MCP 实现，而不是直连实现
+        assert type(adapters).__name__ == "MCPDatasourceAdapters"
+
+    def test_mcp_url_does_not_require_direct_urls(self):
+        """MCP 单独配置即可工作，不该强制同时填三个直连地址。
+
+        断言的是**行为**（三个方法都被 MCP 实现覆盖），
+        而不是内部属性 `adapters.prometheus`——MCP 实现根本不用这些属性，
+        拿属性判断装配会得出错误结论。
+        """
+        adapters = build_adapters(_args("", mcp="http://localhost:8000/mcp"))
+        mcp_class = type(adapters)
+        for method in ("query_metric_series", "query_service_error_rate",
+                       "query_service_logs", "query_service_traces"):
+            # 每个方法都必须由 MCP 实现自己定义，而不是继承自基类走直连分支
+            assert method in vars(mcp_class), f"{method} not overridden by MCP adapters"
+
+    def test_direct_urls_still_work_when_mcp_absent(self):
+        """不配 MCP 时行为不变：直连适配器照常装配。"""
+        adapters = build_adapters(_args("", prometheus="http://p"))
+        assert type(adapters).__name__ == "DatasourceAdapters"
+
+    def test_mcp_takes_precedence_over_direct_urls(self):
+        """两者都配时用 MCP（生产推荐路径），避免两套数据源并存导致证据来源混淆。"""
+        adapters = build_adapters(_args(
+            "", prometheus="http://p", loki="http://l", tempo="http://t",
+            mcp="http://localhost:8000/mcp"))
+        assert type(adapters).__name__ == "MCPDatasourceAdapters"
+
+
 class _Args:
-    def __init__(self, topology: str = "", prometheus: str = "", loki: str = "", tempo: str = "") -> None:
+    def __init__(self, topology: str = "", prometheus: str = "", loki: str = "", tempo: str = "",
+                 mcp: str = "") -> None:
         self.topology = topology
         self.prometheus_url = prometheus or None
         self.loki_url = loki or None
         self.tempo_url = tempo or None
+        self.mcp_url = mcp or None
 
 
-def _args(topology: str = "", *, prometheus: str = "", loki: str = "", tempo: str = "") -> _Args:
-    return _Args(topology, prometheus, loki, tempo)
+def _args(topology: str = "", *, prometheus: str = "", loki: str = "", tempo: str = "",
+          mcp: str = "") -> _Args:
+    return _Args(topology, prometheus, loki, tempo, mcp)
 
 
 class TestRedisModeFailure:

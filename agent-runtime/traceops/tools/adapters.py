@@ -248,6 +248,164 @@ class TempoAdapter(_HttpAdapter):
         return {"traces_considered": len(trace_ids), "batches": batches}
 
 
+def _mcp_time(value: str) -> str:
+    """把 ISO8601 时间裁剪成 mcp-grafana 的时间解析器**能接受**的精度。
+
+    实测 Prometheus 侧（gtime 解析器）：
+        2026-10-31T03:36:00Z               OK
+        2026-10-31T03:36:00.123Z           OK
+        2026-10-31T03:36:00.123456+00:00   FAIL
+          -> parsing end time: syntax error: unexpected tDIGIT ... starting with "0"
+
+    而 `datetime.isoformat()` 默认输出 6 位微秒 —— 上游 `_plan_node` 传的正是它。
+    所以参数名改对之后，**时间格式仍会让真实调用 100% 失败**，只是错误从
+    "unknown arguments" 变成 "parse error"。
+
+    只裁小数位，不做别的改写：
+    - 相对时间（now / now-15m）原样返回，它们是服务端支持的格式
+    - 已经是 Z 或 +00:00 且≤3 位小数的原样返回
+    """
+    if not isinstance(value, str) or "." not in value:
+        return value
+    head, _, tail = value.partition(".")
+    # 拆出小数部分与后面的时区后缀（Z / +00:00 / -07:00）
+    frac = ""
+    rest = tail
+    for i, ch in enumerate(tail):
+        if not ch.isdigit():
+            frac, rest = tail[:i], tail[i:]
+            break
+    else:
+        frac, rest = tail, ""
+    if len(frac) > 3:
+        frac = frac[:3]
+    return f"{head}.{frac}{rest}" if frac else f"{head}{rest}"
+
+
+def _mcp_prometheus_to_native(raw: Any) -> Any:
+    """Grafana MCP 的 query_prometheus 结果 → Prometheus 原生 query_range 形状。
+
+    MCP 返回（实测）:
+        {"data": [{"metric": {...}, "values": [[ts, "v"], ...]}], "exploreUrl": "..."}
+    Prometheus 原生（MetricNormalizer 唯一认的形状）:
+        {"status": "success", "data": {"resultType": "matrix", "result": [...]}}
+
+    已经是原生形状时原样返回（幂等），避免重复转换破坏数据。
+    """
+    if not isinstance(raw, dict):
+        return raw
+    data = raw.get("data")
+    # 原生形状：data 是 dict 且带 result
+    if isinstance(data, dict) and "result" in data:
+        return raw
+    if not isinstance(data, list):
+        return raw
+    # 判断 matrix 还是 vector：有 values 列表 = matrix，有 value = vector
+    result_type = "matrix"
+    if data and all("value" in item and "values" not in item for item in data if isinstance(item, dict)):
+        result_type = "vector"
+    return {"status": "success", "data": {"resultType": result_type, "result": data}}
+
+
+def _mcp_loki_to_native(raw: Any) -> Any:
+    """Grafana MCP 的 query_loki_logs 结果 → Loki 原生 query_range 形状。
+
+    MCP 返回（实测）**逐条摊平**，而且 timestamp 是纳秒字符串：
+        {"data": [{"timestamp": "1793417622798029056", "line": "...",
+                   "labels": {...}, "structuredMetadata": {...}}], "metadata": {...}}
+    Loki 原生（LogNormalizer 唯一认的形状）**按 stream 聚合**:
+        {"status": "success", "data": {"resultType": "streams",
+         "result": [{"stream": {...labels...}, "values": [[ns, line, meta?]]}]}}
+
+    转换要点：按 labels 分组，否则 N 条日志会变成 N 个 stream（下游逐条建证据，
+    证据数量爆炸且丢失"同一批查询"的语义）。
+    已经是原生形状时原样返回。
+    """
+    if not isinstance(raw, dict):
+        return raw
+    data = raw.get("data")
+    if isinstance(data, dict) and "result" in data:
+        return raw
+    if not isinstance(data, list):
+        return raw
+
+    by_stream: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        labels = entry.get("labels") or {}
+        # 用排序后的 JSON 做分组键：labels 是 dict，不可哈希
+        key = json.dumps(labels, sort_keys=True, ensure_ascii=False)
+        stream = by_stream.get(key)
+        if stream is None:
+            stream = {"stream": dict(labels), "values": []}
+            by_stream[key] = stream
+            order.append(key)
+        ts = str(entry.get("timestamp", ""))
+        line = entry.get("line", "")
+        meta = entry.get("structuredMetadata") or None
+        # Loki values 元素是 [ns, line] 或 [ns, line, metadata]
+        if meta:
+            stream["values"].append([ts, line, meta])
+        else:
+            stream["values"].append([ts, line])
+    return {
+        "status": "success",
+        "data": {"resultType": "streams", "result": [by_stream[k] for k in order]},
+    }
+
+
+def _mcp_tempo_search_to_batches(trace: Any) -> list[Any]:
+    """search_tempo_traces 的单条 trace 摘要 → OTLP `batches` 形状。
+
+    为什么需要：某些版本组合下 `get_tempo_trace` 恒 404（实测 Grafana 11.1.0
+    + Tempo 2.5.0 —— mcp-grafana 走 `/api/v2/traces`，Tempo 2.5 没有该端点）。
+    但 search 的响应**已经带回 spanSet**：
+        {"traceID", "rootServiceName", "rootTraceName",
+         "startTimeUnixNano", "durationMs", "spanSet": {"spans": [{spanID, ...}]}}
+
+    用它构造的是一份**降级**证据：只有匹配到的 span，没有完整 span 树，
+    也没有父子关系。丢掉它的代价是"整条 trace 证据消失"，比降级更糟；
+    所以保留，但调用方必须靠 `degraded=True` 知道这不是完整数据。
+
+    产出形状对齐 TraceNormalizer 的 OTLP 分支（scopeSpans/spans + UnixNano）。
+    """
+    if not isinstance(trace, dict):
+        return []
+    span_set = trace.get("spanSet") or {}
+    raw_spans = span_set.get("spans") or []
+    if not raw_spans:
+        return []
+
+    service = trace.get("rootServiceName") or ""
+    root_name = trace.get("rootTraceName") or ""
+    spans: list[dict[str, Any]] = []
+    for sp in raw_spans:
+        if not isinstance(sp, dict):
+            continue
+        start_ns = sp.get("startTimeUnixNano") or trace.get("startTimeUnixNano")
+        duration_ns = sp.get("durationNanos")
+        end_ns = None
+        if start_ns is not None and duration_ns is not None:
+            try:
+                end_ns = str(int(start_ns) + int(duration_ns))
+            except (TypeError, ValueError):
+                end_ns = None
+        spans.append({
+            "traceId": trace.get("traceID"),
+            "spanId": sp.get("spanID"),
+            "name": sp.get("name") or root_name,
+            "startTimeUnixNano": start_ns,
+            "endTimeUnixNano": end_ns,
+        })
+    return [{
+        "resource": {"attributes": [
+            {"key": "service.name", "value": {"stringValue": service}}]},
+        "scopeSpans": [{"spans": spans}],
+    }]
+
+
 class GrafanaMCPClient:
     """Grafana MCP Server 的 JSON-RPC 客户端（streamable HTTP，支持 SSE 响应）。"""
 
@@ -390,45 +548,59 @@ class MCPDatasourceAdapters(DatasourceAdapters):
 
     def query_metric_series(self, service: str, metric: str, start: str, end: str) -> Any:
         expression = metric if any(ch in metric for ch in "()[]{}") else f'{metric}{{service="{service}"}}'
-        return self.client.call_tool(
-            "query_prometheus",
-            {
-                "datasourceUid": self.prometheus_uid,
-                "expr": expression,
-                "startRFC3339": start,
-                "endRFC3339": end,
-                "stepSeconds": 60,
-            },
-        )
+        return self._query_prometheus(expression, start, end)
 
     def query_service_error_rate(self, service: str, start: str, end: str) -> Any:
         total = f'sum(rate(http_requests_total{{service="{service}"}}[1m]))'
         errors = f'sum(rate(http_requests_total{{service="{service}",status=~"5.."}}[1m]))'
-        return self.client.call_tool(
+        return self._query_prometheus(f"{errors} / clamp_min({total}, 0.000001)", start, end)
+
+    def _query_prometheus(self, expression: str, start: str, end: str) -> Any:
+        """查询 Prometheus，并把响应还原成原生形状。
+
+        两个实测结论（都不是文档写的）：
+
+        1. **参数名**：`query_prometheus` 的真实签名是
+           datasourceUid / expr / startTime / endTime / stepSeconds / queryType，
+           **没有** startRFC3339 / endRFC3339。服务端对未知参数直接拒绝：
+             unknown arguments "endRFC3339", "startRFC3339"
+        2. **必须声明 queryType**：不给 queryType 时带 stepSeconds 的 range 查询
+           不成立，而 `endTime` 是必填项。
+
+        **响应形状**：MCP 返回 `{data: [...], exploreUrl}`，而不是 Prometheus 的
+        `{status, data: {resultType, result}}`。`MetricNormalizer` 只认后者，
+        不转换就会 ValueError —— 且会被 `_collect_node` 当成 missing_data 静默吞掉。
+        """
+        raw = self.client.call_tool(
             "query_prometheus",
             {
                 "datasourceUid": self.prometheus_uid,
-                "expr": f"{errors} / clamp_min({total}, 0.000001)",
-                "startRFC3339": start,
-                "endRFC3339": end,
+                "expr": expression,
+                "startTime": _mcp_time(start),
+                "endTime": _mcp_time(end),
+                "queryType": "range",
                 "stepSeconds": 60,
             },
         )
+        return _mcp_prometheus_to_native(raw)
 
     def query_service_logs(self, service: str, start: str, end: str, filter: str | None = None) -> Any:
         logql = f'{{service="{service}"}}'
         if filter:
             logql += f' |= "{filter}"'
-        return self.client.call_tool(
+        raw = self.client.call_tool(
             "query_loki_logs",
             {
                 "datasourceUid": self.loki_uid,
                 "logql": logql,
-                "startRFC3339": start,
-                "endRFC3339": end,
+                # 规范拼写是小写 fc（服务端 schema: startRfc3339 / endRfc3339）。
+                # 写 startRFC3339 在 Go 的宽松解码下侥幸能过，换实现就会坏。
+                "startRfc3339": _mcp_time(start),
+                "endRfc3339": _mcp_time(end),
                 "limit": 200,
             },
         )
+        return _mcp_loki_to_native(raw)
 
     def query_service_traces(
         self, service: str, start: str, end: str, min_duration_ms: int | None = None
@@ -448,6 +620,8 @@ class MCPDatasourceAdapters(DatasourceAdapters):
         )
         traces = found.get("traces", []) if isinstance(found, dict) else []
         batches: list[Any] = []
+        degraded = False
+        degraded_reason = ""
         for t in traces:
             trace_id = t.get("traceID") or t.get("traceId")
             if not trace_id:
@@ -460,10 +634,34 @@ class MCPDatasourceAdapters(DatasourceAdapters):
             #   Docker latest：只有 datasourceUid/trace_id/focus_span_id
             # 传 start/end 给旧版会被拒（unknown arguments）。因此先不带时间范围，
             # 失败且错误信息表明"unknown arguments"时再降级重试。
-            payload = self._call_get_trace(trace_id, start=start, end=end)
+            try:
+                payload = self._call_get_trace(trace_id, start=start, end=end)
+            except Exception as exc:
+                # get_tempo_trace 在该版本组合下可能恒 404（实测：
+                # Grafana 11.1.0 + Tempo 2.5.0 走 /api/v2/traces 而 Tempo 2.5
+                # 没有该端点）。此时**不该让整条 trace 证据消失**：
+                # search 响应本身已带 spanSet，足以构造一条（受限的）trace 证据。
+                fallback = _mcp_tempo_search_to_batches(t)
+                if fallback:
+                    batches.extend(fallback)
+                    degraded = True
+                    degraded_reason = f"get_tempo_trace unavailable: {str(exc)[:160]}"
+                    continue
+                # 没有 spanSet 可降级时必须抛出：静默 continue 会让证据无声消失，
+                # 上层无法区分"这个 trace 没数据"和"我们没取回来"。
+                # 抛出去由 `_collect_node` 记入 missing_data，才是诚实的失败路径。
+                raise
             if isinstance(payload, dict):
                 batches.extend(payload.get("batches", [payload]))
-        return {"traces_considered": len(traces), "batches": batches}
+        result: dict[str, Any] = {
+            "traces_considered": len(traces),
+            "batches": batches,
+            "degraded": degraded,
+        }
+        if degraded:
+            # 必须可辨：只含摘要 span 的结果不能被误当成完整 span 树
+            result["degraded_reason"] = degraded_reason
+        return result
 
     def _call_get_trace(self, trace_id: str, *, start: str | None, end: str | None) -> Any:
         """调用 get_tempo_trace，容忍两个 mcp-grafana 版本的参数差异。

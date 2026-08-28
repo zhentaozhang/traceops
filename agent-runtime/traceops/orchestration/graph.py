@@ -261,7 +261,24 @@ def _unwrap_raw(raw: Any, evidence_type: EvidenceType) -> dict[str, Any]:
 
 
 def _observed_at(raw: dict[str, Any], evidence_type: EvidenceType, fallback: datetime) -> datetime:
-    """从数据本身取观测时间；取不到时用窗口结束时间。"""
+    """从数据本身取观测时间；取不到时用窗口结束时间。
+
+    **必须夹到"现在"**：告警刚触发时查询窗口末端常常在未来（窗口是
+    [fault_start, now+X]），于是最后一个数据点的时间戳可能落在未来。
+    `Evidence` 有一条不变量 `collected_at >= observed_at`，取值超前会直接
+    ValidationError —— 而 `_collect_node` 会把它当成"这个数据源没数据"，
+    静默丢进 missing_data 然后 continue。
+
+    这是实测踩到的：跑 MCP 全链路时 metric 和 log 证据全部消失，
+    报告照样给出 SUPPORTED，用的是残缺证据。夹到 now 才是诚实的：
+    数据确实存在，观测时间不晚于我们取回它的时刻。
+    """
+    observed = _observed_at_raw(raw, evidence_type, fallback)
+    now = datetime.now(UTC)
+    return min(observed, now)
+
+
+def _observed_at_raw(raw: dict[str, Any], evidence_type: EvidenceType, fallback: datetime) -> datetime:
     try:
         if evidence_type is EvidenceType.METRIC:
             result = raw.get("result") or []
