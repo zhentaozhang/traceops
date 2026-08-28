@@ -83,6 +83,10 @@ services:
   # 正确做法是单独运行 grafana/mcp-grafana 并指向 Grafana。
   mcp-grafana:
     image: grafana/mcp-grafana:latest
+    # 镜像自带 Entrypoint 是 `/app/mcp-grafana --transport sse ...`，
+    # 直接写 command 会变成"在 sse 模式上叠加参数"，实际仍走 sse。
+    # 必须用 entrypoint 覆盖，才能真正切到 streamable-http。
+    entrypoint: ["/app/mcp-grafana"]
     command: ["-t", "streamable-http", "--address", "0.0.0.0:8000"]
     environment:
       GRAFANA_URL: http://grafana:3000

@@ -17,7 +17,8 @@ from __future__ import annotations
 from traceops.tools.adapters import MCPDatasourceAdapters, GrafanaMCPClient
 
 SEARCH_ALLOWED = {"datasourceUid", "query", "start", "end"}
-GET_ALLOWED = {"datasourceUid", "trace_id", "focus_span_id"}
+# v2.1.1 起允许可选的 start/end（窄化时间范围）；Docker latest 只接受三个。
+GET_ALLOWED = {"datasourceUid", "trace_id", "focus_span_id", "start", "end"}
 
 
 class RecordingClient:
@@ -80,10 +81,12 @@ class TestGetTempoTraceSignature:
 
         get_call = client.calls[1]
         assert get_call[0] == "get_tempo_trace"
-        # 必须是允许集的**子集**：focus_span_id 是可选的，不必总是传
+        # 必须是允许集的**子集**：focus_span_id / start / end 都可选
         assert set(get_call[1]) <= GET_ALLOWED, (
             f"real server rejects unknown args; got {sorted(get_call[1])}")
         assert "datasourceUid" in get_call[1] and "trace_id" in get_call[1]
+        # 绝不能出现文档里的 camelCase 写法
+        assert "traceId" not in get_call[1]
         assert "traceId" not in get_call[1]
 
     def test_short_trace_id_is_padded_to_32(self):
@@ -103,3 +106,60 @@ class TestGetTempoTraceSignature:
         MCPDatasourceAdapters(client).query_service_traces(
             "order-service", "2026-10-31T00:00:00Z", "2026-10-31T23:59:59Z")
         assert len(client.calls) == 1, "no trace ids -> no get calls"
+
+
+class TestVersionCompatibility:
+    """两个 mcp-grafana 版本的签名差异必须被容忍。
+
+    实测差异：
+      v2.1.1（uvx）：get_tempo_trace 接受 datasourceUid/trace_id/focus_span_id/start/end
+      Docker latest：只接受 datasourceUid/trace_id/focus_span_id
+
+    传 start/end 给旧版会得到 "unknown arguments"，此时必须降级重试，
+    否则在 Docker 部署下 trace 永远取不回来。
+    """
+
+    def test_falls_back_when_old_version_rejects_time_range(self):
+        class OldVersionClient:
+            def __init__(self):
+                self.calls = []
+
+            def call_tool(self, name, arguments=None):
+                self.calls.append((name, dict(arguments or {})))
+                if name != "get_tempo_trace":
+                    return {"traces": [{"traceID": "a" * 32}]}
+                if "start" in (arguments or {}) or "end" in (arguments or {}):
+                    raise RuntimeError(
+                        'unknown arguments "end", "start"; valid arguments: '
+                        'datasourceUid, focus_span_id, trace_id')
+                return {"batches": [{"resource": {}, "spans": []}]}
+
+        client = OldVersionClient()
+        adapters = MCPDatasourceAdapters(client)
+
+        payload = adapters.query_service_traces(
+            "order-service", "2026-10-31T00:00:00Z", "2026-10-31T23:59:59Z")
+
+        # 第二次 get 调用必须不带时间范围
+        get_calls = [c for c in client.calls if c[0] == "get_tempo_trace"]
+        assert len(get_calls) == 2, get_calls
+        assert "start" not in get_calls[1][1] and "end" not in get_calls[1][1]
+        assert payload is not None
+
+    def test_non_argument_error_is_not_swallowed(self):
+        """404（trace 真不存在）不能被当成'参数不支持'而重试。"""
+        class FailingClient:
+            def __init__(self):
+                self.calls = []
+
+            def call_tool(self, name, arguments=None):
+                self.calls.append((name, dict(arguments or {})))
+                if name != "get_tempo_trace":
+                    return {"traces": [{"traceID": "a" * 32}]}
+                raise RuntimeError("tempo API returned 404: 404 page not found")
+
+        client = FailingClient()
+        import pytest
+        with pytest.raises(RuntimeError, match="404"):
+            MCPDatasourceAdapters(client).query_service_traces(
+                "order-service", "2026-10-31T00:00:00Z", "2026-10-31T23:59:59Z")

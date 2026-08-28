@@ -455,8 +455,37 @@ class MCPDatasourceAdapters(DatasourceAdapters):
             # Tempo 返回的 traceID 可能是短形式；存储的是 32 位十六进制
             if len(trace_id) < 32:
                 trace_id = trace_id.rjust(32, "0")
-            payload = self.client.call_tool(
-                "get_tempo_trace", {"datasourceUid": self.tempo_uid, "trace_id": trace_id})
+            # **版本兼容**：mcp-grafana 的两个版本签名不同 ——
+            #   v2.1.1（uvx）：允许可选 start/end（窄化时间范围，查得更快）
+            #   Docker latest：只有 datasourceUid/trace_id/focus_span_id
+            # 传 start/end 给旧版会被拒（unknown arguments）。因此先不带时间范围，
+            # 失败且错误信息表明"unknown arguments"时再降级重试。
+            payload = self._call_get_trace(trace_id, start=start, end=end)
             if isinstance(payload, dict):
                 batches.extend(payload.get("batches", [payload]))
         return {"traces_considered": len(traces), "batches": batches}
+
+    def _call_get_trace(self, trace_id: str, *, start: str | None, end: str | None) -> Any:
+        """调用 get_tempo_trace，容忍两个 mcp-grafana 版本的参数差异。
+
+        旧版（Docker latest）没有 start/end；新版（v2.1.1+）有。
+        策略：先带时间范围（新版能查得更快、更准），若服务端明确报
+        "unknown arguments" 则降级为不带时间范围重试。
+
+        只在错误信息明确是参数不被接受时才降级 —— 其他错误（如 404）必须
+        原样上报，否则会把"trace 真的不存在"误当成"参数不支持"。
+        """
+        args: dict[str, Any] = {"datasourceUid": self.tempo_uid, "trace_id": trace_id}
+        if start and end:
+            args["start"] = start
+            args["end"] = end
+        try:
+            return self.client.call_tool("get_tempo_trace", args)
+        except Exception as exc:
+            message = str(exc)
+            if start and end and "unknown argument" in message.lower():
+                return self.client.call_tool(
+                    "get_tempo_trace",
+                    {"datasourceUid": self.tempo_uid, "trace_id": trace_id},
+                )
+            raise
