@@ -36,7 +36,13 @@ from traceops.evidence.graph import (
 from traceops.evidence.templates import QueryTemplateError, default_registry
 from traceops.evidence.normalizer import normalize
 from traceops.evidence.store import EvidenceStore
-from traceops.orchestration.detectors import attribute_evidence, generate_hypotheses
+from traceops.orchestration.detectors import (
+    attribute_evidence,
+    generate_hypotheses,
+    logs_are_anomalous,
+    metric_is_anomalous,
+    traces_are_anomalous,
+)
 from traceops.rca.chain import build_propagation_chain
 from traceops.rca.ranking import RankedCandidate, derive_signals, rank_hypotheses
 from traceops.rca.report import build_report
@@ -568,22 +574,44 @@ def _rank_node(state: InvestigationState, config: RunnableConfig) -> dict[str, A
         derive_signals(h, state.get("links", []), _ctx_from(config).store, fault_start=request.fault_start)
         for h in hypotheses
     ]
-    ranked = rank_hypotheses(hypotheses, signals)
+    ranked = rank_hypotheses(hypotheses, signals, topology=_ctx_from(config).topology)
 
     # 拓扑分层：同分时越靠下游（更可能是根因）的排前。
     # 规则分不同则不动 —— 证据强度优先，拓扑只做平局裁决。
+    #
+    # 注意：R-008 已把「症状」候选降级（status != SUPPORTED）。这里的重排
+    # 必须把状态放在第一优先级，否则会把被降级的症状服务重新顶到 rank1，
+    # R-008 就白做了。
     topology = _ctx_from(config).topology
     if topology is not None:
+        from traceops.domain.models import HypothesisStatus
+
         order = {name: index for index, name in enumerate(topology.blame_order({h.candidate_service for h in hypotheses}))}
         by_id = {h.id: h for h in hypotheses}
-        ranked.sort(key=lambda r: (-r.score, order.get(by_id[r.hypothesis_id].candidate_service, 999)))
+        ranked.sort(key=lambda r: (
+            r.status is not HypothesisStatus.SUPPORTED,   # 断言为根因的排前面
+            -r.score,
+            order.get(by_id[r.hypothesis_id].candidate_service, 999),
+        ))
         for index, candidate in enumerate(ranked, start=1):
             candidate.rank = index
     return {"ranked": ranked}
 
 
 def _affected_services(state: InvestigationState, config: RunnableConfig) -> list[str]:
-    """影响范围 = 首选根因服务的上游（blast radius），排除根因自身。"""
+    """影响范围 = 首选根因的上游服务中，**确实被观测到异常**的那些。
+
+    为什么不能只算拓扑：`blast_radius` 只说明"这两个服务有调用关系"，
+    不说明"这次故障真的波及了它"。拓扑里有依赖 ≠ 它此刻在受苦。
+
+    参考 aurora-lab 场景 12 的失败：「其它 workload 都健康、未受影响」
+    的唯一依据是 pod status，从未查过流量 —— 真实第二故障因此被漏掉，
+    而报告还宣称它不存在。
+
+    所以这里只收录**采集层拿到了证据**的上游服务；拓扑相关但没采到的，
+    由 `_unobserved_related` 记入 missing_data（明确说"没查"，
+    而不是默认"没事"）。
+    """
     topology = _ctx_from(config).topology
     ranked = state.get("ranked") or []
     hypotheses = state.get("hypotheses") or []
@@ -595,7 +623,71 @@ def _affected_services(state: InvestigationState, config: RunnableConfig) -> lis
         return []
     radius = topology.blast_radius(lead.candidate_service, depth=2)
     radius.discard(lead.candidate_service)
-    return sorted(radius)
+    anomalous = _anomalous_services(state)
+    return sorted(name for name in radius if name in anomalous)
+
+
+def _anomalous_services(state: InvestigationState) -> set[str]:
+    """本次调查**观测到异常**的服务集合（受影响判定用这个，不是"有数据"）。
+
+    `_observed_services` 只知道"拿到了记录"；影响范围要的是"它确实表现异常"。
+    一个服务错误率 0.01（正常）不该出现在受影响列表里，否则报告会夸大影响面。
+    """
+    names: set[str] = set()
+    for evidence in state.get("evidence", []) or []:
+        service = evidence.service_id
+        if not service:
+            continue
+        if metric_is_anomalous(evidence) or logs_are_anomalous(evidence) or traces_are_anomalous(evidence):
+            names.add(service)
+    return names
+
+
+def _observed_services(state: InvestigationState) -> set[str]:
+    """本次调查真正**采到有效观测**的服务集合。
+
+    "查过"不等于"观测到"：一次查询可能成功返回但结果为空（`result: []`），
+    那种情况下我们什么都没看到。把这种服务算成"已观测"，等于用
+    "我查了"冒充"我看见它没事"——正是 aurora-lab E-1 的失败模式。
+
+    因此只统计 `normalized_data` 里确实有记录的证据。
+    """
+    names: set[str] = set()
+    for evidence in state.get("evidence", []) or []:
+        service = evidence.service_id
+        if not service:
+            continue
+        data = evidence.normalized_data or {}
+        records = (
+            data.get("total_records")
+            or data.get("result_count")
+            or len(data.get("records") or [])
+            or len(data.get("spans") or [])
+            or len(data.get("series") or [])
+        )
+        if records:
+            names.add(service)
+    return names
+
+
+def _unobserved_related(state: InvestigationState, config: RunnableConfig) -> list[str]:
+    """拓扑相关但**没有观测证据**的服务 —— 必须显式记为"未检查"。
+
+    这是"诚实"的另一半：不能把没查的服务写进影响范围（那是发明事实），
+    但也不能静默省略（静默省略等于暗示"查过了、没事"）。
+    """
+    topology = _ctx_from(config).topology
+    ranked = state.get("ranked") or []
+    hypotheses = state.get("hypotheses") or []
+    if topology is None or not ranked:
+        return []
+    lead = next((h for h in hypotheses if h.id == ranked[0].hypothesis_id), None)
+    if lead is None:
+        return []
+    radius = topology.blast_radius(lead.candidate_service, depth=2)
+    radius.discard(lead.candidate_service)
+    observed = _observed_services(state)
+    return sorted(name for name in radius if name not in observed)
 
 
 def _propagation_chain(state: InvestigationState, ctx: RunContext) -> list:
@@ -633,6 +725,15 @@ def _correlation_notes(state: InvestigationState) -> list[str]:
 def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
     request = state["request"]
     ctx = _ctx_from(config)
+    missing = list(state.get("missing_data", []))
+    # 拓扑相关但没观测到数据的服务必须在报告里明说"未检查"——
+    # 既不写进影响范围（那是发明事实），也不静默省略（那暗示"查过了没事"）。
+    unobserved = _unobserved_related(state, config)
+    if unobserved:
+        missing.append(
+            "topology-related services not observed (scope unknown, not assumed healthy): "
+            + ", ".join(unobserved)
+        )
     report = build_report(
         investigation_run_id=request.investigation_run_id,
         hypotheses=state.get("hypotheses", []),
@@ -641,7 +742,7 @@ def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str,
         ranked=state.get("ranked", []),
         fault_start=request.fault_start,
         store=ctx.store,
-        missing_data=list(state.get("missing_data", [])),
+        missing_data=missing,
         affected_services=_affected_services(state, config),
         correlation_notes=_correlation_notes(state),
         propagation_chain=_propagation_chain(state, ctx),

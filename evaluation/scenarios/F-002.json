@@ -15,6 +15,21 @@
     "service": "billing-api",
     "component": null,
     "fault_type": "dependency_timeout",
-    "expected_diagnosis": "SUPPORTED"
-  }
+    "expected_diagnosis": "SUPPORTED",
+    "must_identify": [
+      "billing-api"
+    ],
+    "wrong_answers": [
+      "memory leak",
+      "node memory pressure",
+      "redis"
+    ]
+  },
+  "topology_edges": [
+    [
+      "payment-service",
+      "billing-api"
+    ]
+  ],
+  "scope_depth": 2
 }

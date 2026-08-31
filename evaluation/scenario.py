@@ -79,6 +79,18 @@ class GroundTruth(BaseModel):
     fault_type: str
     expected_diagnosis: Literal["SUPPORTED", "REFUTED", "INCONCLUSIVE"] = "SUPPORTED"
     propagation_chain: list[str] = Field(default_factory=list)
+    # ---- rubric（借鉴 aurora-lab scenarios/*/scenario.yaml）----
+    # 报告**必须**点到的东西。不止一个根因服务时，用来防「只找到第一个就宣布收工」。
+    must_identify: list[str] = Field(
+        default_factory=list,
+        description="报告中必须出现的实体（服务名/组件名）；缺一个即记一次 missing_identification",
+    )
+    # **看起来合理但实际错误**的答案，被系统说出口就算一次错误断言。
+    # 这是「规则自证」的解药：只有列出错误答案，才测得出「方向错但听起来专业」。
+    wrong_answers: list[str] = Field(
+        default_factory=list,
+        description="明确错误的根因表述（如 'memory leak'）；出现在报告中即计为一次错误断言",
+    )
 
 
 class Scenario(BaseModel):

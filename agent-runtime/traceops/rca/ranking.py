@@ -110,8 +110,15 @@ def _evaluate(signals: CandidateSignals) -> tuple[int, HypothesisStatus, list[st
 def rank_hypotheses(
     hypotheses: list[RootCauseHypothesis],
     signals: list[CandidateSignals],
+    *,
+    topology=None,
 ) -> list[RankedCandidate]:
-    """确定性排序：score 降序，同分按 hypothesis_id 升序（保证可复现）。"""
+    """确定性排序：score 降序，同分按 hypothesis_id 升序（保证可复现）。
+
+    Args:
+        topology: 提供时启用 R-008（症状不升级为根因）。None 时保持旧行为——
+            宁可留一个可疑候选，也不要在没有拓扑的情况下瞎猜方向。
+    """
     by_id = {s.hypothesis_id: s for s in signals}
     known = {h.id for h in hypotheses}
 
@@ -151,7 +158,65 @@ def rank_hypotheses(
             hypothesis_id=hid, score=score, rank=i,
             status=status, applied_rules=rules,
         ))
+
+    _apply_symptom_rule(ranked, by_id_full, topology)
     return ranked
+
+
+# 症状服务的异常可以完全由上游根因解释，因此不应被断言为独立根因。
+# 用 DEGRADED 而不是 REFUTED：我们没有证据反驳"它自己也有问题"，
+# 只是证据不足以支持它作为根因（防止把症状升级成第二根因）。
+_SYMPTOM_STATUS = HypothesisStatus.INCONCLUSIVE
+
+
+def _apply_symptom_rule(ranked: list[RankedCandidate], hypotheses: dict, topology) -> None:
+    """R-008：拓扑上依赖另一个 SUPPORTED 候选的服务，其异常是症状，不是根因。
+
+    为什么需要：`_evaluate` 只看「支持证据条数 > 0」，而症状服务的错误率
+    本来就会升高（那就是症状的定义）。于是 F-001 的 rank3 会出现
+    `order-service/availability_degradation` 且状态 SUPPORTED ——
+    报告等于说"order-service 也是根因"，而它只是被 redis 拖累。
+
+    判据（纯确定性，不猜）：
+      候选 C 依赖 候选 R（两者都被观测到异常）→ C 的异常可由 R 解释 → C 降级。
+
+    **不按排名先后判定**：排名可能因为平局裁决把症状排到前面（实测过），
+    那样"只看前面更强的候选"会漏掉它。方向关系是结构性的，与排名无关。
+
+    边界：
+      - 互不相干的服务不降级（多故障场景必须保留多个根因）
+      - topology 为 None 时整条规则不启用（没有方向信息就不猜）
+      - 环检测已在拓扑构造期完成，因此不会双向降级
+    """
+    if topology is None:
+        return
+
+    supported = [
+        (c, (hypotheses[c.hypothesis_id].candidate_service or "").strip())
+        for c in ranked
+        if c.status is HypothesisStatus.SUPPORTED
+    ]
+
+    for candidate, service in supported:
+        if not service:
+            continue
+        for other, root in supported:
+            if other is candidate or not root or root == service:
+                continue
+            try:
+                depends_on_root = root in topology.dependencies(service)
+            except Exception:  # 拓扑查询失败不该让排序崩掉
+                depends_on_root = False
+            if depends_on_root:
+                candidate.status = _SYMPTOM_STATUS
+                candidate.applied_rules.append(f"R-008 (symptom of {root}, not a root cause)")
+                break
+
+    # 降级后重排：断言为根因的候选必须排在"受影响/不确定"之前。
+    # 否则 rank1 可能是被降级的症状服务，AC@1 会被这种排序噪声拖低。
+    ranked.sort(key=lambda r: (r.status is not HypothesisStatus.SUPPORTED, r.rank))
+    for i, candidate in enumerate(ranked, start=1):
+        candidate.rank = i
 
 
 def derive_signals(

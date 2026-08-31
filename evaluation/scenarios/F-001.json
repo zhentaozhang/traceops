@@ -31,6 +31,22 @@
     "service": "redis",
     "component": "redis-connection-pool",
     "fault_type": "pool_exhaustion",
-    "expected_diagnosis": "SUPPORTED"
-  }
+    "expected_diagnosis": "SUPPORTED",
+    "must_identify": [
+      "redis"
+    ],
+    "wrong_answers": [
+      "order-service",
+      "memory leak",
+      "node memory pressure",
+      "api-gateway"
+    ]
+  },
+  "topology_edges": [
+    [
+      "order-service",
+      "redis"
+    ]
+  ],
+  "scope_depth": 2
 }

@@ -90,6 +90,16 @@
       "redis",
       "order-service",
       "api-gateway"
+    ],
+    "must_identify": [
+      "redis",
+      "order-service",
+      "api-gateway"
+    ],
+    "wrong_answers": [
+      "memory leak",
+      "node memory pressure",
+      "network partition"
     ]
   }
 }

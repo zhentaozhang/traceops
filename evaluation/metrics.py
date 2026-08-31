@@ -38,7 +38,15 @@ class ScenarioOutcome:
     affected_services_correct: bool | None
     tool_calls: int
     tokens_used: int
-    chain_declared: bool
+    # rubric 结果（未声明 rubric 的场景为空元组，保持向后兼容）
+    missing_identifications: tuple[str, ...] = ()
+    wrong_answers_asserted: tuple[str, ...] = ()
+    # 该场景是否声明过 rubric。必须显式记录：空元组无法区分
+    # 「没声明 rubric」与「声明了但全部命中」，后者应当进分母。
+    rubric_declared: bool = False
+    # 候选池大小（去重后的候选服务数）。AC@k 必须与它一起看：
+    # 池子只有 1 个候选时，AC@3/AC@5 恒真，是伪指标。
+    candidate_pool_size: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -60,6 +68,9 @@ class AggregateMetrics:
     mean_tokens: float
     chain_order_accuracy: float
     affected_services_accuracy: float
+    # rubric 族：只统计"声明了 rubric"的场景，避免污染其他指标的分母
+    wrong_answer_rate: float = 0.0
+    must_identify_rate: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -160,6 +171,12 @@ def score_scenario(scenario: "Scenario", result: "InvestigationResult") -> Scena
     ]
     citation_precision = len(attributable) / len(cited) if cited else 0.0
 
+    # ---- rubric ----
+    report_text = _report_text(report)
+    root_cause_text = _root_cause_text(report)
+    wrong_answers_asserted = _asserted_wrong_answers(root_cause_text, ground_truth.wrong_answers)
+    missing_identifications = _missing_identifications(report_text, ground_truth.must_identify)
+
     return ScenarioOutcome(
         scenario_id=scenario.scenario_id,
         service_ac_at_1=rank is not None and rank <= 1,
@@ -178,18 +195,107 @@ def score_scenario(scenario: "Scenario", result: "InvestigationResult") -> Scena
         chain_declared=bool(ground_truth.propagation_chain),
         chain_order_correct=_chain_order_correct(ground_truth, report),
         affected_services_correct=_affected_services_correct(ground_truth, report),
+        missing_identifications=missing_identifications,
+        wrong_answers_asserted=wrong_answers_asserted,
+        rubric_declared=bool(ground_truth.must_identify or ground_truth.wrong_answers),
+        candidate_pool_size=len({(h.candidate_service or "").strip() for h in hypotheses
+                                 if (h.candidate_service or "").strip()}),
     )
+
+
+def _root_cause_text(report) -> str:
+    """「被断言为根因」的文本 —— 只取候选假设与摘要的根因从句。
+
+    为什么必须与"被提到"分开：F-001 的报告里 `order-service` 既出现在
+    摘要（"error reported by order-service"）里，也作为 rank 3 候选存在。
+    前者是**归因说明**（正确且必需），后者是**候选根因**（可争议）。
+
+    如果把两者都算作"断言了 order-service 是根因"，一个把归因说清楚的
+    *好*报告会被判成错误答案 —— 这正是 aurora-lab E-9 那类"评分器 bug
+    把正确行为判成失败"。所以 wrong_answers 只看真正的根因断言面。
+    """
+    if report is None:
+        return ""
+    parts: list[str] = []
+    for hypothesis in getattr(report, "hypotheses", None) or []:
+        # 只有 SUPPORTED 的候选才是「被断言为根因」。
+        # INCONCLUSIVE / REFUTED 的候选是系统明确表达不确定，不能算成断言——
+        # 否则一个诚实地把症状列为"不确定"的报告，反而会被判成说错了话。
+        status = getattr(hypothesis, "status", None)
+        if status is not None and getattr(status, "value", status) != "supported":
+            continue
+        for attr in ("candidate_service", "fault_type", "candidate_component"):
+            value = getattr(hypothesis, attr, None)
+            if value:
+                parts.append(str(value))
+        # 刻意**不含 failure_mechanism**：它是叙述性文本，天然会写
+        # "error reported by order-service"——那是正确的归因说明，
+        # 不是"断言 order-service 是根因"。把叙述算成断言，等于惩罚
+        # 一个把归因写清楚的报告（aurora-lab E-9 那类评分器 bug）。
+    summary = str(getattr(report, "summary", "") or "")
+    # 摘要里 "Root cause: ..." 到第一个破折号/句号之前才是根因断言；
+    # 破折号之后通常是"归因说明"，那是另一回事。
+    if summary:
+        clause = summary.split(" — ")[0] if " — " in summary else summary
+        parts.append(clause)
+    return " \n ".join(parts).lower()
+
+
+def _report_text(report) -> str:
+    """「被提到过」的文本 —— 供 must_identify 使用（宽松匹配）。
+
+    与 `_root_cause_text` 的区别：这里纳入传播链节点与影响范围，
+    因为它们"应当被报告点到"，但不等于是根因断言。
+
+    仍然刻意不含 Evidence 的原始日志文本：日志里出现 "memory leak"
+    是外部数据，不是系统的判断。
+    """
+    if report is None:
+        return ""
+    parts: list[str] = [_root_cause_text(report)]
+    for node in getattr(report, "propagation_chain", None) or []:
+        if isinstance(node, dict) and node.get("service"):
+            parts.append(str(node["service"]))
+    for service in getattr(report, "affected_services", None) or []:
+        parts.append(str(service))
+    return " \n ".join(parts).lower()
+
+
+def _asserted_wrong_answers(report_text: str, wrong_answers: list[str]) -> tuple[str, ...]:
+    """报告文本里出现了哪些预声明的错误答案（大小写不敏感）。"""
+    asserted = [w for w in wrong_answers if w.strip().lower() in report_text]
+    return tuple(asserted)
+
+
+def _missing_identifications(report_text: str, must_identify: list[str]) -> tuple[str, ...]:
+    """must_identify 里哪些实体在报告中完全没被提到。"""
+    missing = [m for m in must_identify if m.strip().lower() not in report_text]
+    return tuple(missing)
 
 
 def aggregate(rows: Iterable[ScenarioOutcome]) -> AggregateMetrics:
     items = list(rows)
     if not items:
-        return AggregateMetrics(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        # 空集合要产出**全零**的合法结果，而不是崩溃。
+        # 此前这里按位置参数传了 12 个值给 14 字段的 dataclass → TypeError。
+        # 位置参数还会在字段增删时静默错位，因此一律用关键字。
+        return AggregateMetrics(
+            scenario_count=0, ac_at_1=0.0, ac_at_3=0.0, ac_at_5=0.0,
+            fault_type_accuracy=0.0, component_accuracy=0.0,
+            diagnosis_accuracy=0.0, abstention_rate=0.0,
+            evidence_recall_mean=0.0, citation_precision_mean=0.0,
+            mean_tool_calls=0.0, mean_tokens=0.0,
+            chain_order_accuracy=0.0, affected_services_accuracy=0.0,
+            wrong_answer_rate=0.0, must_identify_rate=0.0,
+        )
 
     component_rows = [r.component_at_1 for r in items if r.component_at_1 is not None]
     # 定位与证据类指标只在"确实注入了故障"的场景上统计：
     # 健康对照组没有可定位的根因，把它算进 AC 分母会系统性低估系统能力。
     fault_rows = [r for r in items if r.fault_injected]
+    # rubric 族只在"声明了 rubric"的场景上统计：
+    # 没声明 rubric 的场景不该被算成"没出错"（那会虚高指标）
+    rubric_rows = [r for r in items if r.rubric_declared]
 
     return AggregateMetrics(
         scenario_count=len(items),
@@ -209,4 +315,9 @@ def aggregate(rows: Iterable[ScenarioOutcome]) -> AggregateMetrics:
         affected_services_accuracy=_mean(
             [1.0 if r.affected_services_correct else 0.0 for r in items
              if r.affected_services_correct is not None]),
+        # rubric 族
+        wrong_answer_rate=_mean(
+            [1.0 if r.wrong_answers_asserted else 0.0 for r in rubric_rows]),
+        must_identify_rate=_mean(
+            [1.0 if not r.missing_identifications else 0.0 for r in rubric_rows]),
     )

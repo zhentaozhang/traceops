@@ -7,12 +7,32 @@
   "window_start": "2026-10-30T10:00:00Z",
   "window_end": "2026-10-30T10:05:00Z",
   "signals": {
-    "error_rate_series": [0.01, 0.012, 0.40]
+    "error_rate_series": [
+      0.01,
+      0.012,
+      0.4
+    ]
   },
   "ground_truth": {
     "service": "inventory-service",
     "component": null,
     "fault_type": "availability_degradation",
-    "expected_diagnosis": "SUPPORTED"
-  }
+    "expected_diagnosis": "SUPPORTED",
+    "must_identify": [
+      "inventory-service"
+    ],
+    "wrong_answers": [
+      "memory leak",
+      "redis",
+      "order-service",
+      "network partition"
+    ]
+  },
+  "topology_edges": [
+    [
+      "inventory-service",
+      "inventory-db"
+    ]
+  ],
+  "scope_depth": 2
 }
