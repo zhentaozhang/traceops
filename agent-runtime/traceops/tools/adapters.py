@@ -356,6 +356,37 @@ def _mcp_loki_to_native(raw: Any) -> Any:
     }
 
 
+def _mcp_tempo_trace_to_batches(payload: Any) -> list[Any]:
+    """`get_tempo_trace` 的响应 → OTLP `batches` 列表。
+
+    两个真实形状都要认，否则证据会静默丢失：
+
+    - **Tempo 2.x / Grafana Tempo datasource**：`{"batches": [resourceSpan...]}`
+    - **Tempo v3.0.0 /api/v2/traces**：`{"trace": {"resourceSpans": [...]}, "metrics": {}}`
+
+    旧实现写的是 `payload.get("batches", [payload])`：对 v3 来说 `batches` 不存在，
+    于是把**外层 dict** 当成一个 batch 塞进去。外层没有 spans/scopeSpans，
+    `TraceNormalizer` 判 "contains no spans"，整条 trace 证据丢失 ——
+    而且这条丢失路径是静默的（进 missing_data，报告照出）。
+    """
+    if not isinstance(payload, dict):
+        return []
+    if "batches" in payload:
+        return list(payload["batches"] or [])
+    trace = payload.get("trace")
+    if isinstance(trace, dict):
+        # v3：trace 内部本身就是 resourceSpans 的容器
+        spans = trace.get("resourceSpans")
+        if isinstance(spans, list):
+            return spans
+        if "batches" in trace:
+            return list(trace["batches"] or [])
+    # 未包装的单个 resourceSpan（少数实现直接返回这层）
+    if "resourceSpans" in payload and isinstance(payload["resourceSpans"], list):
+        return payload["resourceSpans"]
+    return []
+
+
 def _mcp_tempo_search_to_batches(trace: Any) -> list[Any]:
     """search_tempo_traces 的单条 trace 摘要 → OTLP `batches` 形状。
 
@@ -652,7 +683,7 @@ class MCPDatasourceAdapters(DatasourceAdapters):
                 # 抛出去由 `_collect_node` 记入 missing_data，才是诚实的失败路径。
                 raise
             if isinstance(payload, dict):
-                batches.extend(payload.get("batches", [payload]))
+                batches.extend(_mcp_tempo_trace_to_batches(payload))
         result: dict[str, Any] = {
             "traces_considered": len(traces),
             "batches": batches,

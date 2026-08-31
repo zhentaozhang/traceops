@@ -339,6 +339,74 @@ class TestTempoDegradesWhenTraceFetchUnavailable:
         assert raw.get("degraded") is False
 
 
+class TestTempoV3Shape:
+    """Tempo v3 的 `/api/v2/traces/{id}` 把 span 树包在 `trace` 字段里。
+
+    实测（Tempo v3.0.0）：
+        {"trace": {"resourceSpans": [{resource, scopeSpans}]}, "metrics": {}}
+    而 Tempo 2.5 的老端点是直接 `{"batches": [...]}`。
+
+    适配器当前写的是 `payload.get("batches", [payload])` —— 对 v3 来说
+    `batches` 不存在，于是把**整个外层 dict** 当成一个 batch 塞进去。
+    那个 dict 里没有 `spans`/`scopeSpans`，`TraceNormalizer` 判定
+    "contains no spans"，证据照样丢失。
+
+    也就是说：升 Tempo 版本并不会自动变好，这里还有一层形状要对上。
+    """
+
+    def test_v3_trace_wrapper_is_unwrapped_into_batches(self):
+        class V3Client:
+            def call_tool(self, name, arguments=None):
+                if name == "search_tempo_traces":
+                    return {"traces": [{"traceID": "a" * 32}], "metrics": {}}
+                return {
+                    "trace": {
+                        "resourceSpans": [{
+                            "resource": {"attributes": [
+                                {"key": "service.name", "value": {"stringValue": "redis"}}]},
+                            "scopeSpans": [{"spans": [{
+                                "traceId": "a" * 32,
+                                "spanId": "22bb33cc44dd55ee",
+                                "name": "redis.command",
+                                "startTimeUnixNano": "1793417000000000000",
+                                "endTimeUnixNano": "1793417002100000000",
+                                "status": {"code": "STATUS_CODE_ERROR"},
+                            }]}],
+                        }]
+                    },
+                    "metrics": {},
+                }
+
+        raw = MCPDatasourceAdapters(V3Client()).query_service_traces(
+            "redis", "now-1h", "now")
+
+        evidence = _normalize(EvidenceType.TRACE, raw)
+        assert evidence.normalized_data["total_records"] == 1
+        span = evidence.normalized_data["spans"][0]
+        assert span["service"] == "redis"
+        assert span["operation_name"] == "redis.command"
+        assert span["error"] is True
+
+    def test_v3_result_is_not_marked_degraded(self):
+        """v3 给的是完整 span 树，不能标成降级。"""
+
+        class V3Client:
+            def call_tool(self, name, arguments=None):
+                if name == "search_tempo_traces":
+                    return {"traces": [{"traceID": "a" * 32}], "metrics": {}}
+                return {"trace": {"resourceSpans": [{
+                    "resource": {"attributes": [
+                        {"key": "service.name", "value": {"stringValue": "redis"}}]},
+                    "scopeSpans": [{"spans": [{
+                        "traceId": "a" * 32, "spanId": "b", "name": "redis.command",
+                        "startTimeUnixNano": "1", "endTimeUnixNano": "2"}]}],
+                }]}, "metrics": {}}
+
+        raw = MCPDatasourceAdapters(V3Client()).query_service_traces(
+            "redis", "now-1h", "now")
+        assert raw.get("degraded") is False
+
+
 class TestAdapterContractParity:
     """MCP 适配器与直连适配器对同一份数据必须产出可比的 Evidence。"""
 
