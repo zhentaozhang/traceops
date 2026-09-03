@@ -103,13 +103,15 @@ class TestBudgetIntegration:
         gw = ToolGateway()
         gw.register(make_tool())
         budget = BudgetManager(max_tool_calls=2)
-        args = {"service": "x", "start": "2026-10-30T01:55:00Z", "end": "2026-10-30T02:10:00Z"}
-        gw.invoke("query_service_error_rate", args, budget=budget,
+        base = {"service": "x", "start": "2026-10-30T01:55:00Z", "end": "2026-10-30T02:10:00Z"}
+        # 每次换一个服务名：重复调用防护会拒绝"同名同参数"，
+        # 但预算计数必须仍然按真实调用累加。
+        gw.invoke("query_service_error_rate", base, budget=budget,
                   allowed_permissions=[ToolPermission.OBSERVABILITY_READ])
-        gw.invoke("query_service_error_rate", args, budget=budget,
+        gw.invoke("query_service_error_rate", {**base, "service": "y"}, budget=budget,
                   allowed_permissions=[ToolPermission.OBSERVABILITY_READ])
         with pytest.raises(Exception):  # BudgetExhausted from budget manager
-            gw.invoke("query_service_error_rate", args, budget=budget,
+            gw.invoke("query_service_error_rate", {**base, "service": "z"}, budget=budget,
                       allowed_permissions=[ToolPermission.OBSERVABILITY_READ])
 
     def test_failed_validation_does_not_consume_budget(self):

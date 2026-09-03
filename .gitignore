@@ -39,3 +39,6 @@ control-plane/target/
 
 # Python venv
 .venv/
+
+# Generated evaluation output (re-running the suite changes timestamps every time)
+evaluation/reports/*.json

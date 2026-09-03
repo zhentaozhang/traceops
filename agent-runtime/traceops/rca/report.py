@@ -98,8 +98,19 @@ def build_report(
         else:
             summary = "Root cause identified"
     elif ranked and all(r.status == HypothesisStatus.REFUTED for r in ranked):
-        diagnosis = "REFUTED"
-        summary = "All candidate root causes were refuted by contradictory evidence"
+        # REFUTED 的合法前提：我们确实有观测，且观测否定了候选。
+        # 若采集过程本身有缺失（数据源不可达 / 查询空结果），那"什么都没看见"
+        # 不能冒充"已排除" —— 那正是把 absence 当成阴性证据。
+        if missing_data:
+            diagnosis = "INCONCLUSIVE"
+            summary = (
+                "All candidates would be refuted, but data collection was incomplete "
+                "(" + "; ".join(list(missing_data)[:3]) + "); "
+                "a refutation requires observations we do not have"
+            )
+        else:
+            diagnosis = "REFUTED"
+            summary = "All candidate root causes were refuted by contradictory evidence"
     else:
         diagnosis = "INCONCLUSIVE"
         summary = "Insufficient evidence for a conclusive diagnosis"

@@ -27,6 +27,16 @@ class ToolPermission(str, Enum):
 
 
 class ToolNotConfigured(RuntimeError):
+    """工具已注册但数据源未配置。"""
+
+
+class DuplicateToolCall(RuntimeError):
+    """同一次调查里用完全相同的参数重复调用同一个工具。
+
+    为什么要拒绝而不是放行：预算耗在重复查询上是真实成本
+    （aurora-lab 记录过一个 run 把 2/3 预算花在 25 次重复写入上）。
+    调用方应当换参数或换时间窗，而不是把同一件事再问一遍。
+    """
     """内置工具尚未接数据源适配器（P0 阶段：先有契约，后接 Grafana MCP）。"""
 
 
@@ -47,6 +57,8 @@ class ToolGateway:
     def __init__(self) -> None:
         self._tools: dict[str, ToolSpec] = {}
         self._audit: list[dict[str, Any]] = []
+        # 同一次调查内「同名 + 完全相同参数」的调用指纹（重复调用防护）
+        self._seen_calls: set[str] = set()
 
     # ---- registry ----
     def register(self, spec: ToolSpec) -> None:
@@ -94,12 +106,27 @@ class ToolGateway:
             self._record(tool_name, "REJECTED_SCHEMA", params, error=exc.message[:500])
             raise
 
+        # 重复调用防护（holmesgpt safeguards.prevent_overly_repeated_tool_call 的做法）：
+        # 同一次调查里「同名 + 完全相同参数」的第二次调用直接拒绝。
+        #
+        # 必须放在预算扣除**之前**：否则"防重复"本身成了成本 ——
+        # 一次重复调用会吃掉一次配额，反而加速预算耗尽。
+        fingerprint = self._call_fingerprint(tool_name, params)
+        if fingerprint in self._seen_calls:
+            self._record(tool_name, "DUPLICATE_CALL", params,
+                         error="identical call already made in this investigation")
+            raise DuplicateToolCall(
+                f"duplicate call: {tool_name} was already invoked with identical params; "
+                "change the parameters or the time window instead"
+            )
+
         try:
             budget.consume_tool_call()
         except BudgetExhausted as exc:
             self._record(tool_name, "BUDGET_EXHAUSTED", params, error=str(exc))
             raise
 
+        self._seen_calls.add(fingerprint)
         started = time.monotonic()
         try:
             result = spec.implementation(**params)
@@ -118,9 +145,57 @@ class ToolGateway:
                 f"limit {spec.max_result_bytes}"
             )
 
-        self._record(tool_name, "OK", params,
+        self._record(tool_name, self._outcome_for(result), params,
                      duration_ms=int((time.monotonic() - started) * 1000))
         return result
+
+    @staticmethod
+    def _call_fingerprint(tool_name: str, params: dict[str, Any]) -> str:
+        """调用指纹：工具名 + 规范化 JSON 参数。
+
+        `sort_keys=True` 是必须的：同一组参数换个键序不该被当成不同查询，
+        否则指纹防护形同虚设。
+        """
+        return f"{tool_name}:{json.dumps(params, sort_keys=True, ensure_ascii=False, default=str)}"
+
+    @staticmethod
+    def _is_empty_result(result: Any) -> bool:
+        """判断这次查询是不是「查了，但什么都没有」。
+
+        必须覆盖真实数据源的三种空响应形状（它们的共同点是"结果集为空"）：
+          - Prometheus `{"status":"success","data":{"resultType":"matrix","result":[]}}`
+          - Loki       `{"status":"success","data":{"resultType":"streams","result":[]}}`
+          - Tempo      `{"traces_considered":0,"batches":[]}`
+
+        **没有异常 ≠ 没有数据**：空字符串、空 list/dict 都算 no data。
+        但 `0` 和 `False` 不算 —— 它们是合法的值（错误率 0 是真实的观测）。
+        """
+        if result is None:
+            return True
+        if isinstance(result, (str, list, dict, tuple, set)) and len(result) == 0:
+            return True
+        if isinstance(result, dict):
+            for key in ("result", "records", "spans", "series", "batches", "traces"):
+                value = result.get(key)
+                if isinstance(value, (list, tuple)) and len(value) == 0:
+                    return True
+            data = result.get("data")
+            if isinstance(data, dict) and isinstance(data.get("result"), list) and not data["result"]:
+                return True
+            if result.get("traces_considered") == 0:
+                return True
+        return False
+
+    def _outcome_for(self, result: Any) -> str:
+        """成功返回时区分 OK / NO_DATA。
+
+        这个区别对**结论**有决定性意义：
+          - NO_DATA = 查过了，确实没有 → 可以支持 REFUTED
+          - ERROR   = 没法查           → 只能进 missing_data，禁止 REFUTED
+
+        混为一谈会把"数据源挂了"当成"没有异常"，进而把 absence 当成阴性证据。
+        """
+        return "NO_DATA" if self._is_empty_result(result) else "OK"
 
     # ---- audit ----
     def _record(self, tool: str, outcome: str, params: dict[str, Any],
@@ -136,6 +211,15 @@ class ToolGateway:
 
     def audit_log(self) -> list[dict[str, Any]]:
         return list(self._audit)
+
+    def audit_records(self, *, outcome: str) -> list[dict[str, Any]]:
+        """按 outcome 过滤审计记录。
+
+        有用是因为上层要回答两类不同的问题：
+          - `outcome="NO_DATA"` → 哪些查询"查过但没东西"
+          - `outcome="ERROR"`   → 哪些查询"根本没查成"
+        """
+        return [r for r in self._audit if r["outcome"] == outcome]
 
 
 # ---- built-in tool pool (全部只读) ----
