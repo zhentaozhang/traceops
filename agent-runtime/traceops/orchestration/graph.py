@@ -746,6 +746,7 @@ def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str,
         affected_services=_affected_services(state, config),
         correlation_notes=_correlation_notes(state),
         propagation_chain=_propagation_chain(state, ctx),
+        incident_id=request.incident_id,
     )
     return {"report": report, "status": report.diagnosis_status}
 

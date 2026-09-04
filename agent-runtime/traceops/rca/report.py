@@ -34,6 +34,7 @@ def build_report(
     affected_services: list[str] | None = None,
     correlation_notes: list[str] | None = None,
     propagation_chain: list | None = None,
+    incident_id: str | None = None,
 ) -> RCAReport:
     """组装并校验诊断报告。
 
@@ -131,9 +132,13 @@ def build_report(
         abstained=diagnosis != "SUPPORTED",
     )
 
-    validation = store.validate_report_references(report)
+    # 必须绑定本次事故：只查"ID 在 Store 里存在"会放过**引用了别处证据**的报告。
+    # 评测时（同一进程多场景）尤其危险：ID 确实存在，但那份证据属于别的场景，
+    # 于是"引用完整性通过、证据却是别人的"。
+    validation = store.validate_report_references(report, incident_id=incident_id)
     if not validation.passed:
-        raise ReportIntegrityError(
-            "report references invalid evidence: " + ", ".join(validation.invalid_ids or validation.errors)
-        )
+        # 用 errors 而不是只列 ID：调用方需要知道是"不存在"还是"属于别的事故"，
+        # 这两种情况的修法完全不同。
+        detail = "; ".join(validation.errors) or ", ".join(validation.invalid_ids)
+        raise ReportIntegrityError(f"report references invalid evidence: {detail}")
     return report
