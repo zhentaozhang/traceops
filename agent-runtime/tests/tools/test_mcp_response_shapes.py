@@ -426,3 +426,61 @@ class TestAdapterContractParity:
         # 两类都必须在**不抛异常**的前提下产出证据
         assert _normalize(EvidenceType.METRIC, metric_raw) is not None
         assert _normalize(EvidenceType.LOG, log_raw) is not None
+
+
+class TestDsQueryFallbackPrecedence:
+    """降级顺序必须先优后劣：ds/query 完整 span 树 > search 摘要 spanSet。
+
+    实测：Tempo 2.5 下 get_tempo_trace 恒 404，但 Grafana /api/ds/query
+    的 traceId 查询返回 200 且带 parentSpanID —— 即可重建 span 树。
+    所以挂了 ds/query 就不该退到"只剩摘要"的 degraded 路径。
+    """
+
+    def test_full_tree_is_preferred_over_degraded_summary(self):
+        class _Fallback:
+            def __init__(self):
+                self.calls = []
+
+            def get_trace_batches(self, trace_id):
+                self.calls.append(trace_id)
+                return [{
+                    "resource": {"attributes": [
+                        {"key": "service.name", "value": {"stringValue": "redis"}}]},
+                    "scopeSpans": [{"spans": [{
+                        "traceId": trace_id, "spanId": "b", "name": "redis.command",
+                        "startTimeUnixNano": "1793417000000000000",
+                        "endTimeUnixNano": "1793417002100000000",
+                        "status": {"code": "STATUS_CODE_ERROR"}}]}],
+                }]
+
+        class _Client:
+            def call_tool(self, name, arguments=None):
+                if name == "search_tempo_traces":
+                    return REAL_MCP_TEMPO_SEARCH
+                raise RuntimeError("tempo API returned 404: 404 page not found")
+
+        fallback = _Fallback()
+        adapters = MCPDatasourceAdapters(_Client()).with_trace_fallback(fallback)
+        raw = adapters.query_service_traces("redis", "now-2h", "now")
+
+        assert fallback.calls, "ds/query fallback must be attempted"
+        # 拿到完整树 → 不应标成 degraded
+        assert raw.get("degraded") is False
+        evidence = _normalize(EvidenceType.TRACE, raw)
+        assert evidence.normalized_data["total_records"] == 1
+        assert "degraded" not in evidence.normalized_data
+
+    def test_falls_to_summary_when_dsquery_also_fails(self):
+        class _Fallback:
+            def get_trace_batches(self, trace_id):
+                raise RuntimeError("ds/query unavailable")
+
+        class _Client:
+            def call_tool(self, name, arguments=None):
+                if name == "search_tempo_traces":
+                    return REAL_MCP_TEMPO_SEARCH
+                raise RuntimeError("tempo API returned 404: 404 page not found")
+
+        raw = MCPDatasourceAdapters(_Client()).with_trace_fallback(_Fallback()) \
+            .query_service_traces("redis", "now-2h", "now")
+        assert raw.get("degraded") is True, "summary fallback must be marked degraded"

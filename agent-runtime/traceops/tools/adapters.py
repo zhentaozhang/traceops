@@ -576,6 +576,10 @@ class MCPDatasourceAdapters(DatasourceAdapters):
         self.prometheus_uid = prometheus_uid
         self.loki_uid = loki_uid
         self.tempo_uid = tempo_uid
+        # 可选的 ds/query 降级路径：当 get_tempo_trace 不可用（Tempo 缺
+        # /api/v2/traces）时，改走 Grafana /api/ds/query 取完整 span 树。
+        # 实测该路径在 Grafana 11.1 + Tempo 2.5 下可用，不依赖 Tempo 版本。
+        self.trace_fallback = None
 
     def query_metric_series(self, service: str, metric: str, start: str, end: str) -> Any:
         expression = metric if any(ch in metric for ch in "()[]{}") else f'{metric}{{service="{service}"}}'
@@ -670,8 +674,17 @@ class MCPDatasourceAdapters(DatasourceAdapters):
             except Exception as exc:
                 # get_tempo_trace 在该版本组合下可能恒 404（实测：
                 # Grafana 11.1.0 + Tempo 2.5.0 走 /api/v2/traces 而 Tempo 2.5
-                # 没有该端点）。此时**不该让整条 trace 证据消失**：
-                # search 响应本身已带 spanSet，足以构造一条（受限的）trace 证据。
+                # 没有该端点）。降级顺序是**先优后劣**：
+                #   1. ds/query 取完整 span 树（不依赖 Tempo 版本，最优）
+                #   2. search 的 spanSet 摘要（一定会丢父子结构，明确标 degraded）
+                if self.trace_fallback is not None:
+                    try:
+                        full = self.trace_fallback.get_trace_batches(trace_id)
+                    except Exception:
+                        full = []
+                    if full:
+                        batches.extend(full)
+                        continue
                 fallback = _mcp_tempo_search_to_batches(t)
                 if fallback:
                     batches.extend(fallback)
@@ -693,6 +706,11 @@ class MCPDatasourceAdapters(DatasourceAdapters):
             # 必须可辨：只含摘要 span 的结果不能被误当成完整 span 树
             result["degraded_reason"] = degraded_reason
         return result
+
+    def with_trace_fallback(self, fallback) -> "MCPDatasourceAdapters":
+        """挂载 ds/query 降级路径（返回 self 以便链式配置）。"""
+        self.trace_fallback = fallback
+        return self
 
     def _call_get_trace(self, trace_id: str, *, start: str | None, end: str | None) -> Any:
         """调用 get_tempo_trace，容忍两个 mcp-grafana 版本的参数差异。
