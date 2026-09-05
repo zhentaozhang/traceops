@@ -44,6 +44,7 @@ from traceops.orchestration.detectors import (
     traces_are_anomalous,
 )
 from traceops.rca.chain import build_propagation_chain
+from traceops.rca.contradiction import find_contradictions
 from traceops.rca.ranking import RankedCandidate, derive_signals, rank_hypotheses
 from traceops.rca.report import build_report
 from traceops.runtime.budget import BudgetExhausted, BudgetManager
@@ -489,6 +490,32 @@ def _link_node(state: InvestigationState, config: RunnableConfig) -> dict[str, A
                     )
                 )
     # 交叉检查：事件证据的服务（若有）不属于候选服务的假设不获得 R-004 支持
+
+    # 反向证据：主动构造 CONTRADICTS 关系。
+    # 此前这条链**只产生 SUPPORTS**，于是 R-005（冲突证据降权）成了死代码，
+    # Contradiction Detection Rate 的分母恒为 0。矛盾的判据全部可枚举
+    # （见 rca/contradiction.py），因此可确定性生成，不需要 LLM。
+    hypotheses = list(state.get("hypotheses", []))
+    contradicting = find_contradictions(
+        hypotheses, list(state.get("evidence", [])), topology=ctx.topology)
+    for item in contradicting:
+        # **矛盾优先于支持**：同一条证据如果被判为反证，它就不该再算作支持。
+        #
+        # 为什么不是"跳过重复对"：SUPPORTS 是按"证据归属 == 候选服务"粗判的，
+        # 而矛盾判定是**针对性**的（"这个服务的错误率全程正常，所以池耗尽
+        # 不成立"）。后者更强，必须覆盖前者，否则 R-005 永远读不到冲突。
+        links = [l for l in links
+                 if not (l.hypothesis_id == item.hypothesis_id
+                         and l.evidence_id == item.evidence_id)]
+        links.append(
+            HypothesisEvidence(
+                hypothesis_id=item.hypothesis_id,
+                evidence_id=item.evidence_id,
+                relation_type=RelationType.CONTRADICTS,
+                reason=item.reason,
+                created_by=CreatedBy.RULE,
+            )
+        )
     return {"links": links}
 
 
