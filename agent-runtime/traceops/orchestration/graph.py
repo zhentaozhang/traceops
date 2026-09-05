@@ -45,6 +45,7 @@ from traceops.orchestration.detectors import (
 )
 from traceops.rca.chain import build_propagation_chain
 from traceops.rca.contradiction import find_contradictions
+from traceops.rca.semantic import check_all
 from traceops.rca.ranking import RankedCandidate, derive_signals, rank_hypotheses
 from traceops.rca.report import build_report
 from traceops.runtime.budget import BudgetExhausted, BudgetManager
@@ -774,6 +775,14 @@ def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str,
         correlation_notes=_correlation_notes(state),
         propagation_chain=_propagation_chain(state, ctx),
         incident_id=request.incident_id,
+        semantic_checks={
+            check.hypothesis_id: check
+            for check in check_all(
+                list(state.get("hypotheses", [])),
+                list(state.get("evidence", [])),
+                topology=ctx.topology,
+            )
+        },
     )
     return {"report": report, "status": report.diagnosis_status}
 

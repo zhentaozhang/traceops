@@ -28,6 +28,15 @@ SLOW_SPAN_THRESHOLD_SECONDS = 0.5
 
 _ERROR_HINTS = ("error", "exception", "timeout", "timed out", "pool", "refused", "unavailable")
 
+# 每种故障机制"应该会看到什么"。与 rca/semantic.py 的 EXPECTATIONS 同源，
+# 在这里声明是为了让假设自带可核对的预期，而不是留一个空字段。
+_EXPECTED_BY_FAULT: dict[str, tuple[str, ...]] = {
+    "availability_degradation": ("error_rate_rise", "error_logs"),
+    "pool_exhaustion": ("error_rate_rise", "error_logs", "slow_span"),
+    "latency_degradation": ("slow_span",),
+    "dependency_timeout": ("error_logs", "error_rate_rise"),
+}
+
 
 def metric_is_anomalous(evidence: Evidence) -> bool:
     """仅对 error-rate 模板应用阈值，避免把任意指标序列当异常。"""
@@ -163,7 +172,9 @@ def generate_hypotheses(
             candidate_component=component,
             fault_type=fault_type,
             failure_mechanism=mechanism,
-            predicted_observations=[],
+            # 预期观测声明：下传给语义校验（rca/semantic.py），
+            # 让"这个假设声称会看到什么"成为可核对的东西，而不是空字段。
+            predicted_observations=list(_EXPECTED_BY_FAULT.get(fault_type, ())),
             status=HypothesisStatus.PROPOSED,
         )
         seen[key] = hypothesis

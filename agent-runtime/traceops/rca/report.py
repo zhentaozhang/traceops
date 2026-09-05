@@ -35,6 +35,7 @@ def build_report(
     correlation_notes: list[str] | None = None,
     propagation_chain: list | None = None,
     incident_id: str | None = None,
+    semantic_checks: dict | None = None,
 ) -> RCAReport:
     """组装并校验诊断报告。
 
@@ -88,16 +89,33 @@ def build_report(
             f"supported ({', '.join(names)}); no rule discriminates them"
         )
     elif top is not None and top.status == HypothesisStatus.SUPPORTED:
-        diagnosis = "SUPPORTED"
         lead = next((h for h in updated_hypotheses if h.id == top.hypothesis_id), None)
-        if lead is not None:
-            parts = [lead.candidate_service]
-            if lead.candidate_component:
-                parts.append(lead.candidate_component)
-            parts.append(f"({lead.fault_type})")
-            summary = "Root cause: " + " ".join(parts) + f" — {lead.failure_mechanism}"
+        # 语义闸门：覆盖率太低意味着"这个机制声称的观测大多没出现"。
+        # 例如声称 latency_degradation 却没有任何慢 span —— 预期证据缺失本身
+        # 就是证据（aurora conclusion_gate: absence of EXPECTED evidence is evidence）。
+        # 只在覆盖率为 0 时降级：部分覆盖是正常的（真实故障不必凑齐三件套），
+        # 一刀切要求高覆盖率会把本来对的诊断降级成不确定。
+        semantic = semantic_checks.get(top.hypothesis_id) if semantic_checks else None
+        if semantic is not None and semantic.expected and semantic.coverage == 0.0:
+            diagnosis = "INCONCLUSIVE"
+            summary = (
+                f"Candidate {lead.candidate_service}/{lead.fault_type} is supported by evidence, "
+                f"but none of its expected observations were seen "
+                f"(expected: {', '.join(semantic.expected)}); "
+                "absence of expected evidence is not confirmation"
+                if lead is not None else
+                "Supported candidate lacks all expected observations"
+            )
         else:
-            summary = "Root cause identified"
+            diagnosis = "SUPPORTED"
+            if lead is not None:
+                parts = [lead.candidate_service]
+                if lead.candidate_component:
+                    parts.append(lead.candidate_component)
+                parts.append(f"({lead.fault_type})")
+                summary = "Root cause: " + " ".join(parts) + f" — {lead.failure_mechanism}"
+            else:
+                summary = "Root cause identified"
     elif ranked and all(r.status == HypothesisStatus.REFUTED for r in ranked):
         # REFUTED 的合法前提：我们确实有观测，且观测否定了候选。
         # 若采集过程本身有缺失（数据源不可达 / 查询空结果），那"什么都没看见"
