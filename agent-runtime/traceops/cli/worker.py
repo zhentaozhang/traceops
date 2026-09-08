@@ -103,6 +103,19 @@ def build_adapters(args) -> DatasourceAdapters | None:
     return DatasourceAdapters(prometheus=prom, loki=loki, tempo=tempo)
 
 
+def build_model(args):
+    """按配置构造模型客户端。未配置时返回 None → 纯确定性调查（P0 行为）。"""
+    if not getattr(args, "model_url", None):
+        return None
+    from traceops.runtime.openai_client import OpenAICompatibleModel
+
+    return OpenAICompatibleModel(
+        base_url=args.model_url,
+        model_name=args.model_name or "default",
+        api_key=args.model_api_key,
+    )
+
+
 def build_topology(args) -> ServiceTopology | None:
     """拓扑从 `caller:callee` 形式的分号列表解析，例如 `api-gateway:order-service`。"""
     if not args.topology:
@@ -150,6 +163,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stream", default=os.environ.get("TRACEOPS_STREAM", "traceops.events"))
     parser.add_argument("--group", default=os.environ.get("TRACEOPS_GROUP", "traceops-workers"))
     parser.add_argument("--consumer", default=os.environ.get("TRACEOPS_CONSUMER", "worker-1"))
+    parser.add_argument("--model-url", default=os.environ.get("TRACEOPS_MODEL_URL"),
+                        help="OpenAI-compatible base URL (e.g. https://api.x/v1); "
+                             "omit to run fully deterministic (no LLM)")
+    parser.add_argument("--model-name", default=os.environ.get("TRACEOPS_MODEL_NAME"),
+                        help="model name for the OpenAI-compatible endpoint")
+    parser.add_argument("--model-api-key", default=os.environ.get("TRACEOPS_MODEL_API_KEY"),
+                        help="API key; prefer the env var over the flag")
     parser.add_argument("--mcp-url", default=os.environ.get("TRACEOPS_MCP_URL"),
                         help="Grafana MCP Server URL (production path); overrides the three direct URLs")
     parser.add_argument("--prometheus-url", default=os.environ.get("TRACEOPS_PROMETHEUS_URL"))
@@ -236,6 +256,7 @@ def main(argv: list[str] | None = None) -> int:
             budget=BudgetManager(max_tool_calls=args.max_tool_calls),
             gateway=gateway,
             topology=topology,
+            model=build_model(args),
         )
 
     worker = InvestigationWorker(

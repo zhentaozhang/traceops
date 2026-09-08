@@ -11,7 +11,7 @@ import sys
 
 import pytest
 
-from traceops.cli.worker import build_adapters, build_topology, main
+from traceops.cli.worker import build_adapters, build_model, build_topology, main
 
 
 def _run_cli(args: list[str]) -> subprocess.CompletedProcess:
@@ -208,3 +208,28 @@ def _run(args: list[str]) -> subprocess.CompletedProcess:
     env = {**os.environ}
     env["PYTHONPATH"] = str(__import__("pathlib").Path(__file__).resolve().parents[2])
     return subprocess.run(args, capture_output=True, text=True, timeout=60, env=env)
+
+
+class TestModelWiring:
+    """LLM 必须能从 CLI 启用，且未配置时行为与 P0 完全一致。"""
+
+    def test_no_model_url_means_no_model(self):
+        """不配 --model-url → 纯确定性调查（P0 行为不变）。"""
+        assert build_model(_args_model("")) is None
+
+    def test_model_url_builds_client(self):
+        model = build_model(_args_model("http://localhost:9/v1"))
+        assert model is not None
+        assert "openai-compatible" in model.name
+
+    def test_model_name_is_used(self):
+        model = build_model(_args_model("http://localhost:9/v1", name="gpt-x"))
+        assert "gpt-x" in model.name
+
+
+def _args_model(url: str = "", *, name: str = "") -> object:
+    return type("A", (), {
+        "model_url": url or None,
+        "model_name": name or None,
+        "model_api_key": None,
+    })()

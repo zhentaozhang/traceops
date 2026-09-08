@@ -26,6 +26,15 @@ class ModelUnavailable(RuntimeError):
     """模型不可用（超时/限流/凭证失效）。调用方应记入 missing_data，而不是伪造结果。"""
 
 
+class ModelContractViolation(ModelUnavailable):
+    """模型输出违反契约（结构不合法，如自称 confidence）。
+
+    与"模型不可用"的差别：这不是环境问题，是模型没守住输出格式。
+    继承自 ModelUnavailable 是为了让编排层**默认**仍能把调查继续下去，
+    但类型更具体，便于审计时区分"模型挂了"与"模型乱答"。
+    """
+
+
 @dataclass(frozen=True)
 class ModelHypothesis:
     """模型提出的候选假设。
@@ -49,6 +58,11 @@ class ModelRequest:
     evidence_summary: dict[str, Any]
     allowed_services: list[str] = field(default_factory=list)
     max_hypotheses: int = 3
+    # **必须显式给输出上限**。不给的话 provider 会退到很小的默认值
+    # （litellm 对 Anthropic 系默认 4096），结构化输出会被拦腰截断：
+    # 截断 → 工具参数不完整 → 结构校验失败 → 模型看不到原因 → 重试到预算耗尽。
+    # 8192 足够 3 条假设 + 机制解释；显式设置比"相信默认值"可靠。
+    max_output_tokens: int = 8192
 
 
 @dataclass(frozen=True)
@@ -56,10 +70,18 @@ class ModelResponse:
     hypotheses: list[ModelHypothesis]
     input_tokens: int
     output_tokens: int
+    # 模型的停止原因。`length` 表示被截断 —— 必须可辨识，否则
+    # "预算配少了"会被误读成"模型能力不行"。
+    finish_reason: str = "stop"
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
+
+    @property
+    def truncated(self) -> bool:
+        """是否因 token 上限被切断。"""
+        return self.finish_reason == "length"
 
 
 class ModelClient(Protocol):
