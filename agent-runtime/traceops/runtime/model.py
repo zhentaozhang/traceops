@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 from traceops.runtime.budget import BudgetExhausted, BudgetManager
@@ -98,6 +99,35 @@ class ScriptedModel:
         return ModelResponse(self._hypotheses[: request.max_hypotheses], input_tokens, output_tokens)
 
 
+_SCHEMA_PATH = Path(__file__).resolve().parents[3] / "contracts" / "models" / "hypothesis-output.v1.schema.json"
+_schema_cache: dict | None = None
+
+
+def hypothesis_output_schema() -> dict:
+    """加载模型输出契约（懒加载 + 缓存）。
+
+    契约文件在 `contracts/models/` —— 与事件契约同一事实来源，
+    这样模型输出格式的变更也走版本化，而不是藏在代码里。
+    """
+    global _schema_cache
+    if _schema_cache is None:
+        _schema_cache = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+    return _schema_cache
+
+
+def validate_model_payload(payload: dict) -> list[str]:
+    """校验模型返回的结构，返回错误消息列表（空表示通过）。
+
+    为什么单独提供：接真实模型时，调用方需要**在构造 dataclass 之前**
+    知道结构对不对。越界字段（如 confidence）在这一步就该被拦住，
+    而不是等到 dataclass 报出一个对上游不透明的 TypeError。
+    """
+    from jsonschema import Draft202012Validator
+
+    validator = Draft202012Validator(hypothesis_output_schema())
+    return [f"{list(e.path)}: {e.message}" for e in validator.iter_errors(payload)]
+
+
 class ModelGateway:
     """模型调用的唯一入口：预算预留 + 结果校验。
 
@@ -134,7 +164,16 @@ class ModelGateway:
         )
 
     def _validate(self, response: ModelResponse, allowed: set[str]) -> list[ModelHypothesis]:
-        """模型输出必须过白名单：越界假设直接丢弃，不进入排序。"""
+        """模型输出必须过 schema + 白名单：越界假设直接丢弃，不进入排序。
+
+        两道关卡的顺序是**先结构后业务**：
+          1. `hypothesis-output.v1.schema.json`：结构合法（无 confidence 等越界字段）
+          2. 服务白名单：不能凭空提出拓扑里不存在的服务
+
+        结构校验放在前面，因为"字段越界"（例如模型自称 confidence）是
+        **契约级违规**，比"服务不在白名单"更根本 —— 前者说明模型没守住
+        输出格式，后者只是这次猜得离谱。
+        """
         kept: list[ModelHypothesis] = []
         for hypothesis in response.hypotheses:
             if not hypothesis.candidate_service or not hypothesis.fault_type:

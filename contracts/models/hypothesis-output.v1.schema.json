@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://traceops.local/schemas/hypothesis-output.v1.json",
+  "title": "ModelHypothesisOutput",
+  "description": "LLM 假设生成的输出契约（P1）。\n\n设计约束来自 `runtime/model.py` 的注释与 REVISIONS-1.1：\n1. **没有 confidence 字段**，且 additionalProperties=false 让任何自称\n   置信度的输出在解析期直接被拒 —— 排序只由确定性规则负责。\n2. 服务必须在允许名单内（由 ModelGateway 白名单二次校验）。\n3. 假设必须带可核对的预期观测，否则语义校验（rca/semantic.py）无从比对。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["hypotheses"],
+  "properties": {
+    "hypotheses": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "candidate_service",
+          "fault_type",
+          "failure_mechanism",
+          "expected_observations"
+        ],
+        "properties": {
+          "candidate_service": {
+            "type": "string",
+            "minLength": 1,
+            "description": "候选根因服务。必须属于调查可访问的服务白名单。"
+          },
+          "fault_type": {
+            "type": "string",
+            "enum": [
+              "pool_exhaustion",
+              "dependency_timeout",
+              "latency_degradation",
+              "availability_degradation"
+            ],
+            "description": "故障机制。枚举而非自由文本：新增机制必须先在代码里登记预期观测，否则语义校验无法比对。"
+          },
+          "candidate_component": {
+            "type": ["string", "null"],
+            "description": "具体组件（如 redis-connection-pool）。可为 null：只知道服务级也应当被允许。"
+          },
+          "failure_mechanism": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "description": "一句话机制解释。不接受空字符串 —— 空解释等于没有诊断价值。"
+          },
+          "rationale": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "为什么提出这个假设。仅作说明，不参与排序。"
+          },
+          "expected_observations": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "enum": [
+                "error_rate_rise",
+                "error_logs",
+                "slow_span"
+              ]
+            },
+            "description": "本假设预期会观测到什么。语义校验用它计算覆盖率。"
+          }
+        }
+      }
+    }
+  }
+}
