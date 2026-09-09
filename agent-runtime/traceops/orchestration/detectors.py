@@ -148,8 +148,21 @@ def generate_hypotheses(
     *,
     investigation_run_id: str,
     topology: object | None = None,
+    mechanism_only_services: set[str] | None = None,
 ) -> list[RootCauseHypothesis]:
-    """从证据生成候选假设（确定性）。同一 (service, fault_type, component) 只生成一次。"""
+    """从证据生成候选假设（确定性）。同一 (service, fault_type, component) 只生成一次。
+
+    Args:
+        mechanism_only_services: 允许**描述机制**但**不允许新增候选**的服务集合。
+
+            这是"影响层证据"的正确用法。影响层的证据（上游调用方 / 兄弟节点）
+            不能生成候选根因，否则会把症状服务当根因；但 `attribute_evidence`
+            可能把它归因到**某个已经存在的候选服务**（fiber 服务的日志讲 redis，
+            那就是关于 redis 的证据），这种证据本身是机制判定的宝贵材料。
+
+            判据是**归因结果**而不是证据来源：只有当影响层证据被归因到一个
+            已存在的候选服务时，它才参与机制描述。归因不到的证据仍然被排除。
+    """
     # 去重键 = (service, fault_type)。**不含 component**：
     # 同一条慢链路可能从日志推出 "redis-connection-pool"、从 span 推出 None，
     # 那是同一种故障机制的两种描述，不该算成两个候选。否则候选集被同一服务灌满，
@@ -158,7 +171,21 @@ def generate_hypotheses(
     seen: dict[tuple[str, str], RootCauseHypothesis] = {}
     hypotheses: list[RootCauseHypothesis] = []
 
-    def _add(service: str, fault_type: str, component: str | None, mechanism: str) -> None:
+    def _add(service: str, fault_type: str, component: str | None, mechanism: str,
+             *, reported_by: str | None = None) -> None:
+        # 机制-only 服务：允许为**已存在的候选**补充机制，但不得新增候选。
+        # 例：兄弟服务 inventory-service 的日志讲 redis timeout →
+        # `attribute_evidence` 把它归因给 redis → 它可以描述 redis 的机制，
+        # 但不能让 inventory-service 自己变成候选根因。
+        if mechanism_only_services and reported_by is not None \
+                and reported_by in mechanism_only_services:
+            # 影响层证据只能给**已有的候选服务**补充机制，不能凭空建候选。
+            # 判据是"这个服务是否已经是候选"（任何机制都算），
+            # 而不是"这个具体机制是否已存在" —— 否则 redis 已知是候选、
+            # 但还没人提出 pool_exhaustion 时，兄弟证据就无法补上这个机制，
+            # 而那恰恰是它最有价值的地方。
+            if not any(k[0] == service for k in seen):
+                return
         key = (service, fault_type)
         existing = seen.get(key)
         if existing is not None:
@@ -184,7 +211,8 @@ def generate_hypotheses(
         if ev.service_id is None:
             continue
         if metric_is_anomalous(ev):
-            _add(ev.service_id, "availability_degradation", None, "error rate crossed baseline threshold")
+            _add(ev.service_id, "availability_degradation", None,
+                 "error rate crossed baseline threshold", reported_by=ev.service_id)
         if logs_are_anomalous(ev):
             text = " ".join(str(r.get("message", "")) for r in ev.normalized_data.get("records", []))
             attribution = _attribute_dependency(text, ev.service_id, topology)
@@ -195,13 +223,15 @@ def generate_hypotheses(
                     else "dependency_timeout"
                 )
                 _add(owner_service, fault_type, owner_component,
-                     f"error reported by {ev.service_id}: dependency {owner_service} failing")
+                     f"error reported by {ev.service_id}: dependency {owner_service} failing",
+                     reported_by=ev.service_id)
             else:
                 component = _extract_component(text)
                 fault_type = (
                     "pool_exhaustion" if component and "pool" in component else "dependency_timeout"
                 )
-                _add(ev.service_id, fault_type, component, "error logs indicate dependency failure")
+                _add(ev.service_id, fault_type, component,
+                     "error logs indicate dependency failure", reported_by=ev.service_id)
         if traces_are_anomalous(ev):
             spans = ev.normalized_data.get("spans", [])
             slowest = max(
@@ -216,13 +246,15 @@ def generate_hypotheses(
             if attribution is not None:
                 owner_service, owner_component = attribution
                 _add(owner_service, "latency_degradation", owner_component,
-                     f"slow span on {owner_service} observed by {ev.service_id}")
+                     f"slow span on {owner_service} observed by {ev.service_id}",
+                     reported_by=ev.service_id)
             else:
                 # 慢链路但没有可归因的依赖时，**不要**从 span 名切出"组件"。
                 # `redis.command` 的第二段是动词（command/get/set），不是组件名。
                 # 把动词当组件会让它错误地拿到"组件具体"加分，进而与真实组件
                 # （redis-connection-pool）并列，最终只能按 UUID 随机排序。
                 _add(ev.service_id, "latency_degradation", None,
-                     "slow span on downstream dependency (component unknown)")
+                     "slow span on downstream dependency (component unknown)",
+                     reported_by=ev.service_id)
 
     return hypotheses

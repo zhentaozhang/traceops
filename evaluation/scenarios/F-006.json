@@ -1,0 +1,94 @@
+{
+  "scenario_id": "F-006",
+  "name": "Noisy decoy: loudest symptom is not the root cause",
+  "description": "针对性验证规则的一个已知弱点：'谁的症状最响亮，谁就是根因'。\n\n根因是 redis 的连接池耗尽，但它的错误率只有 0.07（刚过阈值），信号很弱。\n干扰项 inventory-service 的错误率高达 0.65、日志一长串错误 —— 它是**被 redis 拖累的下游**，症状比根因响得多。\n\n正确行为：靠拓扑方向（inventory-service 依赖 redis）与故障前配置变更（maxPoolSize 20→2）把 redis 排到第一，而不是被音量带走。\n\n这条场景存在的意义：如果系统只是'选异常最大的那个服务'，它会在这里失败。六个原场景都做不到这个检验，因为它们的根因同时也是最响的服务。",
+  "service_hint": "order-service",
+  "fault_start": "2026-10-30T10:02:00Z",
+  "window_start": "2026-10-30T10:00:00Z",
+  "window_end": "2026-10-30T10:05:00Z",
+  "topology_edges": [
+    [
+      "api-gateway",
+      "order-service"
+    ],
+    [
+      "order-service",
+      "redis"
+    ],
+    [
+      "inventory-service",
+      "redis"
+    ]
+  ],
+  "scope_depth": 2,
+  "signals": {
+    "per_service": {
+      "redis": {
+        "error_rate_series": [
+          0.004,
+          0.02,
+          0.07
+        ],
+        "error_logs": [],
+        "slow_spans": [
+          {
+            "name": "redis.command",
+            "duration_ms": 2400
+          }
+        ]
+      },
+      "inventory-service": {
+        "error_rate_series": [
+          0.01,
+          0.42,
+          0.65
+        ],
+        "error_logs": [
+          "ERROR inventory-service: redis connection pool exhausted, could not reserve stock after 2400ms",
+          "ERROR inventory-service: redis connection pool exhausted, could not reserve stock after 2500ms",
+          "ERROR inventory-service: redis connection pool exhausted, could not release stock after 2300ms"
+        ],
+        "slow_spans": [
+          {
+            "name": "inventory.reserve",
+            "duration_ms": 2300
+          }
+        ]
+      },
+      "order-service": {
+        "error_rate_series": [
+          0.005,
+          0.05,
+          0.09
+        ],
+        "error_logs": [],
+        "slow_spans": []
+      }
+    },
+    "config_change": {
+      "changed_at": "2026-10-30T10:01:00Z",
+      "component": "redis-connection-pool",
+      "summary": "maxPoolSize reduced 20 -> 2"
+    }
+  },
+  "ground_truth": {
+    "service": "redis",
+    "component": "redis-connection-pool",
+    "fault_type": "pool_exhaustion",
+    "expected_diagnosis": "SUPPORTED",
+    "propagation_chain": [
+      "redis",
+      "inventory-service",
+      "order-service"
+    ],
+    "must_identify": [
+      "redis",
+      "inventory-service"
+    ],
+    "wrong_answers": [
+      "inventory-service is the root cause",
+      "memory leak",
+      "node memory pressure"
+    ]
+  }
+}

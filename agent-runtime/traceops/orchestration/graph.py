@@ -192,7 +192,14 @@ def _scope_services(request: InvestigationRequest, ctx: "RunContext") -> list[tu
 
     if ctx.impact_scope:
         upstream = ctx.topology.blast_radius(request.service_hint, depth=ctx.scope_depth)
-        extra = sorted(upstream - investigation - {request.service_hint})
+        # 兄弟节点：与受调查服务共享依赖的旁支服务。它们不是候选根因
+        # （investigation 层仍只向下游展开），但它们的异常同样由根因传导而来，
+        # 而且它们的日志常常是根因机制最直接的证据。漏掉它们会同时损害
+        # 传播链、影响范围与机制判定（F-006 场景实测三项全挂）。
+        siblings = ctx.topology.sibling_scope(request.service_hint, depth=ctx.scope_depth)
+        extra = sorted(
+            (upstream | siblings) - investigation - {request.service_hint}
+        )
         tiers.extend((service, IMPACT_TIER) for service in extra)
 
     return tiers
@@ -388,16 +395,25 @@ def _hypothesize_node(state: InvestigationState, config: RunnableConfig) -> dict
     evidence_list = state.get("evidence", [])
     missing = list(state.get("missing_data", []))
 
-    # 只有调查层证据能生成候选：影响层（上游症状）不产生根因候选，
-    # 否则会把调用方当根因。它们仍进 Store、仍参与传播链。
-    investigation_evidence = [
-        e for e in evidence_list
-        if e.query_params.get("_tier", INVESTIGATION_TIER) == INVESTIGATION_TIER
-    ]
+    # 分层规则（三件事分开，别一刀切）：
+    #   1. **生成候选**：只有调查层证据可以。影响层是上游/兄弟的症状，
+    #      让它们成为候选等于把症状服务当根因。
+    #   2. **描述机制**：影响层证据**可以**参与 —— 前提是 `attribute_evidence`
+    #      把它归因到某个已有的候选服务。兄弟服务写"redis timeout"的日志，
+    #      是关于 redis 的证据，能描述 redis 的机制（F-006 实测：这条被整条
+    #      丢掉后，redis 只剩弱信号，机制判成 availability_degradation，
+    #      FT@1 直接掉到 0）。
+    #   3. **进传播链/影响范围**：影响层证据本来就在做这件事。
+    impact_services = {
+        e.service_id for e in evidence_list
+        if e.query_params.get("_tier", INVESTIGATION_TIER) != INVESTIGATION_TIER
+        and e.service_id
+    }
     hypotheses = generate_hypotheses(
-        investigation_evidence,
+        evidence_list,
         investigation_run_id=request.investigation_run_id,
         topology=ctx.topology,
+        mechanism_only_services=impact_services,
     )
 
     if ctx.model is not None and evidence_list:

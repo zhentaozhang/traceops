@@ -104,6 +104,37 @@ class ServiceTopology:
             radius |= frontier
         return radius
 
+    def sibling_scope(self, service: str, *, depth: int = 2) -> set[str]:
+        """找出与 `service` **共享依赖**的兄弟服务（排除自身与依赖/调用方）。
+
+        为什么需要：`expand_scope` 只沿下游走，于是
+
+            api-gateway → order-service → redis
+            inventory-service → redis
+
+        从 order-service 出发永远看不到 inventory-service —— 它是**兄弟**，
+        不是下游也不是上游。但根因传导对兄弟和子女是同一回事：
+        redis 出问题，inventory-service 一样遭殃。
+
+        漏掉兄弟的代价（由 F-006 场景实测）：
+          1. 传播链缺节点（chain 指标失败）
+          2. 影响范围漏报（affected 指标失败）
+          3. **证据丢失**：兄弟的日志往往是根因机制最直接的证据
+             （"redis timeout ... could not reserve stock" 就在兄弟那边），
+             不查它就只能看到根因服务自己的弱信号，机制判定被带偏
+
+        实现：取 `service` 的下游集合 D，再从 D 的**调用方**中排除自身与
+        `service` 自身的下游/上游链，剩下的就是兄弟。深度 >1 时沿下游逐层扩展。
+        """
+        downstream = self.expand_scope(service, depth=depth)
+        # 与 service 直接/间接共享任一依赖的服务
+        candidates: set[str] = set()
+        for node in downstream:
+            candidates |= self.dependents(node)
+
+        # 排除：自身、自身依赖链（它们属于下游）、自身调用方链（它们属于影响层）
+        return candidates - downstream - self.blast_radius(service, depth=depth)
+
     def blame_order(self, candidates: set[str]) -> list[str]:
         """把候选按"更可能是根因"排序并保持确定性。
 
