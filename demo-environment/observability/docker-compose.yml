@@ -9,12 +9,17 @@
 #
 # 说明: 这是"能接上适配器的最小集合"，不含 TicketFlow 业务服务与故障注入
 # （见 技术验证记录 S4/S5，需要靶场代码就位后补）。
+#
+# **版本已钉死，不要用 :latest**。理由见 镜像说明：
+# 本项目已因版本组合不匹配静默失效三次（Tempo 缺端点、mcp-grafana 走新路径、
+# Tempo v3 改响应形状），而每次表现都是"证据凭空消失"而非报错。
+# latest 会让"重建一次行为就变了"无法复现。
 
 name: traceops-observability
 
 services:
   prometheus:
-    image: prom/prometheus:v2.53.0
+    image: prom/prometheus:v3.0.1
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.retention.time=6h
@@ -30,7 +35,7 @@ services:
       retries: 5
 
   loki:
-    image: grafana/loki:3.1.0
+    image: grafana/loki:3.5
     command: -config.file=/etc/loki/local-config.yaml
     volumes:
       - ./loki/loki-config.yml:/etc/loki/local-config.yaml:ro
@@ -43,7 +48,7 @@ services:
       retries: 8
 
   tempo:
-    image: grafana/tempo:2.5.0
+    image: grafana/tempo:3.0.0
     command: -config.file=/etc/tempo/tempo-config.yml
     volumes:
       - ./tempo/tempo-config.yml:/etc/tempo/tempo-config.yml:ro
@@ -58,7 +63,7 @@ services:
       retries: 8
 
   grafana:
-    image: grafana/grafana:11.1.0
+    image: grafana/grafana:13.3
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
@@ -82,7 +87,7 @@ services:
   # Grafana 11.0.0 / 11.1.0 都没有 /mcp 端点（实测 handler=notfound 404）；
   # 正确做法是单独运行 grafana/mcp-grafana 并指向 Grafana。
   mcp-grafana:
-    image: grafana/mcp-grafana:latest
+    image: grafana/mcp-grafana:2.1.1
     # 镜像自带 Entrypoint 是 `/app/mcp-grafana --transport sse ...`，
     # 直接写 command 会变成"在 sse 模式上叠加参数"，实际仍走 sse。
     # 必须用 entrypoint 覆盖，才能真正切到 streamable-http。

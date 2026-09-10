@@ -20,6 +20,10 @@ storage:
     wal:
       path: /var/tempo/wal
 
-compactor:
-  compaction:
-    block_retention: 6h
+# Tempo v3 移除了顶层 `compactor` 配置段。
+# 直接沿用 2.x 的写法会启动失败：
+#   failed parsing config: yaml: unmarshal errors:
+#     line 23: field compactor not found in type app.Config
+# 本栈只需要 6 小时的可查窗口（演示用），不显式配置 compactor 时
+# v3 使用默认保留策略；要精细控制请在 v3 的对应模块下声明，
+# **不要**照搬 2.x 的 `compactor.compaction.block_retention`。
