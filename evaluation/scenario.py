@@ -91,6 +91,12 @@ class GroundTruth(BaseModel):
         default_factory=list,
         description="明确错误的根因表述（如 'memory leak'）；出现在报告中即计为一次错误断言",
     )
+    # 除 service 之外的**其他**独立根因。多故障场景用：
+    # 只有一个 `service` 字段时，"第二个故障被漏报"无法被指标发现。
+    additional_root_causes: list[str] = Field(
+        default_factory=list,
+        description="与 service 互不相干、同时发生的其他根因服务；报告中应各自成为 SUPPORTED 候选",
+    )
 
 
 class Scenario(BaseModel):

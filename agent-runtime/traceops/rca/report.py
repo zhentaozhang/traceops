@@ -21,6 +21,37 @@ class ReportIntegrityError(Exception):
     """报告引用了不存在的证据 / 跨事故证据。拒绝出报告。"""
 
 
+def _independent_faults(services: set[str], topology) -> bool:
+    """这些服务之间是否**互不相干**（各自独立的故障）。
+
+    操作定义：任意两方都不同时满足下面任一条件，则视为互不相干：
+      - 一方在另一方的下游（dependencies 传递闭包）
+      - 一方在另一方的上游（dependents 传递闭包）
+      - 两者共享同一个依赖（兄弟）
+
+    topology 为 None 时返回 False —— 没有方向信息就不猜，
+    保持旧的歧义闸门行为（宁可弃权，也不要凭空宣布多根因）。
+    """
+    if topology is None or len(services) < 2:
+        return False
+    names = sorted(services)
+
+    def _related(a: str, b: str) -> bool:
+        try:
+            downstream_a = topology.expand_scope(a, depth=3)
+            downstream_b = topology.expand_scope(b, depth=3)
+            shared_deps = topology.dependencies(a) & topology.dependencies(b)
+        except Exception:
+            return True  # 拓扑查询失败时保守：当作相干，维持弃权
+        return b in downstream_a or a in downstream_b or bool(shared_deps)
+
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            if _related(a, b):
+                return False
+    return True
+
+
 def build_report(
     *,
     investigation_run_id: str,
@@ -36,6 +67,7 @@ def build_report(
     propagation_chain: list | None = None,
     incident_id: str | None = None,
     semantic_checks: dict | None = None,
+    topology=None,
 ) -> RCAReport:
     """组装并校验诊断报告。
 
@@ -76,7 +108,12 @@ def build_report(
         for r in tied
     }
     tied_services.discard(None)
-    if len(tied) > 1 and len(tied_services) > 1:
+    # 同分但在拓扑上**互不相干** → 这不是"分不清哪个是根因"，
+    # 而是"两个故障同时发生"。把独立故障判成歧义会让真实的第二个故障
+    # 被报告说成"不存在"（aurora-lab 场景 12 的原话：
+    # "A real second outage went unreported, and the report said it was not there"）。
+    independent = _independent_faults(tied_services, topology)
+    if len(tied) > 1 and len(tied_services) > 1 and not independent:
         names = [
             f"{h.candidate_service}/{h.fault_type}"
             for h in updated_hypotheses

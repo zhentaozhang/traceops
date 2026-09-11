@@ -1,0 +1,59 @@
+{
+  "scenario_id": "F-007",
+  "name": "Two independent faults at once (no single root cause)",
+  "description": "两个**互不相干**的服务同时出故障：redis 连接池耗尽 + billing-api 依赖超时。\n\n它们不在同一条链上、不共享依赖，因此任何一方都无法解释另一方 —— 正确答案是**两条独立根因**，不是'分不清哪个是根因'。\n\n这条场景检验的是 PRD 里一个此前的未决问题：同分候选之间到底是『歧义』还是『多根因』。旧实现一律判 INCONCLUSIVE，等于把真实的第二个故障说成『不存在』（aurora-lab 场景 12 的原话：A real second outage went unreported, and the report said it was not there）。\n\n判据是拓扑相干性：同分但拓扑互不相干 → 两条根因；同分且相干（一个依赖另一个 / 共享依赖）→ 仍是歧义。",
+  "service_hint": "order-service",
+  "fault_start": "2026-10-30T10:02:00Z",
+  "window_start": "2026-10-30T10:00:00Z",
+  "window_end": "2026-10-30T10:05:00Z",
+  "topology_edges": [
+    ["order-service", "redis"],
+    ["payment-service", "billing-api"],
+    ["api-gateway", "order-service"],
+    ["api-gateway", "payment-service"]
+  ],
+  "scope_depth": 2,
+  "signals": {
+    "per_service": {
+      "redis": {
+        "error_rate_series": [0.005, 0.28, 0.44],
+        "error_logs": [
+          "ERROR redis: connection pool exhausted, rejecting connection after 2100ms"
+        ],
+        "slow_spans": [
+          {
+            "name": "redis.command",
+            "duration_ms": 2100
+          }
+        ]
+      },
+      "billing-api": {
+        "error_rate_series": [0.01, 0.33, 0.41],
+        "error_logs": [
+          "ERROR billing-api: downstream dependency timeout after 3000ms, invoice generation failed"
+        ],
+        "slow_spans": []
+      }
+    },
+    "config_change": {
+      "changed_at": "2026-10-30T10:01:00Z",
+      "component": "redis-connection-pool",
+      "summary": "maxPoolSize reduced 20 -> 2"
+    }
+  },
+  "ground_truth": {
+    "service": "redis",
+    "component": "redis-connection-pool",
+    "fault_type": "pool_exhaustion",
+    "expected_diagnosis": "SUPPORTED",
+    "additional_root_causes": ["billing-api"],
+    "must_identify": [
+      "redis",
+      "billing-api"
+    ],
+    "wrong_answers": [
+      "memory leak",
+      "node memory pressure"
+    ]
+  }
+}

@@ -714,6 +714,25 @@ def _observed_services(state: InvestigationState) -> set[str]:
     return names
 
 
+def _services_outside_investigation(state: InvestigationState, config: RunnableConfig) -> list[str]:
+    """拓扑中存在、但本次调查完全没碰过的服务。
+
+    这是"覆盖边界"而非"故障"：从单一告警起点出发不可能知道别的链有没有问题，
+    所以只能诚实声明边界，不能假装全都查过。
+    """
+    topology = _ctx_from(config).topology
+    request = state["request"]
+    if topology is None:
+        return []
+    depth = _ctx_from(config).scope_depth
+    covered = (
+        topology.expand_scope(request.service_hint, depth=depth)
+        | topology.blast_radius(request.service_hint, depth=depth)
+        | topology.sibling_scope(request.service_hint, depth=depth)
+    )
+    return sorted(topology.services() - covered)
+
+
 def _unobserved_related(state: InvestigationState, config: RunnableConfig) -> list[str]:
     """拓扑相关但**没有观测证据**的服务 —— 必须显式记为"未检查"。
 
@@ -778,6 +797,16 @@ def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str,
             "topology-related services not observed (scope unknown, not assumed healthy): "
             + ", ".join(unobserved)
         )
+    # 覆盖边界必须**主动**声明。调查从一条告警的 service_hint 出发，
+    # 只能覆盖该点所在的链路；拓扑里其它独立的链根本没被查。
+    # 不声明的话，读者会以为"报告没说它们有问题 = 它们没问题"，
+    # 这正是 aurora-lab 场景 12 的失败（第二条故障从未出现，而报告不说"我没查"）。
+    outside = _services_outside_investigation(state, config)
+    if outside:
+        missing.append(
+            "services outside the investigated chain were NOT investigated "
+            "(this report covers one alert's chain only): " + ", ".join(outside)
+        )
     report = build_report(
         investigation_run_id=request.investigation_run_id,
         hypotheses=state.get("hypotheses", []),
@@ -791,6 +820,7 @@ def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str,
         correlation_notes=_correlation_notes(state),
         propagation_chain=_propagation_chain(state, ctx),
         incident_id=request.incident_id,
+        topology=ctx.topology,
         semantic_checks={
             check.hypothesis_id: check
             for check in check_all(
