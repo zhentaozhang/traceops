@@ -74,6 +74,11 @@ def main(argv: list[str] | None = None) -> int:
         f"chain={agg.chain_order_accuracy:.2f} "
         f"affected={agg.affected_services_accuracy:.2f}"
     )
+    # 排名质量：AC@k 阶跃，Avg@5/MRR 连续 —— 一起看才不会被"进了前5"掩盖"排第5"
+    print(
+        f"     Avg@5={agg.avg_at_5:.2f} MRR={agg.mrr:.2f} mean_rank={agg.mean_rank:.2f} "
+        f"wrong_ans={agg.wrong_answer_rate:.2f} must_id={agg.must_identify_rate:.2f}"
+    )
     # 机会基线必须与 AC@k 一起打印，否则 AC@3/@5 会被当成能力
     print(
         f"     candidates={chance.candidate_pool_size} "

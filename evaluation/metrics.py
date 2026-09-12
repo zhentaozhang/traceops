@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Iterable
 
+from evaluation.rank_quality import average_precision_at, mean_reciprocal_rank
 from traceops.domain.models import EvidenceType
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -44,6 +45,8 @@ class ScenarioOutcome:
     # 该场景是否声明过 rubric。必须显式记录：空元组无法区分
     # 「没声明 rubric」与「声明了但全部命中」，后者应当进分母。
     rubric_declared: bool = False
+    # 根因服务在候选里的排名（None = 未进候选）。Avg@k/MRR 由它派生。
+    ground_truth_rank: int | None = None
     # 候选池大小（去重后的候选服务数）。AC@k 必须与它一起看：
     # 池子只有 1 个候选时，AC@3/AC@5 恒真，是伪指标。
     candidate_pool_size: int = 0
@@ -71,6 +74,10 @@ class AggregateMetrics:
     # rubric 族：只统计"声明了 rubric"的场景，避免污染其他指标的分母
     wrong_answer_rate: float = 0.0
     must_identify_rate: float = 0.0
+    # 排名质量：AC@k 是阶跃的，这两个对"排第几"连续敏感
+    avg_at_5: float = 0.0
+    mrr: float = 0.0
+    mean_rank: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -200,6 +207,7 @@ def score_scenario(scenario: "Scenario", result: "InvestigationResult") -> Scena
         rubric_declared=bool(ground_truth.must_identify or ground_truth.wrong_answers),
         candidate_pool_size=len({(h.candidate_service or "").strip() for h in hypotheses
                                  if (h.candidate_service or "").strip()}),
+        ground_truth_rank=rank,
     )
 
 
@@ -287,6 +295,7 @@ def aggregate(rows: Iterable[ScenarioOutcome]) -> AggregateMetrics:
             mean_tool_calls=0.0, mean_tokens=0.0,
             chain_order_accuracy=0.0, affected_services_accuracy=0.0,
             wrong_answer_rate=0.0, must_identify_rate=0.0,
+            avg_at_5=0.0, mrr=0.0, mean_rank=0.0,
         )
 
     component_rows = [r.component_at_1 for r in items if r.component_at_1 is not None]
@@ -320,4 +329,10 @@ def aggregate(rows: Iterable[ScenarioOutcome]) -> AggregateMetrics:
             [1.0 if r.wrong_answers_asserted else 0.0 for r in rubric_rows]),
         must_identify_rate=_mean(
             [1.0 if not r.missing_identifications else 0.0 for r in rubric_rows]),
+        # 排名质量：只看注入了故障的场景（与 AC@k 同分母）
+        avg_at_5=average_precision_at([r.ground_truth_rank for r in fault_rows], 5),
+        mrr=mean_reciprocal_rank([r.ground_truth_rank for r in fault_rows]),
+        mean_rank=round(
+            sum(r.ground_truth_rank for r in fault_rows if r.ground_truth_rank) /
+            max(1, sum(1 for r in fault_rows if r.ground_truth_rank)), 4),
     )
