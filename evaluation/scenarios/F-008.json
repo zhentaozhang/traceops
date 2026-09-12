@@ -1,0 +1,131 @@
+{
+  "scenario_id": "F-008",
+  "name": "Wide candidate pool: many services anomalous, one root cause",
+  "description": "真实事故的样子：一次依赖故障会让**一大片**下游服务同时出现异常。\n\n本场景把 4 个服务都放在 order-service 的**下游链**上（因此都进 investigation tier、都能成为候选），其中只有 redis 是真根因。前几个场景候选池只有 2 个（根因 + 1 症状），AC@1 相当于二选一，无法区分能力；这里候选池扩大到 4~5。\n\n答案只能靠两条硬信号：\n  1. 故障前的配置变更（maxPoolSize 20→2）指向 redis-connection-pool\n  2. 拓扑方向：越靠下游越可能是根因（blame_order）\n\n各服务错误率被刻意设成相近，让'谁异常最大'这条捷径失效。",
+  "service_hint": "order-service",
+  "fault_start": "2026-10-30T10:02:00Z",
+  "window_start": "2026-10-30T10:00:00Z",
+  "window_end": "2026-10-30T10:05:00Z",
+  "topology_edges": [
+    [
+      "api-gateway",
+      "order-service"
+    ],
+    [
+      "order-service",
+      "inventory-service"
+    ],
+    [
+      "order-service",
+      "payment-service"
+    ],
+    [
+      "order-service",
+      "search-service"
+    ],
+    [
+      "inventory-service",
+      "redis"
+    ],
+    [
+      "payment-service",
+      "redis"
+    ],
+    [
+      "search-service",
+      "redis"
+    ]
+  ],
+  "scope_depth": 2,
+  "signals": {
+    "per_service": {
+      "redis": {
+        "error_rate_series": [
+          0.006,
+          0.31,
+          0.38
+        ],
+        "error_logs": [
+          "ERROR redis: connection pool exhausted, rejecting connection after 2400ms"
+        ],
+        "slow_spans": [
+          {
+            "name": "redis.command",
+            "duration_ms": 2400
+          }
+        ]
+      },
+      "order-service": {
+        "error_rate_series": [
+          0.004,
+          0.27,
+          0.34
+        ],
+        "error_logs": [],
+        "slow_spans": [
+          {
+            "name": "order.reserve",
+            "duration_ms": 2200
+          }
+        ]
+      },
+      "payment-service": {
+        "error_rate_series": [
+          0.005,
+          0.29,
+          0.36
+        ],
+        "error_logs": [],
+        "slow_spans": [
+          {
+            "name": "payment.authorize",
+            "duration_ms": 2250
+          }
+        ]
+      },
+      "search-service": {
+        "error_rate_series": [
+          0.003,
+          0.25,
+          0.33
+        ],
+        "error_logs": [],
+        "slow_spans": [
+          {
+            "name": "search.query",
+            "duration_ms": 2100
+          }
+        ]
+      },
+      "user-service": {
+        "error_rate_series": [
+          0.004,
+          0.26,
+          0.35
+        ],
+        "error_logs": [],
+        "slow_spans": []
+      }
+    },
+    "config_change": {
+      "changed_at": "2026-10-30T10:01:00Z",
+      "component": "redis-connection-pool",
+      "summary": "maxPoolSize reduced 20 -> 2"
+    }
+  },
+  "ground_truth": {
+    "service": "redis",
+    "component": "redis-connection-pool",
+    "fault_type": "pool_exhaustion",
+    "expected_diagnosis": "SUPPORTED",
+    "must_identify": [
+      "redis"
+    ],
+    "wrong_answers": [
+      "order-service is the root cause",
+      "payment-service is the root cause",
+      "search-service is the root cause",
+      "memory leak"
+    ]
+  }
+}

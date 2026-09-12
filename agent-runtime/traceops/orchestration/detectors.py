@@ -115,10 +115,40 @@ def _attribute_dependency(
     return None
 
 
-def _extract_component(message: str) -> str | None:
-    """只为"本服务自身组件"场景兜底（不涉及依赖归因时使用）。"""
-    match = re.search(r"\b([a-z][a-z0-9-]+-connection-pool)\b", message.lower())
-    return match.group(1) if match else None
+# 真实世界的连接池日志几乎不写 "redis-connection-pool"，而是自然语言：
+#   "connection pool exhausted" / "could not get a resource from the pool" /
+#   "pool is full" / "HikariPool-1 - Connection is not available" ...
+# 只匹配带连字符的写法会让这些日志提取不到组件，进而把"池耗尽"
+# 误判成 dependency_timeout（F-008 实测 FT@1 因此为 0）。
+_POOL_PATTERNS = (
+    re.compile(r"\b([a-z][a-z0-9-]+)-connection-pool\b"),   # 显式连字符写法
+    re.compile(r"connection\s*pool"),                       # connection pool
+    re.compile(r"\bpool\s+(?:is\s+)?(?:exhausted|full|empty|saturated)\b"),
+    re.compile(r"could\s+not\s+get\s+a\s+resource\s+from\s+the\s+pool"),
+    re.compile(r"hikari\s*pool"),                            # HikariPool-N
+)
+
+
+def _extract_component(message: str, *, service: str | None = None) -> str | None:
+    """从日志提取"本服务自身的组件名"（不涉及依赖归因时使用）。
+
+    Args:
+        service: 上报服务名。提供时用 `{service}-connection-pool` 作为组件名，
+            这样才能与配置变更事件里的 `redis-connection-pool` 对上
+            （`_component_matches` 靠这个名字给 R-004 加分）。
+
+    判定顺序：显式连字符写法优先（它自带完整组件名），否则看自然语言短语。
+    没有服务名时不编造前缀，返回通用的 `connection-pool`。
+    """
+    lowered = message.lower()
+    explicit = _POOL_PATTERNS[0].search(lowered)
+    if explicit:
+        return explicit.group(1) + "-connection-pool"
+    for pattern in _POOL_PATTERNS[1:]:
+        if pattern.search(lowered):
+            prefix = (service or "").strip().lower()
+            return f"{prefix}-connection-pool" if prefix else "connection-pool"
+    return None
 
 
 def attribute_evidence(evidence: Evidence, topology: object | None = None) -> tuple[str, str | None] | None:
@@ -226,7 +256,7 @@ def generate_hypotheses(
                      f"error reported by {ev.service_id}: dependency {owner_service} failing",
                      reported_by=ev.service_id)
             else:
-                component = _extract_component(text)
+                component = _extract_component(text, service=ev.service_id)
                 fault_type = (
                     "pool_exhaustion" if component and "pool" in component else "dependency_timeout"
                 )
