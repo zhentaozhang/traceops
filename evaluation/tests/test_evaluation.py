@@ -181,10 +181,20 @@ class TestMultiServiceChain:
         }
         assert offsets["redis"] < offsets["order-service"] < offsets["api-gateway"]
 
-    def test_multi_service_citation_precision_is_lownot_perfect(self):
-        """多服务采集的代价：非根因服务的证据会被引用，precision 必然低于 1。
+    def test_multi_service_citation_precision_is_below_one(self):
+        """多服务采集的代价：非根因服务的证据会被引用，precision 必然 < 1。
 
         这是诚实性测试 —— 如果这里变成 1.00，说明指标在撒谎。
+
+        阈值从 0.5 放宽到"严格小于 1"的原因：`expected_evidence_types`
+        原来只看顶层信号、忽略 `per_service`（多服务场景信号全在 per_service 里），
+        导致分母为空、所有证据被判"不可归因"，precision 被压到 0.10。
+        修好后 F-005 的 10 条引用里有 6 条指向根因，0.60 才是真实值。
+
+        保留"必须 < 1"这条断言：级联场景一定会引用症状服务的证据，
+        如果真的变成 1.00，说明引用逻辑退化成"只引用根因"
+        （那会丢掉传播链需要的证据）。
         """
         outcome = run_scenario(self._cascade())
-        assert outcome.citation_precision < 0.5, outcome.citation_precision
+        assert outcome.citation_precision < 1.0, outcome.citation_precision
+        assert outcome.citation_precision > 0.0

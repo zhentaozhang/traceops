@@ -1,0 +1,48 @@
+{
+  "scenario_id": "F-009",
+  "name": "Higher-scoring decoy: rules favour the symptom, topology must override",
+  "description": "这条场景专为检验**规则本身**的边界，而不是数据质量。\n\n症状服务 order-service 拿到了更强的规则证据：它有慢 span（R-003 +2）且有自己的组件信息（R-007 +1），总分高于根因 redis。redis 只有弱证据（错误率略高）。\n\n正确答案只能靠**拓扑方向**（blame_order 在平局时把更下游的排前）——但这里不只是平局，order-service 分数**更高**。\n\n两种可能的正确行为：\n  A. 拓扑方向应当能压过 1 分的规则差 → redis 排第一（AC@1=1）\n  B. 分数差是真实证据差，不该被拓扑强压 → order-service 排第一（这是诚实的失败）\n\n本场景**不断言**哪种正确 —— 它存在的目的是把这个问题从\"没人知道\"变成\"有一个明确的实测答案\"。若结果是 B，那说明当前规则在'症状证据更强'时确实会错，这是需要记录的能力边界。",
+  "service_hint": "order-service",
+  "fault_start": "2026-10-30T10:02:00Z",
+  "window_start": "2026-10-30T10:00:00Z",
+  "window_end": "2026-10-30T10:05:00Z",
+  "topology_edges": [
+    ["order-service", "redis"],
+    ["api-gateway", "order-service"]
+  ],
+  "scope_depth": 2,
+  "signals": {
+    "per_service": {
+      "redis": {
+        "error_rate_series": [0.006, 0.09, 0.12],
+        "error_logs": [],
+        "slow_spans": []
+      },
+      "order-service": {
+        "error_rate_series": [0.005, 0.41, 0.48],
+        "error_logs": [],
+        "slow_spans": [
+          {
+            "name": "order.checkout",
+            "duration_ms": 2600
+          },
+          {
+            "name": "order.reserve",
+            "duration_ms": 2400
+          }
+        ]
+      }
+    }
+  },
+  "ground_truth": {
+    "service": "redis",
+    "fault_type": "availability_degradation",
+    "expected_diagnosis": "SUPPORTED",
+    "must_identify": [
+      "redis"
+    ],
+    "wrong_answers": [
+      "memory leak"
+    ]
+  }
+}

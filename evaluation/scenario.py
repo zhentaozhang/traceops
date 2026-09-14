@@ -59,6 +59,13 @@ class Signals(BaseModel):
     per_service: dict[str, ServiceSignals] = Field(default_factory=dict)
 
     def expected_evidence_types(self) -> set[EvidenceType]:
+        """本场景**应该**被引用到的证据类型（evidence_recall 的分母）。
+
+        必须同时看顶层字段与 `per_service`：多服务场景把信号写在 per_service 里
+        （F-005/F-006/F-008/F-009 都是这种形状），只看顶层会让集合为空，
+        于是 evidence_recall 的分母为 0、恒返回 0.0 —— 一个"分母算错"造成的
+        伪失败，而不是"没找到证据"。
+        """
         types: set[EvidenceType] = set()
         if self.error_rate_series:
             types.add(EvidenceType.METRIC)
@@ -68,6 +75,14 @@ class Signals(BaseModel):
             types.add(EvidenceType.TRACE)
         if self.config_change is not None:
             types.add(EvidenceType.EVENT)
+        # 多服务：各服务信号类型的并集
+        for service_signals in (self.per_service or {}).values():
+            if service_signals.error_rate_series:
+                types.add(EvidenceType.METRIC)
+            if service_signals.error_logs:
+                types.add(EvidenceType.LOG)
+            if service_signals.slow_spans:
+                types.add(EvidenceType.TRACE)
         return types
 
 
