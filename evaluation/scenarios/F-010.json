@@ -1,0 +1,39 @@
+{
+  "scenario_id": "F-010",
+  "name": "Equal-depth tie: correct answer lands at rank 2",
+  "description": "这条场景的**目的**是让正确答案合理地排不到第一，从而测出排序规则的真实分辨率。\n\n构造：两个服务在拓扑上**同等深度**（都是 api-gateway 直接调用的叶子，各自无下游依赖），且证据强度完全相同（都只有错误率异常，都无慢 span、无配置变更）。\n\n于是所有区分规则都失效：\n  - 分数相同（evidence 强度一样）\n  - blame_order 深度相同（无法用'越下游越像根因'）\n  - 最终只能按**服务名字母序**兜底\n\n真根因故意命名为 `zulu-cache`（字母序靠后），同深度候选是 `alpha-payment`。\n结果：正确答案会排到 rank 2。\n\n**这不是缺陷，是已经记录的设计边界**：\n排序键必须完全确定（不能靠 UUID，否则同场景两次运行结果不同）；\n当所有实质信号都相同时，字母序是唯一稳定的兜底。\n\n本场景的价值在于把这条边界从'文档里写着'变成'指标里量着'：\nAvg@5 与 MRR 终于不再是 1.00，AC@1 也不再是满分。",
+  "service_hint": "api-gateway",
+  "fault_start": "2026-10-30T10:02:00Z",
+  "window_start": "2026-10-30T10:00:00Z",
+  "window_end": "2026-10-30T10:05:00Z",
+  "topology_edges": [
+    ["api-gateway", "alpha-payment"],
+    ["api-gateway", "zulu-cache"]
+  ],
+  "scope_depth": 2,
+  "signals": {
+    "per_service": {
+      "alpha-payment": {
+        "error_rate_series": [0.004, 0.32, 0.40],
+        "error_logs": [],
+        "slow_spans": []
+      },
+      "zulu-cache": {
+        "error_rate_series": [0.004, 0.32, 0.40],
+        "error_logs": [],
+        "slow_spans": []
+      }
+    }
+  },
+  "ground_truth": {
+    "service": "zulu-cache",
+    "fault_type": "availability_degradation",
+    "expected_diagnosis": "SUPPORTED",
+    "must_identify": [
+      "zulu-cache"
+    ],
+    "wrong_answers": [
+      "memory leak"
+    ]
+  }
+}
