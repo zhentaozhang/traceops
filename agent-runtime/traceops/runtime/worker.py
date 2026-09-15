@@ -225,10 +225,18 @@ class InvestigationWorker:
         batch = self.source.poll(limit=limit)
         for message in batch:
             run_id = _extract_run_id(message)
-            already_seen = run_id is not None and (
-                run_id in self._known_run_ids or self.ledger.is_seen(run_id)
-            )
-            if already_seen:
+            # **认领**而不是"检查一下有没有见过"。
+            # 旧写法 is_seen(...) 与后面的 record(...) 之间隔着整个调查时长，
+            # 并发 worker（Redis XAUTOCLAIM 抢回 pending 消息时必然发生）
+            # 会同时通过检查，各自跑一遍同一 run —— 重复烧工具配额、重复发结论。
+            # claim 把"检查+占用"合成一步：只有一个 worker 能成功。
+            # 进程内已知集合先挡一层（构造时预置的 run 视为已处理）。
+            # 它是账本的**快速路径**，但不能替代 claim：集合只活在进程内。
+            if run_id is not None and run_id in self._known_run_ids:
+                stats.skipped_duplicate += 1
+                self.source.ack(message["id"])
+                continue
+            if run_id is not None and not self.ledger.claim(run_id):
                 stats.skipped_duplicate += 1
                 self.source.ack(message["id"])
                 continue
@@ -281,26 +289,26 @@ class InvestigationWorker:
                 reason = _classify_failure(result.errors)
                 run.fail(reason=reason, node="collect")
                 # 是否可重试由统一策略决定，不在各处零散判断
-                self.ledger.record(run.run_id, outcome=f"FAILED:{reason}")
+                self.ledger.finish(run.run_id, outcome=f"FAILED:{reason}")
                 self.sink.publish(failed_event(run, reason=reason,
                                                retryable=is_retryable(reason),
                                                detail="; ".join(result.errors)))
                 stats.failed += 1
                 return
             run.complete()
-            self.ledger.record(run.run_id, outcome="COMPLETED")
+            self.ledger.finish(run.run_id, outcome="COMPLETED")
             self.sink.publish(completed_event(run, result.report))
             stats.succeeded += 1
         except BudgetExhausted as exc:
             run.fail(reason=FAILURE_BUDGET, node="collect")
-            self.ledger.record(run.run_id, outcome=f"FAILED:{FAILURE_BUDGET}")
+            self.ledger.finish(run.run_id, outcome=f"FAILED:{FAILURE_BUDGET}")
             self.sink.publish(failed_event(run, reason=FAILURE_BUDGET,
                                            retryable=is_retryable(FAILURE_BUDGET),
                                            detail=str(exc)))
             stats.failed += 1
         except Exception as exc:  # 未预期错误：保留 checkpoint 供恢复
             run.fail(reason=FAILURE_INTERNAL, node=run.current_node)
-            self.ledger.record(run.run_id, outcome=f"FAILED:{FAILURE_INTERNAL}")
+            self.ledger.finish(run.run_id, outcome=f"FAILED:{FAILURE_INTERNAL}")
             self.sink.publish(failed_event(run, reason=FAILURE_INTERNAL,
                                            retryable=is_retryable(FAILURE_INTERNAL),
                                            detail=repr(exc)))

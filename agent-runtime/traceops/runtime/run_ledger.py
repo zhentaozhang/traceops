@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 
 from traceops.runtime.deadletter import now_iso
@@ -25,7 +26,9 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS run_ledger (
     run_id TEXT PRIMARY KEY,
     outcome TEXT NOT NULL,
-    recorded_at TEXT NOT NULL
+    recorded_at TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'DONE',
+    claimed_at TEXT
 );
 """
 
@@ -41,10 +44,16 @@ class RunLedger:
         self._path = Path(path) if path is not None else None
         self._conn: sqlite3.Connection | None = None
         self._records: dict[str, str] = {}
+        # 认领必须是原子的：is_seen 与 record 之间隔着一整个调查时长，
+        # 期间另一个 worker 也能通过检查 → 重复调查。用锁把"检查+占用"合并成一步。
+        self._lock = threading.Lock()
 
         if self._path is not None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(str(self._path))
+            # check_same_thread=False：认领逻辑本身用 threading.Lock 串行化，
+            # 因此连接跨线程使用是安全的。默认 True 会让"线程池化的 worker"
+            # 在 claim 时直接抛 ProgrammingError —— 单线程测试永远发现不了。
+            self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
             self._conn.executescript(SCHEMA)
             self._conn.commit()
             if preload:
@@ -83,6 +92,83 @@ class RunLedger:
         return self._conn.execute("SELECT COUNT(*) FROM run_ledger").fetchone()[0]
 
     # ---- 写入 ----
+    # ---- 认领语义（并发安全） ----
+    def claim(self, run_id: str) -> bool:
+        """原子地认领一个 run。返回 True 表示由本调用方执行。
+
+        这是修复重复调查的关键：`is_seen` + `record` 是两条独立操作，
+        中间隔着整个调查时长。并发 worker（Redis XAUTOCLAIM 抢回 pending
+        消息时就会发生）会同时通过检查，然后各自跑一遍。
+
+        实现：内存模式下用锁 + 字典；SQLite 模式下用主键冲突
+        （INSERT OR IGNORE 的影响行数就是"谁抢到了"的答案）。
+        """
+        with self._lock:
+            if self._conn is not None:
+                cursor = self._conn.execute(
+                    "INSERT OR IGNORE INTO run_ledger "
+                    "(run_id, outcome, recorded_at, state, claimed_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (run_id, "IN_PROGRESS", now_iso(), "IN_PROGRESS", now_iso()),
+                )
+                self._conn.commit()
+                claimed = cursor.rowcount == 1
+                if claimed:
+                    self._records[run_id] = "IN_PROGRESS"
+                return claimed
+            if run_id in self._records:
+                return False
+            self._records[run_id] = "IN_PROGRESS"
+            return True
+
+    def claim_state(self, run_id: str) -> str | None:
+        """认领状态：IN_PROGRESS / DONE / None（从未见过）。
+
+        区分两者很重要：IN_PROGRESS 说明"别人正在跑"（可能要等或抢回），
+        DONE 说明"已经完成"（跳过即可）。
+        """
+        if self._conn is not None:
+            row = self._conn.execute(
+                "SELECT state FROM run_ledger WHERE run_id = ?", (run_id,)).fetchone()
+            return row[0] if row else None
+        outcome = self._records.get(run_id)
+        if outcome is None:
+            return None
+        return "IN_PROGRESS" if outcome == "IN_PROGRESS" else "DONE"
+
+    def finish(self, run_id: str, *, outcome: str) -> None:
+        """把认领标记为完成（写最终 outcome）。"""
+        self._records[run_id] = outcome
+        if self._conn is not None:
+            self._conn.execute(
+                "UPDATE run_ledger SET outcome = ?, state = 'DONE', recorded_at = ? "
+                "WHERE run_id = ?", (outcome, now_iso(), run_id))
+            self._conn.commit()
+
+    def reclaimable(self, run_id: str, *, older_than_seconds: float) -> bool:
+        """崩溃恢复：处于 IN_PROGRESS 且认领时间超过阈值的 run 可被重新认领。
+
+        没有这条的话，worker 崩在调查中途，这个 run 会永远卡在 IN_PROGRESS。
+        """
+        state = self.claim_state(run_id)
+        if state != "IN_PROGRESS":
+            return False
+        if self._conn is None:
+            # 内存模式无法表达时间，保守返回 True（进程重启本就清空内存）
+            return True
+        row = self._conn.execute(
+            "SELECT claimed_at FROM run_ledger WHERE run_id = ?", (run_id,)).fetchone()
+        if not row or not row[0]:
+            return True
+        from datetime import UTC, datetime
+
+        try:
+            claimed = datetime.fromisoformat(row[0])
+        except ValueError:
+            return True
+        age = (datetime.now(UTC) - claimed).total_seconds()
+        return age >= older_than_seconds
+
     def record(self, run_id: str, *, outcome: str) -> None:
         """记录一次处理结果。
 
