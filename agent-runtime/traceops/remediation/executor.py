@@ -29,6 +29,9 @@ class ExecutionStatus(str, Enum):
     BLOCKED = "blocked"
     FAILED = "failed"
     NOT_VERIFIED = "not_verified"
+    # 预演通过（检查全过、但**没有执行**）。单独一个状态而不是 SUCCESS：
+    # 把"预演通过"记成成功会让人误以为环境已经被改动。
+    DRY_RUN = "dry_run"
 
 
 @dataclass
@@ -49,6 +52,7 @@ def execute_plan(
     registry: ActionRegistry,
     executor,
     verifier,
+    dry_run: bool = False,
 ) -> ExecutionResult:
     reasons: list[str] = []
 
@@ -96,6 +100,18 @@ def execute_plan(
         reasons.append(f"approved by {approval.approver}")
 
     # 4. 执行（唯一会改动环境的位置）
+    #
+    # dry_run 只在这里短路：前面的策略/审批/哈希检查**全部照样跑**。
+    # 如果 dry run 跳过检查，它就变成了"先试后批"的后门。
+    if dry_run:
+        return ExecutionResult(
+            status=ExecutionStatus.DRY_RUN,
+            attempts=0,
+            post_conditions_met=False,
+            rollback_required=False,
+            reasons=reasons + ["dry run: all guards passed, nothing executed"],
+        )
+
     try:
         executor.execute(plan.action, plan.target, plan.parameters)
     except Exception as exc:
