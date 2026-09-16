@@ -44,15 +44,18 @@ public class InvestigationResultService {
     private final IncidentRepository incidents;
     private final AppliedInvestigationEventRepository appliedEvents;
     private final InvestigationFindingRepository findings;
+    private final FindingHistoryRepository history;
     private final ObjectMapper mapper;
 
     public InvestigationResultService(IncidentRepository incidents,
             AppliedInvestigationEventRepository appliedEvents,
             InvestigationFindingRepository findings,
+            FindingHistoryRepository history,
             ObjectMapper mapper) {
         this.incidents = incidents;
         this.appliedEvents = appliedEvents;
         this.findings = findings;
+        this.history = history;
         this.mapper = mapper;
     }
 
@@ -66,7 +69,13 @@ public class InvestigationResultService {
      * 不写等于把"为什么没结论"丢掉。是否需要人工由 needsHumanReview 表达。
      */
     private void recordFinding(String incidentId, InvestigationResult result) {
-        findings.save(InvestigationFinding.from(incidentId, result, Instant.now()));
+        Instant now = Instant.now();
+        InvestigationFinding current = InvestigationFinding.from(incidentId, result, now);
+        findings.save(current);
+        // 同时追加一行历史：Finding 以 incidentId 为主键，第二次调查会**覆盖**第一次，
+        // 于是"这个事故被重查过几次、结论怎么变"就永久丢失了。
+        // 历史表是追加写，不影响"查最新结论"的热路径。
+        history.save(FindingHistorySnapshot.from(current, now));
     }
 
     @Transactional
