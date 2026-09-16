@@ -169,6 +169,30 @@ class RunLedger:
         age = (datetime.now(UTC) - claimed).total_seconds()
         return age >= older_than_seconds
 
+    def rows(self) -> list[dict]:
+        """导出全部账本记录（供审计中心合并时间线）。
+
+        为什么需要这个而不仅是单点查询：审计要回答"这一次事故的全部处置过程"，
+        那必然包含 run 这一维。只有 is_seen/outcome_for 之类单点查询时，
+        时间线永远缺一段。
+
+        内存模式下 `recorded_at` 用当前时刻补 —— 内存模式本来就没有持久时间，
+        假装有精确历史时间反而误导。
+        """
+        if self._conn is not None:
+            cursor = self._conn.execute(
+                "SELECT run_id, outcome, recorded_at, state FROM run_ledger "
+                "ORDER BY recorded_at")
+            return [
+                {"run_id": row[0], "outcome": row[1], "recorded_at": row[2], "state": row[3]}
+                for row in cursor.fetchall()
+            ]
+        return [
+            {"run_id": run_id, "outcome": outcome,
+             "recorded_at": now_iso(), "state": "IN_PROGRESS" if outcome == "IN_PROGRESS" else "DONE"}
+            for run_id, outcome in self._records.items()
+        ]
+
     def record(self, run_id: str, *, outcome: str) -> None:
         """记录一次处理结果。
 

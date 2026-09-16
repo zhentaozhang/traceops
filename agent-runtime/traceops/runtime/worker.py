@@ -26,6 +26,7 @@ from traceops.runtime.deadletter import (
     now_iso,
 )
 from traceops.runtime.retry import RetryPolicy, RetryTracker, is_retryable
+from traceops.evidence.audit import AuditCenter, AuditKind
 from traceops.runtime.run_ledger import RunLedger
 from traceops.runtime.investigation_run import InvestigationConfigSnapshot, InvestigationRun, RunStatus
 
@@ -213,6 +214,27 @@ class InvestigationWorker:
         # 重试策略：按 failure_reason 分类，不盲目重试（见 runtime/retry.py）
         self.retry_policy = retry_policy or RetryPolicy()
 
+    def audit_timeline(self, *, gateway=None, kind=None, subject=None,
+                       since=None, until=None):
+        """合并三处审计产出统一时间线（按时间正序）。
+
+        Args:
+            gateway: 可选的 `ToolGateway`。工具审计是内存列表、且属于某次调查，
+                所以不能由 worker 自己持有 —— 调用方传进来。
+            kind/subject/since/until: 透传给 `AuditCenter.timeline`。
+
+        为什么把 gateway 做成参数而不是构造参数：同一个 worker 会处理很多 run，
+        每个 run 有自己的 gateway；绑在 worker 上会混淆"哪个工具调用属于哪次调查"。
+        """
+        center = AuditCenter()
+        center.add_all(AuditCenter.from_ledger_rows(self.ledger.rows()))
+        if gateway is not None:
+            center.add_all(AuditCenter.from_gateway_records(gateway.audit_log()))
+        if self.dead_letters is not None:
+            for record in getattr(self.dead_letters, "records", []) or []:
+                center.add(AuditCenter.from_dead_letter(record))
+        return center.timeline(kind=kind, subject=subject, since=since, until=until)
+
     def _retry_decision(self, reason: str):
         """独立的记账器：一次失败 → 一个决策。放在这里而不是 Run 上，
         因为单次 poll_once 就是一次尝试。"""
@@ -277,10 +299,13 @@ class InvestigationWorker:
         self.sink.publish(started_event(run))
         stats.run_ids.append(run.run_id)
 
-        budget = BudgetManager(
-            max_tool_calls=getattr(self.build_context(request).budget, "max_tool_calls", 50),
-        )
+        # **只构造一次**：旧写法先调 build_context 只为读一个 max_tool_calls，
+        # 然后把整个 RunContext 丢掉再造一个。真实实现里那意味着连两次数据源、
+        # 开两个 SQLite 连接，而且第一次的 Budget 上限可能被静默丢弃。
         ctx = self.build_context(request)
+        budget = BudgetManager(
+            max_tool_calls=getattr(ctx.budget, "max_tool_calls", 50),
+        )
         try:
             result = run_investigation(request, ctx)
             run.record_usage(tool_calls=result.tool_calls, tokens=result.tokens_used,
