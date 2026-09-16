@@ -17,6 +17,15 @@ public final class EventMessages {
     public static final String SCHEMA_VERSION = "1.0";
     public static final String PRODUCER = "control-plane";
     public static final String INVESTIGATION_REQUESTED = "investigation.requested";
+
+    /**
+     * 进度事件（非终态）。
+     *
+     * <p>Python 侧每个调查节点发一条，带 {@code progress.step_index}。
+     * 它**不是**状态机输入，但也不是"坏消息"。不显式识别的话会被当成
+     * 契约违约，每次调查往日志里刷 N 条虚假告警。
+     */
+    public static final String INVESTIGATION_UPDATED = "investigation.updated";
     public static final Duration DEFAULT_WINDOW = Duration.ofMinutes(5);
 
     private EventMessages() {

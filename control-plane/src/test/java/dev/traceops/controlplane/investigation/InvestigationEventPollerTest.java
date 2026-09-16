@@ -92,6 +92,9 @@ class InvestigationEventPollerTest {
     @Autowired
     private InvestigationEventPoller poller;
 
+    @Autowired
+    private InvestigationProgressStore progressStore;
+
     @BeforeEach
     void reset() {
         source.acked.clear();
@@ -214,6 +217,79 @@ class InvestigationEventPollerTest {
         assertThat(result.applied()).isEqualTo(1);
         assertThat(result.processed()).isEqualTo(1);
         assertThat(source.wasAcked("1-0")).isTrue();
+    }
+
+    @Test
+    void progressEventIsCountedAsProgressNotAsError() throws Exception {
+        // 进度事件不是终态、也不是坏消息。若落到 IllegalArgument catch，
+        // 每次调查会刷出 N 条 "discarding unusable message" 告警 —— 运维会去查
+        // 一堆不存在的契约违约。
+        source.push("p-0", progressEvent("run-prog"));
+
+        PollResult result = poller.pollOnce();
+
+        assertThat(result.progress()).isEqualTo(1);
+        assertThat(result.errors()).as("progress must never be counted as an error").isZero();
+        assertThat(source.wasAcked("p-0")).isTrue();
+    }
+
+    @Test
+    void progressEventDoesNotDriveTheStateMachine() throws Exception {
+        String incidentId = createIncident("fp-prog-1");
+        driveToInvestigating(incidentId);
+        source.push("p-1", progressEvent("run-prog-1"));
+
+        PollResult result = poller.pollOnce();
+
+        assertThat(result.applied()).isZero();
+        assertThat(result.progress()).isEqualTo(1);
+    }
+
+    @Test
+    void progressEventIsStoredForSseConsumption() throws Exception {
+        // 只计数不存储的话，SSE 端点没有数据源 —— 进度内容的生命周期比计数重要得多
+        source.push("s-0", progressEvent("run-stored"));
+
+        poller.pollOnce();
+
+        assertThat(progressStore.latest("run-stored")).isPresent();
+        assertThat(progressStore.latest("run-stored").orElseThrow().currentNode())
+                .isEqualTo("collect");
+        assertThat(progressStore.latest("run-stored").orElseThrow().stepIndex()).isEqualTo(1);
+    }
+
+    @Test
+    void terminalOutcomeClearsStoredProgress() throws Exception {
+        // run 结束后进度必须清掉，否则"正在调查"永远为真
+        source.push("s-1", progressEvent("run-finish"));
+        poller.pollOnce();
+        assertThat(progressStore.latest("run-finish")).isPresent();
+
+        String incidentId = createIncident("fp-prog-clear");
+        driveToInvestigating(incidentId);
+        source.push("s-2", completedEvent(incidentId, "run-finish", "SUPPORTED"));
+        poller.pollOnce();
+
+        assertThat(progressStore.latest("run-finish")).isEmpty();
+    }
+
+    private static String progressEvent(String runId) {
+        return """
+                {
+                  "envelope": {
+                    "event_id": "evt-%s", "event_type": "investigation.updated",
+                    "schema_version": "1.0", "occurred_at": "2026-10-30T10:00:00Z",
+                    "producer": "agent-runtime", "correlation_id": "inc-prog",
+                    "aggregate_id": "%s", "aggregate_version": 2, "causation_id": null
+                  },
+                  "payload": {
+                    "investigation_run_id": "%s", "status": "RUNNING",
+                    "aggregate_version": 2, "current_node": "collect",
+                    "progress": {"step_index": 1, "step_description": "collecting",
+                                 "evidence_count": 2}
+                  }
+                }
+                """.formatted(runId, runId, runId);
     }
 
     @Test

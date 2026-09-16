@@ -889,9 +889,27 @@ def _initial_state(request: InvestigationRequest) -> InvestigationState:
     }
 
 
+def _run_with_progress(graph, initial_state, config, on_node):
+    """按节点执行并回调 `on_node(node_name, state)`，返回最终合并 state。
+
+    LangGraph 的 `stream()` 以 `(node_name, update)` 形式产出增量；
+    这里把增量合并回完整 state，这样调用方拿到的 final 与 invoke() 一致。
+    """
+    accumulated: dict[str, Any] = dict(initial_state)
+    for chunk in graph.stream(initial_state, config, stream_mode="updates"):
+        if not isinstance(chunk, dict):
+            continue
+        for node_name, update in chunk.items():
+            if isinstance(update, dict):
+                accumulated.update(update)
+            on_node(node_name, accumulated)
+    return accumulated
+
+
 def run_investigation(request: InvestigationRequest, ctx: RunContext, *,
                       thread_id: str | None = None,
-                      checkpointer: Any | None = None) -> InvestigationResult:
+                      checkpointer: Any | None = None,
+                      on_node=None) -> InvestigationResult:
     """执行一次完整调查。异常只允许在编程错误时抛出；业务失败进 result。
 
     Args:
@@ -906,7 +924,13 @@ def run_investigation(request: InvestigationRequest, ctx: RunContext, *,
     if thread_id:
         configurable["thread_id"] = thread_id
     config = {"configurable": configurable}
-    final = graph.invoke(_initial_state(request), config)
+    if on_node is None:
+        final = graph.invoke(_initial_state(request), config)
+    else:
+        # stream() 按节点产出 state 更新；用它把"走到哪一步"实时交出去。
+        # 不用 invoke 的另一种原因：进度必须在**节点完成时**发，
+        # 事后一次性发全部进度等于放录像，SSE 就没意义了。
+        final = _run_with_progress(graph, _initial_state(request), config, on_node)
     report = final.get("report")
     status = final.get("status", "FAILED")
     if report is None and status != "FAILED":

@@ -113,6 +113,51 @@ def started_event(run: InvestigationRun) -> dict[str, Any]:
     )
 
 
+#: 节点 → 人可读的进度描述。SSE 前端直接展示，不做二次映射。
+_NODE_DESCRIPTIONS: dict[str, str] = {
+    "plan": "planning the investigation scope",
+    "collect": "collecting evidence from datasources",
+    "hypothesize": "generating root cause candidates",
+    "link": "linking evidence to hypotheses",
+    "correlate": "correlating timeline and propagation",
+    "rank": "ranking candidate root causes",
+    "report": "assembling the diagnosis report",
+}
+
+
+def progress_event(run: InvestigationRun, *, node: str, step_index: int,
+                   description: str | None = None,
+                   evidence_count: int = 0) -> dict[str, Any]:
+    """一条**节点级**进度事件（给 SSE 用）。
+
+    为什么需要：`contracts/` 里 `investigation-updated` 早就声明了
+    `progress.{step_index, step_description, evidence_count}`，
+    但两端从未填充过，且整个调查只发一条 `started_event`。
+    于是跑了 30 秒的调查在前端只有一个 "RUNNING" —— 进度推送**缺的不是传输，是数据**。
+
+    `step_index` 必须单调递增：SSE 客户端可能乱序收到消息（重连/多副本），
+    靠它才能重排。不能复用 `aggregate_version` —— 那个字段同时被终态事件消耗，
+    两类事件挤在同一序列里会让客户端无法判断"这是进度还是结论"。
+    """
+    return _envelope(
+        "investigation.updated",
+        {
+            "investigation_run_id": run.run_id,
+            "status": "RUNNING",
+            "aggregate_version": run.aggregate_version,
+            "current_node": node,
+            "progress": {
+                "step_index": int(step_index),
+                "step_description": description or _NODE_DESCRIPTIONS.get(node, node),
+                "evidence_count": int(evidence_count),
+            },
+        },
+        run_id=run.run_id,
+        incident_id=run.incident_id,
+        version=run.aggregate_version,
+    )
+
+
 def completed_event(run: InvestigationRun, report) -> dict[str, Any]:
     """终态事件：只带摘要与计数，完整报告走 rca_report_ref（蓝图 §4.3 大对象不进消息体）。"""
     candidates = [
@@ -306,8 +351,21 @@ class InvestigationWorker:
         budget = BudgetManager(
             max_tool_calls=getattr(ctx.budget, "max_tool_calls", 50),
         )
+        # 进度上报：每个节点完成时发一条 investigation.updated。
+        # 此前整个调查只发 started_event 一条，前端只能看到 "RUNNING" ——
+        # 跑了 30 秒的调查没有中间状态，SSE 也就无从展示。
+        step_counter = {"index": 0}
+
+        def _on_node(node_name, state):
+            index = step_counter["index"]
+            step_counter["index"] += 1
+            evidence_count = len(state.get("evidence") or [])
+            self.sink.publish(progress_event(
+                run, node=node_name, step_index=index,
+                description=None, evidence_count=evidence_count))
+
         try:
-            result = run_investigation(request, ctx)
+            result = run_investigation(request, ctx, on_node=_on_node)
             run.record_usage(tool_calls=result.tool_calls, tokens=result.tokens_used,
                              rounds=ctx.budget.rounds)
             if result.status == "FAILED":

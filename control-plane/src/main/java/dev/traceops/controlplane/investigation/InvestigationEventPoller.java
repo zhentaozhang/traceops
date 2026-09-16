@@ -38,12 +38,15 @@ public class InvestigationEventPoller {
     private final InvestigationResultService service;
     private final InvestigationEventSource source;
     private final ObjectMapper mapper;
+    private final InvestigationProgressStore progressStore;
 
     public InvestigationEventPoller(InvestigationResultService service,
-            InvestigationEventSource source, ObjectMapper mapper) {
+            InvestigationEventSource source, ObjectMapper mapper,
+            InvestigationProgressStore progressStore) {
         this.service = service;
         this.source = source;
         this.mapper = mapper;
+        this.progressStore = progressStore;
     }
 
     /**
@@ -79,6 +82,19 @@ public class InvestigationEventPoller {
     private void handle(StreamMessage message, Counters counters) {
         String rawJson = message.payload();
         String eventType = peekEventType(rawJson);
+
+        if (EventMessages.INVESTIGATION_UPDATED.equals(eventType)) {
+            // 进度事件：不是终态、也不是坏消息。
+            // 此前它落进 IllegalArgument catch，被记成 "discarding unusable message" + errors++，
+            // 于是每次调查都刷出 N 条虚假的契约违约告警。
+            // 不能只计数就丢：SSE 端点需要读取"现在到哪一步"。
+            // 解析失败（字段缺失/格式坏）不该让 poller 崩，也不能冒充成契约违约 ——
+            // 它不是终态消息，坏掉就地丢弃 + debug 日志即可。
+            recordProgress(rawJson);
+            counters.progress++;
+            ack(message);
+            return;
+        }
 
         if (EventMessages.INVESTIGATION_REQUESTED.equals(eventType)) {
             // Java 自己发出的调查请求也会出现在同一个流里。消费自己的请求会形成自激循环
@@ -116,8 +132,40 @@ public class InvestigationEventPoller {
         }
     }
 
+    /** 把一条 investigation.updated 解析进进度存储（坏数据静默丢弃，不升级为错误）。 */
+    private void recordProgress(String rawJson) {
+        try {
+            JsonNode root = mapper.readTree(rawJson);
+            JsonNode payload = root.path("payload");
+            String runId = payload.path("investigation_run_id").asText("");
+            if (runId.isEmpty()) {
+                return;
+            }
+            JsonNode progress = payload.path("progress");
+            progressStore.record(runId, new InvestigationProgress(
+                    runId,
+                    payload.path("current_node").asText(""),
+                    progress.path("step_index").asInt(0),
+                    progress.path("step_description").asText(""),
+                    progress.path("evidence_count").asInt(0)));
+        } catch (Exception ex) {
+            log.debug("unusable progress event ignored: {}", ex.toString());
+        }
+    }
+
     /** 结算结论 → 计数 + ACK 决策。这里就是"什么算处理完"的唯一一处定义。 */
     private void countOutcome(Applied applied, StreamMessage message, Counters counters) {
+        // 终态到达：清掉该 run 的进度，否则"正在调查"永远为真
+        try {
+            String rawJson = message.payload();
+            JsonNode payload = mapper.readTree(rawJson).path("payload");
+            String runId = payload.path("investigation_run_id").asText("");
+            if (!runId.isEmpty()) {
+                progressStore.clear(runId);
+            }
+        } catch (Exception ignored) {
+            // 清理失败不影响主流程
+        }
         switch (applied.outcome()) {
             case APPLIED -> {
                 counters.applied++;
@@ -207,10 +255,12 @@ public class InvestigationEventPoller {
         private int rejected;
         private int notFound;
         private int errors;
+        /** 被跳过的进度事件数（不是错误，运维不该为此告警）。 */
+        private int progress;
 
         private PollResult toResult() {
             return new PollResult(processed, applied, skipped, needsReview, retryPending, rejected,
-                    notFound, errors);
+                    notFound, errors, progress);
         }
     }
 }

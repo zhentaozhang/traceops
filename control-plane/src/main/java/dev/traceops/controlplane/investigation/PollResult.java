@@ -29,10 +29,17 @@ public record PollResult(
         int retryPending,
         int rejected,
         int notFound,
-        int errors) {
+        int errors,
+        int progress) {
 
     public static PollResult empty() {
-        return new PollResult(0, 0, 0, 0, 0, 0, 0, 0);
+        return new PollResult(0, 0, 0, 0, 0, 0, 0, 0, 0);
+    }
+
+    /** 兼容旧调用点（进度计数缺省为 0）。 */
+    public PollResult(int processed, int applied, int skipped, int needsReview,
+                      int retryPending, int rejected, int notFound, int errors) {
+        this(processed, applied, skipped, needsReview, retryPending, rejected, notFound, errors, 0);
     }
 
     /** 本轮读取就失败了（Redis 不可用）：一条消息都没处理，记一个 error。 */

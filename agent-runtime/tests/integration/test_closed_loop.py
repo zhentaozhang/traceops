@@ -153,7 +153,11 @@ class TestClosedLoop:
         assert stats.succeeded == 1
         assert stats.failed == 0
         types = [m["envelope"]["event_type"] for m in sink.messages]
-        assert types == ["investigation.updated", "investigation.completed"]
+        # started(updated) -> 每节点进度(updated) -> completed
+        assert types[0] == "investigation.updated"
+        assert types[-1] == "investigation.completed"
+        assert types.count("investigation.completed") == 1
+        assert all(t in ("investigation.updated", "investigation.completed") for t in types)
 
     def test_completed_event_can_be_parsed_by_control_plane_contract(self):
         """回程事件必须符合 investigation-completed 契约：Control Plane 才能消费。"""
