@@ -34,7 +34,7 @@ from traceops.evidence.graph import (
     promote_relations,
 )
 from traceops.evidence.templates import QueryTemplateError, default_registry
-from traceops.evidence.normalizer import _trace_batches, normalize
+from traceops.evidence.normalizer import _trace_batches, coerce_epoch, normalize
 from traceops.evidence.store import EvidenceStore
 from traceops.orchestration.detectors import (
     attribute_evidence,
@@ -306,7 +306,8 @@ def _observed_at_raw(raw: dict[str, Any], evidence_type: EvidenceType, fallback:
             for stream in streams:
                 values = stream.get("values") or []
                 if values:
-                    return datetime.fromtimestamp(int(values[0][0]) / 1e9, tz=UTC)
+                    # 单位自适应：写死 /1e9 会把秒级时间戳解析成 1970
+                    return coerce_epoch(values[0][0])
         elif evidence_type is EvidenceType.TRACE:
             # 两种 trace 形状都要认（与 TraceNormalizer 的 `_trace_batches` 同源）：
             #   Jaeger : batches[].spans[].startTime            —— 微秒

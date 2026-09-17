@@ -33,6 +33,48 @@ def _norm_tags(tags: list[dict[str, Any]] | None) -> dict[str, Any]:
     return out
 
 
+#: 秒级现代时间戳约 1.7e9，毫秒级约 1.7e12。1e11 正好把两者分开。
+_SECONDS_THRESHOLD = 1e11
+
+
+def coerce_epoch(value: Any) -> datetime:
+    """把可能是秒/毫秒/微秒/纳秒的 epoch 值统一成 aware datetime。
+
+    为什么要自适应而不是写死 `/1e9`：Loki push **规范**要求纳秒字符串，
+    但生态里毫秒/秒级很常见（某些 Alloy/Promtail 配置、自建 shipper）。
+    写死纳秒时，一个秒级时间戳 `1793354520` 会被解析成 **1970-01-01**（差 56 年）。
+
+    这种错误比"解析失败"更难排查：如果不触发窗口校验，它会**静默通过**
+    并污染整条时间线，让 `observed_after_predecessor` 全部失真。
+
+    借鉴 TriageRCA `_normalize_logs` 的做法（按数量级归一）：
+
+        while ts.max() > 1e11: ts /= 1000
+
+    这里对单值做等价判断：
+        < 1e11  → 秒
+        < 1e14  → 毫秒
+        < 1e17  → 微秒
+        否则    → 纳秒
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"cannot coerce epoch value: {value!r}") from exc
+    if number < 0:
+        raise ValueError(f"epoch must be non-negative, got {number}")
+
+    if number < _SECONDS_THRESHOLD:
+        seconds = number
+    elif number < _SECONDS_THRESHOLD * 1e3:
+        seconds = number / 1e3
+    elif number < _SECONDS_THRESHOLD * 1e6:
+        seconds = number / 1e6
+    else:
+        seconds = number / 1e9
+    return datetime.fromtimestamp(seconds, tz=UTC)
+
+
 class MetricNormalizer:
     kind = "metric"
 
@@ -70,9 +112,10 @@ class LogNormalizer:
                 if len(records) >= max_records:
                     truncated = True
                     continue
-                ns, line = entry[0], entry[1]
+                raw_ts, line = entry[0], entry[1]
                 meta = entry[2] if len(entry) > 2 else {}
-                ts = datetime.fromtimestamp(int(ns) / 1e9, tz=UTC).isoformat()
+                # 单位自适应：纳秒是规范，但生态里有毫秒/秒级
+                ts = coerce_epoch(raw_ts).isoformat()
                 rec = {
                     "timestamp": ts,
                     "message": line,
