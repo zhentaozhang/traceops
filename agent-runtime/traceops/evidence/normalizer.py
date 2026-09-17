@@ -131,6 +131,35 @@ def _is_otlp_span(span: dict[str, Any]) -> bool:
     return "traceId" in span or "startTimeUnixNano" in span
 
 
+def _trace_batches(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """把三种 trace 载荷形状统一成 `batches` 列表。
+
+    为什么必须支持多种外壳：**`batches` 是项目内部约定**（Tempo 查询 API
+    `/api/traces/{id}` 的返回形状），而 OTLP 规范与 push 端点用的外层键是
+    `resourceSpans`。只认 `batches` 会让任何标准 OTLP 载荷被当成"形状错误"丢弃。
+
+    这不是理论问题：TraceOps 的自观测第一次跑就撞上了 ——
+    它自己按 OTLP 规范产出的 trace 过不了自己的 Normalizer。
+    同样的缺口会让它丢弃外部系统送来的标准 OTLP 数据。
+
+    接受的三种形状：
+      1. `{"batches": [resourceSpan, ...]}`        —— 内部约定
+      2. `{"resourceSpans": [resourceSpan, ...]}`  —— OTLP 规范
+      3. 单个 `resourceSpan`（带 scopeSpans）      —— 部分 SDK 直接给这层
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(f"trace payload must be an object, got {type(raw).__name__}")
+    if "batches" in raw:
+        return list(raw["batches"] or [])
+    if "resourceSpans" in raw:
+        return list(raw["resourceSpans"] or [])
+    if "scopeSpans" in raw or "instrumentationLibrarySpans" in raw or "spans" in raw:
+        return [raw]
+    raise ValueError(
+        "trace payload: expected one of {batches: [...]} (Tempo query API) "
+        "or {resourceSpans: [...]} (OTLP spec)")
+
+
 class TraceNormalizer:
     """Trace 归一化。
 
@@ -147,10 +176,9 @@ class TraceNormalizer:
     kind = "trace"
 
     def normalize(self, raw: dict[str, Any], max_records: int) -> dict[str, Any]:
-        if "batches" not in raw:
-            raise ValueError("trace payload: expected Tempo shape {batches: [...]}")
+        batches = _trace_batches(raw)
         spans: list[dict[str, Any]] = []
-        for batch in raw["batches"]:
+        for batch in batches:
             resource = batch.get("resource") or {}
             # OTLP：scopeSpans 是数组；Jaeger：spans 直接在 batch 下
             otlp_scopes = batch.get("scopeSpans") or batch.get("instrumentationLibrarySpans") or []

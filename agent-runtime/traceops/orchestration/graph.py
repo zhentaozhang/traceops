@@ -34,7 +34,7 @@ from traceops.evidence.graph import (
     promote_relations,
 )
 from traceops.evidence.templates import QueryTemplateError, default_registry
-from traceops.evidence.normalizer import normalize
+from traceops.evidence.normalizer import _trace_batches, normalize
 from traceops.evidence.store import EvidenceStore
 from traceops.orchestration.detectors import (
     attribute_evidence,
@@ -308,11 +308,24 @@ def _observed_at_raw(raw: dict[str, Any], evidence_type: EvidenceType, fallback:
                 if values:
                     return datetime.fromtimestamp(int(values[0][0]) / 1e9, tz=UTC)
         elif evidence_type is EvidenceType.TRACE:
-            for batch in raw.get("batches") or []:
+            # 两种 trace 形状都要认（与 TraceNormalizer 的 `_trace_batches` 同源）：
+            #   Jaeger : batches[].spans[].startTime            —— 微秒
+            #   OTLP   : *.scopeSpans[].spans[].startTimeUnixNano —— 纳秒
+            # 只认 Jaeger 会让所有 OTLP trace 的 observed_at 退化成 fallback（窗口末端），
+            # 时间线因此全部相同，传播链的时序标记失去意义。
+            for batch in _trace_batches(raw):
+                # Jaeger 形状：spans 直接在 batch 下
                 for span in batch.get("spans") or []:
                     start_us = span.get("startTime")
                     if start_us is not None:
                         return datetime.fromtimestamp(int(start_us) / 1e6, tz=UTC)
+                # OTLP 形状：spans 嵌在 scopeSpans 里，纳秒
+                for scope in (batch.get("scopeSpans")
+                              or batch.get("instrumentationLibrarySpans") or []):
+                    for span in scope.get("spans") or []:
+                        start_ns = span.get("startTimeUnixNano")
+                        if start_ns is not None:
+                            return datetime.fromtimestamp(int(start_ns) / 1e9, tz=UTC)
     except (TypeError, ValueError, IndexError):
         pass
     return fallback
