@@ -112,6 +112,12 @@ class RunContext:
     # 影响层：向上游（调用方）采集症状证据，只用于传播链/影响范围，不进候选。
     # 关掉它就退化为一层采集（症状不会再出现在链上）。
     impact_scope: bool = True
+    # ---- 消融开关（E4 vs E5）----
+    # 语义覆盖率闸门：覆盖率为 0 时把 SUPPORTED 降级为 INCONCLUSIVE。
+    # 关掉它 = E4 臂（有证据引擎但无假设验证）。
+    enable_semantic_gate: bool = True
+    # 确定性矛盾检测：生成 CONTRADICTS 关系，供 R-005 降权。
+    enable_contradiction: bool = True
 
 
 @dataclass
@@ -527,8 +533,12 @@ def _link_node(state: InvestigationState, config: RunnableConfig) -> dict[str, A
     # Contradiction Detection Rate 的分母恒为 0。矛盾的判据全部可枚举
     # （见 rca/contradiction.py），因此可确定性生成，不需要 LLM。
     hypotheses = list(state.get("hypotheses", []))
-    contradicting = find_contradictions(
-        hypotheses, list(state.get("evidence", [])), topology=ctx.topology)
+    # E4 臂关闭矛盾检测：它测的是"有证据引擎、无假设验证"
+    contradicting = (
+        find_contradictions(
+            hypotheses, list(state.get("evidence", [])), topology=ctx.topology)
+        if getattr(ctx, "enable_contradiction", True) else []
+    )
     for item in contradicting:
         # **矛盾优先于支持**：同一条证据如果被判为反证，它就不该再算作支持。
         #
@@ -835,14 +845,17 @@ def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str,
         propagation_chain=_propagation_chain(state, ctx),
         incident_id=request.incident_id,
         topology=ctx.topology,
-        semantic_checks={
-            check.hypothesis_id: check
-            for check in check_all(
-                list(state.get("hypotheses", [])),
-                list(state.get("evidence", [])),
-                topology=ctx.topology,
-            )
-        },
+        semantic_checks=(
+            {
+                check.hypothesis_id: check
+                for check in check_all(
+                    list(state.get("hypotheses", [])),
+                    list(state.get("evidence", [])),
+                    topology=ctx.topology,
+                )
+            }
+            if ctx.enable_semantic_gate else None
+        ),
     )
     return {"report": report, "status": report.diagnosis_status}
 
