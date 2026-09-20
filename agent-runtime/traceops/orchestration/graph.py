@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+import functools
+
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, TypedDict
@@ -340,11 +342,47 @@ def _observed_at_raw(raw: dict[str, Any], evidence_type: EvidenceType, fallback:
 
 # ---------------- nodes ----------------
 
+def _charged(fn):
+    """每个节点执行算一轮，并在入口检查 round / deadline 预算。
+
+    为什么在节点级别计轮：`BudgetManager.begin_round()` 此前**全仓零调用方**，
+    于是 `_rounds` 恒为 0（`worker.py` 却把 0 当真实用量上报），
+    而 `deadline_seconds` 只在 `begin_round` 里检查 —— 也就从未生效。
+    这是"闸门看起来存在、实际不存在"的问题：代码有、测试没测、生产不跑。
+
+    P0 的确定性单趟图确实只有一轮，所以此前无害；但 P1 要接 LLM 多轮循环，
+    轮数上限与截止时间就是防止无限烧钱的两道闸门 ——
+    带着"闸门是虚的"进 P1 等于没有闸门。
+    """
+    @functools.wraps(fn)
+    def wrapper(state, config):
+        ctx = _ctx_from(config)
+        try:
+            ctx.budget.begin_round()
+        except BudgetExhausted as exc:
+            # 预算耗尽必须是**干净失败**（返回 FAILED 结果），不是抛出异常。
+            #
+            # 为什么这一点重要：`run_investigation` 不捕获异常，
+            # 所以从节点里抛出 BudgetExhausted 会一路冒到调用方 ——
+            # 而 `_collect_node` 内部处理预算时返回的是 FAILED 结果。
+            # 两种处理方式不一致，调用方无法统一判断"调查失败了"。
+            # 与既有语义对齐：不产出半成品报告，但把原因写进 errors。
+            errors = list(state.get("errors", [])) + [f"budget exhausted: {exc}"]
+            return {"status": "FAILED", "errors": errors,
+                    "missing_data": list(state.get("missing_data", []))}
+
+        return fn(state, config)
+
+    return wrapper
+
+
+@_charged
 def _plan_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
     request = state["request"]
     return {"plan": _plan_items(request, _ctx_from(config))}
 
 
+@_charged
 def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
     request = state["request"]
     ctx = _ctx_from(config)
@@ -403,6 +441,7 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
     return {"evidence": evidence_list, "missing_data": missing}
 
 
+@_charged
 def _hypothesize_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
     """确定性检测器 + （可选）模型提案。
 
@@ -483,6 +522,7 @@ def _evidence_summary(evidence_list: list[Evidence]) -> dict[str, Any]:
     return summary
 
 
+@_charged
 def _link_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
     ctx = _ctx_from(config)
     request = state["request"]
@@ -591,6 +631,7 @@ def _event_component(evidence: Evidence) -> str | None:
     return None
 
 
+@_charged
 def _correlate_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
     """证据关联（蓝图 §6.3）：构建证据图，产出时间线与关联统计。
 
@@ -633,6 +674,7 @@ def _correlate_node(state: InvestigationState, config: RunnableConfig) -> dict[s
     return {"evidence_graph_summary": summary, "missing_data": missing}
 
 
+@_charged
 def _rank_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
     request = state["request"]
     hypotheses = state.get("hypotheses", [])
@@ -809,6 +851,7 @@ def _correlation_notes(state: InvestigationState) -> list[str]:
     return notes
 
 
+@_charged
 def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
     request = state["request"]
     ctx = _ctx_from(config)
