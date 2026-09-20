@@ -15,6 +15,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.HexFormat;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
@@ -49,6 +50,44 @@ public class IncidentService {
     }
 
     @Transactional
+    /**
+     * 批量接入：逐条处理，并汇总计数。
+     *
+     * <p>为什么逐条而不是"取第一条"：Alertmanager 的 webhook 天然是批量的，
+     * 丢弃其余告警会让多故障场景永远只有一条链（F-007 的根因）。
+     *
+     * <p>为什么单条失败不让整批失败：一条坏告警不该阻塞同批的其它告警 ——
+     * 但失败必须被**计数**（processed 与 created 的差就是去重/失败的数量），
+     * 否则又回到"静默丢弃"的老问题。
+     */
+    public IngestResult ingestAll(List<AlertWebhookRequest.Alert> alerts) {
+        if (alerts == null || alerts.isEmpty()) {
+            throw new IllegalArgumentException("at least one alert is required");
+        }
+        List<String> ids = new ArrayList<>();
+        String firstId = null;
+        IncidentStatus firstStatus = null;
+        boolean anyDeduplicated = false;
+        int created = 0;
+        int processed = 0;
+
+        for (AlertWebhookRequest.Alert alert : alerts) {
+            processed++;
+            IngestResult one = ingest(alert);
+            ids.add(one.incidentId());
+            if (firstId == null) {
+                firstId = one.incidentId();
+                firstStatus = one.status();
+            }
+            if (one.deduplicated()) {
+                anyDeduplicated = true;
+            } else {
+                created++;
+            }
+        }
+        return new IngestResult(firstId, firstStatus, anyDeduplicated, processed, created, ids);
+    }
+
     public IngestResult ingest(AlertWebhookRequest.Alert alert) {
         if (alert == null || alert.fingerprint() == null || alert.fingerprint().isBlank()) {
             throw new IllegalArgumentException("alert fingerprint is required");

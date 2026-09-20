@@ -19,10 +19,16 @@ public class AlertController {
         this.incidentService = incidentService;
     }
 
-    /** 一次 webhook 取第一条 firing 告警建事故；后续告警由指纹幂等规则处理。 */
+    /**
+     * 处理 webhook 里的**每一条**告警。
+     *
+     * <p>旧实现是 {@code request.alerts().getFirst()}：同批其余告警被静默丢弃。
+     * Alertmanager 的 webhook 按设计就是批量的（一个 group 多条 alert），
+     * 所以那不是边界情况，是主路径 —— 被丢掉的告警既不入库、也不报错，
+     * 直接切断了多故障场景的数据来源（EVALUATION 里 F-007 只能看到一条链即此故）。
+     */
     @PostMapping
     public ResponseEntity<IngestResult> ingest(@Valid @RequestBody AlertWebhookRequest request) {
-        AlertWebhookRequest.Alert alert = request.alerts().getFirst();
-        return ResponseEntity.status(HttpStatus.ACCEPTED).body(incidentService.ingest(alert));
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(incidentService.ingestAll(request.alerts()));
     }
 }

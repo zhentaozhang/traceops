@@ -9,7 +9,10 @@ Agent 不直接调用 MCP Server：所有工具调用经过本网关执行
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import tempfile
+from pathlib import Path
 import time
 from datetime import UTC, datetime
 from enum import Enum
@@ -53,12 +56,57 @@ class ToolSpec(BaseModel):
     audit_enabled: bool = True
 
 
+#: 落盘结果在返回 dict 中的键。调用方据此知道"这不是全量"。
+SPILL_REF_KEY = "_spill"
+#: 预览字符数上限。固定值（不用上下文比例）：单次调用场景下上下文占用是固定的。
+_SPILL_PREVIEW_CHARS = 2000
+
+
+class SpillStore:
+    """把超大工具结果落盘，**内容寻址**保存。
+
+    为什么内容寻址：同一份数据重复落盘是同一个文件，
+    因此落盘产物天然可去重、可复现，并且能直接当作证据引用
+    （证据的 checksum 也是内容哈希，两者可以对齐）。
+
+    为什么不用 LLM 摘要：holmesgpt 自己把摘要标成 LEGACY ——
+    「summarization is lossy (the original tool output is unrecoverable afterwards)」。
+    对证据引擎尤其致命：摘要后的内容无法内容寻址、无法引用校验、
+    每次运行还不一样，直接破坏「证据可核查」这个立身之本。
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.root = Path(root)
+
+    def save(self, tool_name: str, payload: Any) -> dict[str, Any]:
+        """写入并返回引用信息。写盘失败时抛 OSError，由调用方降级。"""
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        # 内容哈希：同内容 → 同文件（去重 + 可复现）
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        safe_tool = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in tool_name)[:40]
+        directory = self.root / safe_tool
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{digest[:16]}.json"
+        path.write_text(encoded, encoding="utf-8")
+        return {
+            "path": str(path),
+            "bytes": len(encoded.encode("utf-8")),
+            "digest": digest,
+            "preview": encoded[:_SPILL_PREVIEW_CHARS],
+            "truncated": True,
+        }
+
+
 class ToolGateway:
-    def __init__(self) -> None:
+    def __init__(self, spill_root: Path | None = None) -> None:
         self._tools: dict[str, ToolSpec] = {}
         self._audit: list[dict[str, Any]] = []
         # 同一次调查内「同名 + 完全相同参数」的调用指纹（重复调用防护）
         self._seen_calls: set[str] = set()
+        # 超大结果的落盘根目录。None 时用临时目录（不污染工作区）。
+        self._spill_root = Path(spill_root) if spill_root is not None else (
+            Path(tempfile.gettempdir()) / "traceops-spill")
+        self._spill = SpillStore(self._spill_root)
 
     # ---- registry ----
     def register(self, spec: ToolSpec) -> None:
@@ -137,13 +185,14 @@ class ToolGateway:
 
         encoded = json.dumps(result, ensure_ascii=False)
         if len(encoded.encode("utf-8")) > spec.max_result_bytes:
-            self._record(tool_name, "RESULT_TOO_LARGE", params,
-                         error=f"{len(encoded)} bytes > {spec.max_result_bytes}",
+            # **落盘而不是丢弃**。超过 max_result_bytes 是"数据量大"，
+            # 不是"这次查询失败了" —— 对证据引擎来说，把正当查询的结果扔掉
+            # 是最坏的失败模式（证据覆盖率下降、语义闸门降级，
+            # 而根因只是数据量）。
+            spilled = self._spill_or_truncate(tool_name, result, len(encoded))
+            self._record(tool_name, "SPILLED", params,
                          duration_ms=int((time.monotonic() - started) * 1000))
-            raise ValueError(
-                f"tool {tool_name!r} result size {len(encoded)} bytes exceeds "
-                f"limit {spec.max_result_bytes}"
-            )
+            return spilled
 
         self._record(tool_name, self._outcome_for(result), params,
                      duration_ms=int((time.monotonic() - started) * 1000))
@@ -196,6 +245,25 @@ class ToolGateway:
         混为一谈会把"数据源挂了"当成"没有异常"，进而把 absence 当成阴性证据。
         """
         return "NO_DATA" if self._is_empty_result(result) else "OK"
+
+    def _spill_or_truncate(self, tool_name: str, result: Any, size: int) -> dict[str, Any]:
+        """落盘；写盘失败时降级为「带标记的截断」，**不让整个调用失败**。
+
+        降级形态仍然明确标记 `spill_failed=True` 和 `truncated=True` ——
+        调用方必须知道"你看到的不是全量、而且原件也不在".
+        """
+        try:
+            return {SPILL_REF_KEY: self._spill.save(tool_name, result)}
+        except OSError as exc:
+            encoded = json.dumps(result, ensure_ascii=False, sort_keys=True)
+            return {SPILL_REF_KEY: {
+                "path": None,
+                "bytes": size,
+                "preview": encoded[:_SPILL_PREVIEW_CHARS],
+                "truncated": True,
+                "spill_failed": True,
+                "error": str(exc)[:200],
+            }}
 
     # ---- audit ----
     def _record(self, tool: str, outcome: str, params: dict[str, Any],
