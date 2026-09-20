@@ -39,6 +39,7 @@ from traceops.evidence.templates import QueryTemplateError, default_registry
 from traceops.evidence.normalizer import _trace_batches, coerce_epoch, normalize
 from traceops.evidence.store import EvidenceStore
 from traceops.orchestration.detectors import (
+    ERROR_RATE_THRESHOLD,
     attribute_evidence,
     generate_hypotheses,
     logs_are_anomalous,
@@ -510,8 +511,33 @@ def _hypothesize_node(state: InvestigationState, config: RunnableConfig) -> dict
     return {"hypotheses": hypotheses, "missing_data": missing}
 
 
+#: 机制关键词：用于给模型"命中了什么"，而不是把日志原文喂进去。
+_MECHANISM_KEYWORDS = (
+    "pool", "timeout", "timed out", "exhausted", "refused", "unavailable",
+    "oom", "memory", "disk", "connection", "rate limit", "circuit",
+)
+
+
 def _evidence_summary(evidence_list: list[Evidence]) -> dict[str, Any]:
-    """给模型的证据摘要：只给类型/服务/计数，不给原始负载（上下文成本 + 防注入）。"""
+    """给模型的证据摘要。
+
+    **必须同时满足两个约束**：
+
+    1. **防注入 + 省 token**：原始日志文本不进 Prompt（日志是外部输入，
+       其中可能藏有指令）。这一条不能因为"信息量不够"就放弃。
+    2. **信息量足够到能提假设**：只给 `{count, services}` 时，模型知道
+       "有 3 条 redis 的日志"但不知道日志说了什么，只能靠 service_hint 猜 ——
+       于是"模型假设不如规则"会被误读成模型能力问题，而不是我们的输入问题。
+
+    折中的判据：**归一化后的结构化特征是安全的，自由文本不是**。
+
+    | 给 | 不给 |
+    |---|---|
+    | 错误率峰值 + 是否超阈值 | 日志原文 |
+    | 机制关键词命中（pool/timeout/...） | 完整 payload |
+    | span 操作名 + 最大耗时（OTLP 结构化字段） | 大段自由文本 |
+    | 计数与服务分布（原有锚点） | |
+    """
     summary: dict[str, Any] = {}
     for evidence in evidence_list:
         key = evidence.evidence_type.value + "s"
@@ -519,7 +545,68 @@ def _evidence_summary(evidence_list: list[Evidence]) -> dict[str, Any]:
         entry["count"] += 1
         if evidence.service_id and evidence.service_id not in entry["services"]:
             entry["services"].append(evidence.service_id)
+        data = evidence.normalized_data or {}
+
+        if evidence.evidence_type is EvidenceType.METRIC:
+            peak = _metric_peak(data)
+            if peak is not None:
+                entry["peak_value"] = peak
+                entry["above_threshold"] = peak >= ERROR_RATE_THRESHOLD
+        elif evidence.evidence_type is EvidenceType.LOG:
+            hits = _log_keyword_hits(data)
+            if hits:
+                # 只给命中的关键词，不给句子
+                entry.setdefault("keyword_hits", [])
+                for hit in hits:
+                    if hit not in entry["keyword_hits"]:
+                        entry["keyword_hits"].append(hit)
+        elif evidence.evidence_type is EvidenceType.TRACE:
+            slowest = _slowest_span(data)
+            if slowest is not None:
+                name, duration_ms = slowest
+                if name:
+                    entry.setdefault("slowest_operations", [])
+                    if name not in entry["slowest_operations"]:
+                        entry["slowest_operations"].append(name)
+                entry["max_duration_ms"] = max(entry.get("max_duration_ms", 0), duration_ms)
     return summary
+
+
+def _metric_peak(data: dict[str, Any]) -> float | None:
+    """指标序列的最大值 —— 数字是安全的，且模型需要它判断严重程度。"""
+    peak: float | None = None
+    for item in data.get("series") or []:
+        for point in item.get("values") or []:
+            try:
+                value = float(point[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            peak = value if peak is None else max(peak, value)
+    return peak
+
+
+def _log_keyword_hits(data: dict[str, Any]) -> list[str]:
+    """日志命中的**机制关键词**（不是日志原文）。"""
+    hits: list[str] = []
+    for record in data.get("records") or []:
+        blob = str(record.get("message", "")).lower()
+        for keyword in _MECHANISM_KEYWORDS:
+            if keyword in blob and keyword not in hits:
+                hits.append(keyword)
+    return hits
+
+
+def _slowest_span(data: dict[str, Any]) -> tuple[str, int] | None:
+    """最慢 span 的 (操作名, 毫秒)。操作名来自 OTLP 结构化字段，非自由文本。"""
+    best: tuple[str, int] | None = None
+    for span in data.get("spans") or []:
+        try:
+            duration_ms = int(float(span.get("duration_us") or 0) / 1000)
+        except (TypeError, ValueError):
+            continue
+        if best is None or duration_ms > best[1]:
+            best = (str(span.get("operation_name") or ""), duration_ms)
+    return best
 
 
 @_charged

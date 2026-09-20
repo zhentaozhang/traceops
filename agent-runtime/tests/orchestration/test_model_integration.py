@@ -156,9 +156,21 @@ class TestEvidenceSummaryIsMinimal:
         assert model.calls, "model should have been called"
         summary = model.calls[0].evidence_summary
         assert isinstance(summary, dict)
-        # 只应有类型键与 count/services，不含原始日志文本
+
+        # 核心安全约束：**原始日志文本绝不进 Prompt**（提示注入面）
         joined = str(summary)
         assert "pool exhausted" not in joined
         assert "ERROR" not in joined
+
+        # 允许的字段是"归一化后的结构化特征"，不是任意自由文本。
+        # 原断言限定为 {count, services},但那让模型只知道"有几条日志"、
+        # 不知道日志说了什么 —— 通电后会被误读成"模型不行"。
+        # 现在放开到结构化特征白名单，仍然禁止原文。
+        allowed = {
+            "count", "services",
+            "peak_value", "above_threshold",
+            "keyword_hits", "slowest_operations", "max_duration_ms",
+        }
         for entry in summary.values():
-            assert set(entry) <= {"count", "services"}
+            assert set(entry) <= allowed, (
+                f"unexpected field in prompt-facing summary: {set(entry) - allowed}")
