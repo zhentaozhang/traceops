@@ -337,20 +337,31 @@ class InvestigationWorker:
             stats.failed += 1
             return
 
-        run = InvestigationRun.open(incident_id=request.incident_id, run_id=request.investigation_run_id,
-                                    config=InvestigationConfigSnapshot())
-        run.queue()
-        run.start(node="plan")
-        self.sink.publish(started_event(run))
-        stats.run_ids.append(run.run_id)
-
         # **只构造一次**：旧写法先调 build_context 只为读一个 max_tool_calls，
         # 然后把整个 RunContext 丢掉再造一个。真实实现里那意味着连两次数据源、
         # 开两个 SQLite 连接，而且第一次的 Budget 上限可能被静默丢弃。
+        #
+        # 现在提前到建 run 之前：配置快照要**从实际运行配置派生**，
+        # 否则快照永远是默认值（接了模型却记成 deterministic-rules）。
         ctx = self.build_context(request)
         budget = BudgetManager(
             max_tool_calls=getattr(ctx.budget, "max_tool_calls", 50),
         )
+
+        model_client = getattr(ctx, "model", None)
+        config_snapshot = InvestigationConfigSnapshot.from_runtime(
+            model_name=getattr(model_client, "name", None) if model_client else None,
+            scope_depth=getattr(ctx, "scope_depth", 1),
+            max_tool_calls=getattr(ctx.budget, "max_tool_calls", 50),
+            config_version=getattr(request, "config_version", None),
+        )
+        run = InvestigationRun.open(incident_id=request.incident_id,
+                                    run_id=request.investigation_run_id,
+                                    config=config_snapshot)
+        run.queue()
+        run.start(node="plan")
+        self.sink.publish(started_event(run))
+        stats.run_ids.append(run.run_id)
         # 进度上报：每个节点完成时发一条 investigation.updated。
         # 此前整个调查只发 started_event 一条，前端只能看到 "RUNNING" ——
         # 跑了 30 秒的调查没有中间状态，SSE 也就无从展示。

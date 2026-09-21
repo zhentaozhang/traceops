@@ -71,6 +71,34 @@ class InvestigationConfigSnapshot:
     dataset_version: str | None = None
     config_version: str | None = None
 
+    @classmethod
+    def from_runtime(cls, *, model_name: str | None, scope_depth: int,
+                     max_tool_calls: int,
+                     config_version: str | None = None) -> "InvestigationConfigSnapshot":
+        """从**实际运行配置**派生快照。
+
+        为什么不能直接用默认值：默认值会让每次 run 的快照完全相同，
+        于是「两次跑同一事故结论不同，查出差在哪」这个承诺**无法兑现**。
+        更严重的是它会**撒谎** —— 接了模型却记成 `deterministic-rules`，
+        事后复盘会得出错误结论。
+
+        从运行时对象派生，而不是让调用方"记得填"：后者一定会漏。
+        """
+        provider = "none"
+        name = "deterministic-rules"
+        if model_name:
+            name = model_name
+            # 客户端名形如 "openai-compatible:<model>"，前缀即 provider
+            provider = model_name.split(":", 1)[0] if ":" in model_name else model_name
+        return cls(
+            model_provider=provider,
+            model_name=name,
+            # 采集深度与预算都会改变结论，因此属于可复现性信息
+            topology_version=f"file-declared;scope_depth={scope_depth}",
+            workflow_version=f"p0-v1;max_tool_calls={max_tool_calls}",
+            config_version=config_version,
+        )
+
     def to_dict(self) -> dict[str, str | None]:
         return {
             "model_provider": self.model_provider,
