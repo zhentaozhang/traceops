@@ -29,6 +29,7 @@ public class AlertController {
      */
     @PostMapping
     public ResponseEntity<IngestResult> ingest(@Valid @RequestBody AlertWebhookRequest request) {
-        return ResponseEntity.status(HttpStatus.ACCEPTED).body(incidentService.ingestAll(request.alerts()));
+        return ResponseEntity.status(HttpStatus.ACCEPTED)
+                .body(incidentService.ingestBatch(request.alerts(), request.dependencies()));
     }
 }

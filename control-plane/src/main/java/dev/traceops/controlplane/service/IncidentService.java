@@ -16,9 +16,11 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.HexFormat;
 import java.util.ArrayList;
+import java.util.Set;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import dev.traceops.controlplane.correlation.AlertCorrelation;
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.beans.factory.annotation.Value;
@@ -38,15 +40,19 @@ public class IncidentService {
     private final ObjectMapper mapper;
     private final String environment;
     private final String configVersion;
+    /** 关联时间窗：同服务/依赖服务的告警在这个窗内视为同一次故障。可配置。 */
+    private final java.time.Duration correlationWindow;
 
     public IncidentService(IncidentRepository incidents, OutboxRepository outbox, ObjectMapper mapper,
             @Value("${traceops.investigation.environment:demo}") String environment,
-            @Value("${traceops.investigation.config-version:cfg-local}") String configVersion) {
+            @Value("${traceops.investigation.config-version:cfg-local}") String configVersion,
+            @Value("${traceops.correlation.window-seconds:600}") long correlationWindowSeconds) {
         this.incidents = incidents;
         this.outbox = outbox;
         this.mapper = mapper;
         this.environment = environment;
         this.configVersion = configVersion;
+        this.correlationWindow = java.time.Duration.ofSeconds(correlationWindowSeconds);
     }
 
     @Transactional
@@ -60,6 +66,94 @@ public class IncidentService {
      * 但失败必须被**计数**（processed 与 created 的差就是去重/失败的数量），
      * 否则又回到"静默丢弃"的老问题。
      */
+    /**
+     * 批量接入**并按关联关系分组**。
+     *
+     * <p>为什么必须分组：同一批 webhook 里的多条告警往往描述**同一次故障**
+     * （同服务的错误率 + 延迟、依赖方与被依赖方同时报警）。
+     * 一条一条独立建事故会让一次故障裂成 N 个事故，值班同学要自己再拼回去 ——
+     * 而 `AlertCorrelation` 早就实现了这个判定，却从未被生产代码调用。
+     *
+     * <p>分组是**传递的**（union-find 式）：A 与 B 相关、B 与 C 相关 ⇒ A/B/C 同组。
+     *
+     * @param dependencies 可选的依赖边。缺省为空时只按指纹/同服务关联，
+     *                     宁可少合并也不要把无关告警揉在一起
+     */
+    public IngestResult ingestBatch(List<AlertWebhookRequest.Alert> alerts,
+                                    List<List<String>> dependencies) {
+        if (alerts == null || alerts.isEmpty()) {
+            throw new IllegalArgumentException("at least one alert is required");
+        }
+        AlertCorrelation correlation = new AlertCorrelation(
+                correlationWindow,
+                AlertCorrelation.staticTopology(edgesOf(dependencies)));
+
+        List<AlertCorrelation.Candidate> candidates = alerts.stream()
+                .map(a -> new AlertCorrelation.Candidate(a.fingerprint(), environment,
+                        a.service(), a.startsAt() == null ? Instant.now() : a.startsAt()))
+                .toList();
+
+        // group() 返回的是按位置分好的组；把每组的第一条作为代表去 ingest，
+        // 其余成员与它共享同一事故
+        List<List<AlertCorrelation.Candidate>> groups = correlation.group(candidates);
+        List<String> ids = new ArrayList<>();
+        String firstId = null;
+        IncidentStatus firstStatus = null;
+        boolean anyDedup = false;
+        int created = 0;
+        int processed = 0;
+
+        for (List<AlertCorrelation.Candidate> group : groups) {
+            IngestResult representative = null;
+            for (AlertCorrelation.Candidate member : group) {
+                AlertWebhookRequest.Alert alert = findAlert(alerts, member);
+                if (alert == null) {
+                    continue;
+                }
+                processed++;
+                if (representative == null) {
+                    representative = ingest(alert);
+                    if (!representative.deduplicated()) {
+                        created++;
+                    } else {
+                        anyDedup = true;
+                    }
+                    if (firstId == null) {
+                        firstId = representative.incidentId();
+                        firstStatus = representative.status();
+                    }
+                    ids.add(representative.incidentId());
+                } else {
+                    // 同组：不新建事故，直接复用代表的事故
+                    ids.add(representative.incidentId());
+                }
+            }
+        }
+
+        return new IngestResult(firstId, firstStatus, anyDedup, processed, created, ids);
+    }
+
+    private static Set<List<String>> edgesOf(List<List<String>> dependencies) {
+        if (dependencies == null) {
+            return Set.of();
+        }
+        return dependencies.stream()
+                .filter(e -> e != null && e.size() >= 2)
+                .map(e -> List.of(e.get(0), e.get(1)))
+                .collect(java.util.stream.Collectors.toSet());
+    }
+
+    private static AlertWebhookRequest.Alert findAlert(
+            List<AlertWebhookRequest.Alert> alerts, AlertCorrelation.Candidate candidate) {
+        for (AlertWebhookRequest.Alert alert : alerts) {
+            if (alert.fingerprint() != null
+                    && alert.fingerprint().equals(candidate.fingerprint())) {
+                return alert;
+            }
+        }
+        return null;
+    }
+
     public IngestResult ingestAll(List<AlertWebhookRequest.Alert> alerts) {
         if (alerts == null || alerts.isEmpty()) {
             throw new IllegalArgumentException("at least one alert is required");
