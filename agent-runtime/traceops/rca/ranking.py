@@ -251,9 +251,17 @@ def derive_signals(
                 if l.hypothesis_id == hypothesis.id
                 and l.relation_type == RelationType.SUPPORTS
                 and l.evidence_id in by_id]
-    contradicts = [l for l in links
+    # 矛盾计数必须与支持计数**同分母**：都只算"证据确实存在于库"的 link。
+    #
+    # 旧写法只看 link、不查证据是否存在，于是引用了幽灵证据的 CONTRADICTS
+    # 会被计入，而它的支持对应物会被跳过 —— 分母不一致。
+    # 后果很具体：`REFUTED` 的判据是「矛盾数 > 支持数」，
+    # 一条脏 link 就能把假设判成 REFUTED，而它引用的证据根本不在库里。
+    # 那是"证据驱动"原则的反面：结论来自无法核验的引用。
+    contradicts = [by_id[l.evidence_id] for l in links
                    if l.hypothesis_id == hypothesis.id
-                   and l.relation_type == RelationType.CONTRADICTS]
+                   and l.relation_type == RelationType.CONTRADICTS
+                   and l.evidence_id in by_id]
 
     observed_types = {EvidenceType.METRIC, EvidenceType.LOG, EvidenceType.TRACE}
     own_anomalies = [

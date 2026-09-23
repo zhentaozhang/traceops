@@ -185,6 +185,7 @@ def build_report(
         propagation_chain=[node.to_dict() for node in (propagation_chain or [])],
         missing_data=missing_data or [],
         abstained=diagnosis != "SUPPORTED",
+        root_cause_time=_root_cause_time(updated_hypotheses, links, evidence),
     )
 
     # 必须绑定本次事故：只查"ID 在 Store 里存在"会放过**引用了别处证据**的报告。
@@ -197,3 +198,48 @@ def build_report(
         detail = "; ".join(validation.errors) or ", ".join(validation.invalid_ids)
         raise ReportIntegrityError(f"report references invalid evidence: {detail}")
     return report
+
+
+def _root_cause_time(
+    hypotheses: list[RootCauseHypothesis],
+    links: list,
+    evidence_list: list,
+) -> datetime | None:
+    """根因开始时间 = rank1 候选**支持证据**里最早的 observed_at。
+
+    为什么必须来自证据而不是请求里的 fault_start：
+    `fault_start` 是告警**声称**的时间（假设），`observed_at` 是我们实际
+    **观测到**的时间（事实）。报告只陈述事实 —— 拿 fault_start 充数会让
+    "证据可信"这条原则失效，事后复盘也查不出报告其实没验证过时间。
+
+    为什么取"最早"而不是"最晚"：根因是故障的**起点**，
+    最晚的证据只能说明影响持续到那时。
+
+    没有 rank1、没有支持证据、或支持证据不在证据集里 → 返回 None。
+    """
+    ranked_top = next((h for h in hypotheses if (h.rank or 0) == 1), None)
+    if ranked_top is None:
+        return None
+
+    # 只取"支持"关系的证据 ID；反驳/无关的证据不能用来定根因时间
+    supported_ids: set[str] = set()
+    for link in links:
+        hypothesis_id = getattr(link, "hypothesis_id", None)
+        relation = getattr(link, "relation_type", None)
+        relation_value = getattr(relation, "value", relation)
+        if hypothesis_id != ranked_top.id:
+            continue
+        if str(relation_value).upper() == "SUPPORTS":
+            evidence_id = getattr(link, "evidence_id", None)
+            if evidence_id:
+                supported_ids.add(evidence_id)
+
+    if not supported_ids:
+        return None
+
+    times = [
+        item.observed_at
+        for item in evidence_list
+        if item.id in supported_ids and item.observed_at is not None
+    ]
+    return min(times) if times else None

@@ -292,11 +292,74 @@ class EventNormalizer:
                 "total_records": len(events), "truncated": len(trimmed) < len(events)}
 
 
+class ProfileNormalizer:
+    """Pyroscope 持续剖析 → 热点帧列表。
+
+    为什么需要这一维：对「为什么慢」类根因，profile 比 trace 更直接 ——
+    trace 说"哪个调用慢"，profile 说"慢在哪个函数"。
+
+    接受的形状（Pyroscope `/api/v1/flamegraph`）：
+    ```
+    {"flamegraph": {"names": [...], "values": [...self samples...]},
+     "metadata": {"sampleRate": ..., "spyName": ..., "units": ...}}
+    ```
+
+    只提取 **self value 最高的 N 帧**，不做调用树重建：
+    证据需要的是"热点在哪"，不是完整火焰图（后者对模型是纯噪音）。
+    """
+
+    kind = "profile"
+    #: 最多保留的热点帧数。超过这个数量对诊断没有增益，只会膨胀证据。
+    MAX_HOT_FRAMES = 20
+    #: 聚合根帧名。它们的 value 是整棵树的合计，因此永远排最前，
+    #: 但它们不是任何具体函数 —— 报"热点是 total"没有任何诊断价值。
+    _ROOT_FRAMES = ("total", "(root)", "root", "all")
+
+    def normalize(self, raw: dict[str, Any], max_records: int) -> dict[str, Any]:
+        if not isinstance(raw, dict) or "flamegraph" not in raw:
+            raise ValueError(
+                "profile payload: expected Pyroscope shape {flamegraph: {names, values}}")
+        flame = raw["flamegraph"] or {}
+        names = flame.get("names") or []
+        values = flame.get("values") or []
+        if not names or not values:
+            raise ValueError("profile payload: flamegraph has no names/values")
+
+        frames: list[dict[str, Any]] = []
+        for name, value in zip(names, values):
+            label = str(name).strip()
+            if label.lower() in self._ROOT_FRAMES:
+                # 聚合根节点：不是具体函数，排除
+                continue
+            try:
+                self_value = int(value)
+            except (TypeError, ValueError):
+                continue
+            frames.append({"frame": label, "self_value": self_value})
+
+        # 最热在前 —— 调用方不该还要自己排序
+        frames.sort(key=lambda f: f["self_value"], reverse=True)
+        limit = min(self.MAX_HOT_FRAMES, max_records) if max_records else self.MAX_HOT_FRAMES
+        hot = frames[:limit]
+
+        metadata = raw.get("metadata") or {}
+        return {
+            "kind": self.kind,
+            "total_records": len(frames),
+            "hot_frames": hot,
+            "truncated": len(hot) < len(frames),
+            "sample_rate": metadata.get("sampleRate"),
+            "spy_name": metadata.get("spyName"),
+            "units": metadata.get("units"),
+        }
+
+
 _NORMALIZERS: dict[EvidenceType, Any] = {
     EvidenceType.METRIC: MetricNormalizer(),
     EvidenceType.LOG: LogNormalizer(),
     EvidenceType.TRACE: TraceNormalizer(),
     EvidenceType.EVENT: EventNormalizer(),
+    EvidenceType.PROFILE: ProfileNormalizer(),
 }
 
 

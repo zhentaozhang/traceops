@@ -28,6 +28,15 @@ class EvidenceType(str, Enum):
     LOG = "log"
     TRACE = "trace"
     EVENT = "event"
+    # 持续剖析（Pyroscope）：CPU/内存热点。
+    #
+    # 为什么是独立类型而不是塞进 metric：它回答的是**完全不同的问题**。
+    #   metric -> 慢了多少（错误率/分位）
+    #   trace  -> 哪个调用慢（跨度）
+    #   profile-> 慢在哪个函数/哪一行
+    # 没有 profile，`latency_degradation` 只能停在"redis.command 慢 2.1s"，
+    # 无法回答"慢在解析还是锁竞争" —— 而答案就在 profile 里。
+    PROFILE = "profile"
 
 
 class RelationType(str, Enum):
@@ -224,6 +233,14 @@ class RCAReport(BaseModel):
     )
     missing_data: list[str] = Field(default_factory=list)
     abstained: bool = False
+    # 根因**开始**的时间。来自 rank1 候选支持证据的最早 observed_at，
+    # 没有支持证据时为 None（**不拿 fault_start 充数**）。
+    #
+    # 为什么必须区分：fault_start 是告警**声称**的时间，observed_at 是
+    # 我们实际**观测到**的时间。报告只能陈述观测到的事实。
+    # OpenRCA 的答案是三元素（时间±60s / 组件 / 原因），缺少时间这一维
+    # 会让我们的答案粒度低一档，也无从度量时间准确度。
+    root_cause_time: datetime | None = None
     generated_at: datetime = Field(default_factory=_utcnow)
 
     def all_evidence_ids(self) -> set[str]:
