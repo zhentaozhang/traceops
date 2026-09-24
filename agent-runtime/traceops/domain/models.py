@@ -241,6 +241,11 @@ class RCAReport(BaseModel):
     # OpenRCA 的答案是三元素（时间±60s / 组件 / 原因），缺少时间这一维
     # 会让我们的答案粒度低一档，也无从度量时间准确度。
     root_cause_time: datetime | None = None
+    # 产出本报告的调查策略 digest（见 `evaluation/investigation_profile.py`）。
+    #
+    # 为什么必须记录：两次调查同一事故结论不同时，要能回答
+    # "是策略变了还是数据变了"。没有这个字段就只能靠猜。
+    profile_digest: str | None = None
     generated_at: datetime = Field(default_factory=_utcnow)
 
     def all_evidence_ids(self) -> set[str]:

@@ -92,12 +92,15 @@ class TestConfigRendering:
         """渲染成 RunContext 参数后，差异必须仍然只有一个键。"""
         e3 = arm_config("E3")
         e4 = arm_config("E4")
-        # arm_id 是标识符不是能力，比较时排除
+        # arm_id 是标识符、profile_digest 是策略指纹 —— 两者**本就该**不同，
+        # 比较"能力差异"时排除。剩下的差异必须恰好是证据引擎。
         differing = {
             k for k in set(e3) | set(e4)
-            if k != "arm_id" and e3.get(k) != e4.get(k)
+            if k not in ("arm_id", "profile_digest") and e3.get(k) != e4.get(k)
         }
         assert differing == {"evidence_engine"}, f"got {differing}"
+        # 顺便钉住：策略指纹 must 不同（否则这两臂无法区分）
+        assert e3["profile_digest"] != e4["profile_digest"]
 
     def test_config_includes_fixed_conditions(self):
         """固定条件必须显式出现在配置里，否则"同一环境"只是口头承诺。"""

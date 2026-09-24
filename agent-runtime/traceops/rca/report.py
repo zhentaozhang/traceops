@@ -66,6 +66,7 @@ def build_report(
     correlation_notes: list[str] | None = None,
     propagation_chain: list | None = None,
     incident_id: str | None = None,
+    profile_digest: str | None = None,
     semantic_checks: dict | None = None,
     topology=None,
 ) -> RCAReport:
@@ -186,6 +187,7 @@ def build_report(
         missing_data=missing_data or [],
         abstained=diagnosis != "SUPPORTED",
         root_cause_time=_root_cause_time(updated_hypotheses, links, evidence),
+        profile_digest=profile_digest,
     )
 
     # 必须绑定本次事故：只查"ID 在 Store 里存在"会放过**引用了别处证据**的报告。

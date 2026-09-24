@@ -119,6 +119,31 @@ def diff_arms(from_arm: str, to_arm: str) -> list[str]:
     return [name for name in _CAPABILITY_FIELDS if getattr(left, name) != getattr(right, name)]
 
 
+def arm_profile(arm_id: str):
+    """把实验臂渲染成 **InvestigationProfile**（而不是零散的能力位字典）。
+
+    为什么必须走 profile：`arm_config` 只能声明能力位，无法证明
+    阈值/模板/权重在各臂之间一致。一旦有人调了阈值，
+    E4/E5 的差异就不再可归因 —— 而**没有人会发现**。
+    profile 的 digest 把这个假设变成可校验的事实。
+    """
+    from dataclasses import replace
+
+    from evaluation.investigation_profile import DEFAULT_PROFILE
+
+    if arm_id not in ARMS:
+        raise KeyError(f"unknown arm: {arm_id!r}")
+    arm = ARMS[arm_id]
+    return replace(
+        DEFAULT_PROFILE,
+        enable_model=arm.uses_model,
+        enable_tools=arm.uses_tools,
+        enable_evidence_engine=arm.uses_evidence_engine,
+        enable_semantic_gate=arm.uses_verification,
+        enable_contradiction=arm.uses_verification,
+    )
+
+
 def arm_config(arm_id: str) -> dict:
     """把一个实验臂渲染成可传给 harness 的配置。
 
@@ -136,8 +161,12 @@ def arm_config(arm_id: str) -> dict:
         "evidence_engine": arm.uses_evidence_engine,
         "uses_verification": arm.uses_verification,
         # 与 RunContext 的实际字段对齐：E5 才启用语义/矛盾校验
+        "evidence_engine": arm.uses_evidence_engine,
         "enable_semantic_gate": arm.uses_verification,
         "enable_contradiction": arm.uses_verification,
+        # 策略 digest：运行时据此**证明**各臂用的是同一套阈值/模板/权重，
+        # 而不是只有声明。
+        "profile_digest": arm_profile(arm_id).digest(),
     })
     return config
 
