@@ -2,9 +2,18 @@ package dev.traceops.controlplane.web;
 
 import dev.traceops.controlplane.investigation.FindingHistoryRepository;
 import dev.traceops.controlplane.investigation.InvestigationFindingRepository;
+import dev.traceops.controlplane.domain.Incident;
+import dev.traceops.controlplane.domain.IncidentRepository;
+import dev.traceops.controlplane.service.IncidentService;
+import jakarta.validation.Valid;
 import java.util.List;
 import java.util.NoSuchElementException;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -21,11 +30,44 @@ public class FindingController {
 
     private final InvestigationFindingRepository findings;
     private final FindingHistoryRepository history;
+    private final IncidentService incidentService;
+    private final IncidentRepository incidents;
 
     public FindingController(InvestigationFindingRepository findings,
-                             FindingHistoryRepository history) {
+                             FindingHistoryRepository history,
+                             IncidentService incidentService,
+                             IncidentRepository incidents) {
         this.findings = findings;
         this.history = history;
+        this.incidentService = incidentService;
+        this.incidents = incidents;
+    }
+
+    /**
+     * 人工创建事故并启动调查（PRD 5.1）。
+     *
+     * <p>为什么必须有这个入口：告警不是事故的唯一来源。SRE 观察到用户投诉、
+     * 或复盘时发现"这次故障没触发告警"，都需要能手工立事故并调查 ——
+     * 而"没有告警的故障"恰恰是最难查的一类。
+     *
+     * <p>与告警路径的关键差异是**没有 fingerprint、不去重**：
+     * 人工创建是主动行为，不该被指纹规则吞掉。
+     */
+    @PostMapping
+    public ResponseEntity<ManualIncidentResult> createIncident(
+            @Valid @RequestBody ManualIncidentRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(incidentService.createManual(request));
+    }
+
+    /** 事故列表（可按服务过滤）。带 origin 以便区分告警驱动与人工创建。 */
+    @GetMapping
+    public List<IncidentResponse> listIncidents(
+            @RequestParam(required = false) String service) {
+        List<Incident> found = service == null || service.isBlank()
+                ? incidents.findAllByOrderByCreatedAtDesc()
+                : incidents.findByServiceOrderByCreatedAtDesc(service);
+        return found.stream().map(IncidentResponse::from).toList();
     }
 
     /** 404 表示"还没有结论"，不是"事故不存在" —— 调用方应先查事故再查结论。 */

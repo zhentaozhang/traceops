@@ -16,6 +16,9 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.HexFormat;
 import java.util.ArrayList;
+import dev.traceops.controlplane.domain.IncidentOrigin;
+import dev.traceops.controlplane.web.ManualIncidentRequest;
+import dev.traceops.controlplane.web.ManualIncidentResult;
 import java.util.Set;
 import java.util.List;
 import java.util.Map;
@@ -79,6 +82,34 @@ public class IncidentService {
      * @param dependencies 可选的依赖边。缺省为空时只按指纹/同服务关联，
      *                     宁可少合并也不要把无关告警揉在一起
      */
+    /**
+     * 人工创建事故并立即启动一次调查。
+     *
+     * <p>为什么和告警路径分开而不是复用 {@code ingest}：两者的关键差异是
+     * 指纹与去重语义 —— 人工创建是**主动行为**，不该被指纹规则吞掉。
+     * 合在一个方法里会迫使每处调用都判断"这次要不要去重"，容易漏。
+     */
+    public ManualIncidentResult createManual(ManualIncidentRequest request) {
+        Instant now = Instant.now();
+        String id = UUID.randomUUID().toString();
+        Incident incident = Incident.openManual(
+                id, request.service(), request.title(),
+                request.severity() == null || request.severity().isBlank()
+                        ? "warning" : request.severity(), now);
+        incidents.save(incident);
+
+        String runId = EventMessages.newRunId();
+        Map<String, Object> message = EventMessages.investigationRequested(
+                incident.getId(), request.service(), runId, environment, configVersion,
+                "manual", now);
+        outbox.save(OutboxEvent.pending(EventMessages.newEventId(),
+                EventMessages.INVESTIGATION_REQUESTED, runId, 1L, toJson(message), now));
+        incident.transitionTo(IncidentStatus.INVESTIGATING, now);
+        incidents.save(incident);
+        return new ManualIncidentResult(incident.getId(), incident.getStatus(),
+                IncidentOrigin.MANUAL, runId);
+    }
+
     public IngestResult ingestBatch(List<AlertWebhookRequest.Alert> alerts,
                                     List<List<String>> dependencies) {
         if (alerts == null || alerts.isEmpty()) {
@@ -192,8 +223,11 @@ public class IncidentService {
         Instant now = Instant.now();
         String fingerprint = alert.fingerprint();
 
-        Optional<Incident> active = incidents.findFirstByFingerprintAndStatusNotInOrderByCreatedAtDesc(
-                fingerprint, List.of(IncidentStatus.RESOLVED, IncidentStatus.FAILED));
+        // 只匹配 ALERT 来源：人工事故没有指纹，不能参与告警去重
+        Optional<Incident> active =
+                incidents.findFirstByFingerprintAndOriginAndStatusNotInOrderByCreatedAtDesc(
+                        fingerprint, IncidentOrigin.ALERT,
+                        List.of(IncidentStatus.RESOLVED, IncidentStatus.FAILED));
         if (active.isPresent()) {
             return new IngestResult(active.get().getId(), active.get().getStatus(), true);
         }
