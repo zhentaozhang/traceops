@@ -31,6 +31,7 @@ from enum import Enum
 from pathlib import Path
 
 from traceops.remediation.approval import ApprovalDecision
+from traceops.security.access import Principal
 
 
 class ApprovalRequestStatus(str, Enum):
@@ -153,12 +154,35 @@ class ApprovalStore:
         return request
 
     def decide(self, request_id: str, *, decision: ApprovalDecision, approver: str,
-               reason: str) -> ApprovalRequest:
-        """记录决策。只能决定一次 —— 否则审计无法判断哪个是最终决定。"""
+               reason: str, principal: "Principal | None" = None) -> ApprovalRequest:
+        """记录决策。只能决定一次 —— 否则审计无法判断哪个是最终决定。
+
+        `principal` 提供时**强制授权判定**（权限 + 职责分离）。
+        为什么让它可选：既有的调用点（管理脚本、测试）没有身份上下文，
+        强塞会让它们全部失败；但**所有面向用户的路径都必须传**。
+        """
         if not approver or not approver.strip():
             raise ValueError("approver is required")
         if not reason or not reason.strip():
             raise ValueError("decision reason is required")
+
+        if principal is not None:
+            from traceops.security.access import Action, authorize, require_separation_of_duty
+
+            # 权限：只有 APPROVER 能批
+            authorize(principal, Action.APPROVE_REMEDIATION)
+            current_for_duty = self.get(request_id)
+            if current_for_duty is None:
+                raise KeyError(f"unknown approval request: {request_id}")
+            # 职责分离：不能批自己提的
+            require_separation_of_duty(
+                requested_by=current_for_duty.requested_by,
+                approver=principal.name)
+            # 声明的 approver 必须与实际主体一致，否则审计记录的是假人
+            if approver.strip().lower() != principal.name.strip().lower():
+                raise ValueError(
+                    f"approver {approver!r} does not match authenticated "
+                    f"principal {principal.name!r}")
 
         with self._lock:
             current = self._get_locked(request_id)
