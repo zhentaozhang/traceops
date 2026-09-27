@@ -186,8 +186,12 @@ def build_request(scenario: Scenario) -> InvestigationRequest:
     )
 
 
-def run_scenario(scenario: Scenario) -> ScenarioOutcome:
-    """执行一次调查并打分。每次运行使用全新的 store / budget，互不污染。"""
+def run_scenario(scenario: Scenario, *, model=None) -> ScenarioOutcome:
+    """执行一次调查并打分。每次运行使用全新的 store / budget，互不污染。
+
+    `model` 传入时启用 LLM 假设生成（E1/E2 消融臂需要它；
+    不传则走纯确定性路径，即 E3/E4/E5）。
+    """
     store = EvidenceStore()
     adapters = ScenarioAdapters(scenario)
     topology = (
@@ -201,6 +205,7 @@ def run_scenario(scenario: Scenario) -> ScenarioOutcome:
         budget=BudgetManager(max_tool_calls=MAX_TOOL_CALLS),
         topology=topology,
         scope_depth=scenario.scope_depth,
+        model=model,
     )
     result = run_investigation(build_request(scenario), ctx)
     return score_scenario(scenario, result)
