@@ -56,11 +56,15 @@ services:
       - "3200:3200"   # http query
       - "4317:4317"   # otlp grpc
       - "4318:4318"   # otlp http
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3200/ready"]
-      interval: 10s
-      timeout: 5s
-      retries: 8
+    # **没有 healthcheck**：grafana/tempo:3.0.0 是 distroless 镜像 ——
+    # 容器里没有 sh、没有 wget、没有 curl（实测 `which` 本身都不存在），
+    # 所以任何 shell 形式的 healthcheck 都必然失败，并把服务标成 unhealthy，
+    # 进而让 `depends_on: service_healthy` 的 grafana 起不来。
+    #
+    # 实测该镜像本身是**健康的**：`curl http://localhost:3200/ready` 返回 200。
+    # 与其挂一个永远失败的探针（false negative，比没有更糟），
+    # 不如让依赖方直接探测 HTTP —— 见 grafana 的 depends_on 用 service_started。
+    restart: unless-stopped
 
   grafana:
     image: grafana/grafana:13.3
@@ -80,8 +84,9 @@ services:
         condition: service_healthy
       loki:
         condition: service_healthy
+      # 用 service_started 而不是 service_healthy：tempo 镜像无法自探（见上）
       tempo:
-        condition: service_healthy
+        condition: service_started
 
   # Grafana MCP server：**独立二进制**，不是 Grafana 内置功能。
   # Grafana 11.0.0 / 11.1.0 都没有 /mcp 端点（实测 handler=notfound 404）；

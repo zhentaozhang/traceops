@@ -12,6 +12,18 @@ spring:
     hibernate:
       ddl-auto: ${TRACEOPS_DDL_AUTO:create-drop}
     open-in-view: false
+  data:
+    redis:
+      # 必须显式配置：没有这一段时 Spring Boot **不会**创建
+      # RedisConnectionFactory，注入的 StringRedisTemplate 是未初始化的空壳 ——
+      # 而它的操作在未初始化时**不抛异常、返回 null**，于是 relay 把事件
+      # 标记成"已发布"，Redis 里却什么都没有（静默丢失）。
+      #
+      # 这不是理论风险：实测 publish() 报成功，但 Redis 的 commandstats
+      # 里根本没有 xadd，流长度为 0。
+      host: ${TRACEOPS_REDIS_HOST:localhost}
+      port: ${TRACEOPS_REDIS_PORT:6379}
+      timeout: 3s
 
 traceops:
   events:

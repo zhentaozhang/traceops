@@ -712,7 +712,10 @@ class TestIntegrationWithEventSource:
                 b"*2\r\n"
                 b"$7\r\npayload\r\n"
                 b"$2\r\n{}\r\n")
-        server = ScriptedRedisServer([claim, read])
+        # `+OK` 是 XGROUP CREATE 的回执：poll 现在会先确保消费者组存在
+        # （全新部署必需 —— 否则真实 Redis 会报 NOGROUP）。
+        ok_reply = b"+OK\r\n"
+        server = ScriptedRedisServer([ok_reply, claim, read])
         transport = SocketPairTransport(server, host="127.0.0.1", timeout=1.0)
         transport.connect()
         try:

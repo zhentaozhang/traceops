@@ -491,6 +491,17 @@ class RespRedisTransport:
             return []
         return _streams_from_raw(reply)
 
+    def xgroup_create(self, stream: str, group: str, *, start_id: str = "0",
+                      mkstream: bool = True) -> None:
+        """`XGROUP CREATE <s> <g> <start> MKSTREAM`。
+
+        已存在时抛 `RedisCommandError("BUSYGROUP ...")` —— 调用方应视为正常。
+        """
+        args: list[Any] = ["XGROUP", "CREATE", stream, group, start_id]
+        if mkstream:
+            args.append("MKSTREAM")
+        self._command(*args)
+
     def xack(self, stream: str, group: str, entry_id: str) -> int:
         """`XACK <stream> <group> <id>`，返回被移出 PEL 的条数。"""
         stream = _require_text("stream", stream)

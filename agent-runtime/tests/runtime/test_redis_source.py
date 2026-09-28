@@ -108,6 +108,11 @@ class ScriptedTransport:
                                           "stream": stream, "count": count, "block_ms": block_ms}))
         return self.read_batches.pop(0) if self.read_batches else []
 
+    def xgroup_create(self, stream, group, *, start_id="0", mkstream=True):
+        """消费者组引导：真实传输层会发 XGROUP CREATE；替身只需记录。"""
+        self.calls.append(("xgroup_create", {"stream": stream, "group": group,
+                                             "start_id": start_id, "mkstream": mkstream}))
+
     def xack(self, stream, group, entry_id):
         self.calls.append(("xack", {"stream": stream, "group": group, "entry_id": entry_id}))
         self.acked.append((stream, group, entry_id))
@@ -166,10 +171,16 @@ class TestPollContract:
         assert [m["id"] for m in messages] == ["1700000000000-0", "1700000000005-0"]
         assert messages[0]["payload"]["payload"]["investigation_run_id"] == "run-pending"
         # 认领先于读取，且新消息的 count 扣掉已认领数量
-        assert [name for name, _ in transport.calls] == ["xautoclaim", "xreadgroup"]
-        assert transport.calls[0][1]["start_id"] == DEFAULT_RECLAIM_START_ID
-        assert transport.calls[0][1]["min_idle_ms"] == 60_000
-        assert transport.calls[1][1]["count"] == 9
+        # 现在会先确保消费者组存在（全新部署必需），再认领+读取。
+        # 只断言**读取阶段**的相对顺序，不钉死引导步骤的绝对位置。
+        read_phase = [name for name, _ in transport.calls
+                      if name in ("xautoclaim", "xreadgroup")]
+        assert read_phase == ["xautoclaim", "xreadgroup"]
+        claim = next(p for n, p in transport.calls if n == "xautoclaim")
+        assert claim["start_id"] == DEFAULT_RECLAIM_START_ID
+        assert claim["min_idle_ms"] == 60_000
+        read = next(p for n, p in transport.calls if n == "xreadgroup")
+        assert read["count"] == 9
 
     def test_empty_autoclaim_does_not_block_new_reads(self):
         """没有 pending 不是异常路径，正常读新消息即可。"""
@@ -181,8 +192,10 @@ class TestPollContract:
 
         assert len(messages) == 1
         assert messages[0]["id"] == "1700000000000-1"
-        assert transport.calls[0][0] == "xautoclaim"
-        assert transport.calls[1][0] == "xreadgroup"
+        names = [n for n, _ in transport.calls]
+        assert "xautoclaim" in names and "xreadgroup" in names
+        # 认领必须排在读取之前（崩溃恢复优先）
+        assert names.index("xautoclaim") < names.index("xreadgroup")
 
     def test_empty_stream_returns_empty_list(self):
         """空批次必须是空 list（不是 None），调用方会直接迭代。"""
@@ -193,7 +206,11 @@ class TestPollContract:
         assert messages == []
         assert isinstance(messages, list)
         # 试探性读取也要走完两条命令，否则无法区分"没消息"和"没调用"
-        assert [name for name, _ in transport.calls] == ["xautoclaim", "xreadgroup"]
+        # 现在会先确保消费者组存在（全新部署必需），再认领+读取。
+        # 只断言**读取阶段**的相对顺序，不钉死引导步骤的绝对位置。
+        read_phase = [name for name, _ in transport.calls
+                      if name in ("xautoclaim", "xreadgroup")]
+        assert read_phase == ["xautoclaim", "xreadgroup"]
 
     def test_extra_stream_fields_do_not_break_parsing(self):
         """entry 上除 payload 外的字段（如 ts / producer）是允许的。"""
@@ -436,6 +453,9 @@ class TestQuotaAccounting:
             def xreadgroup(self, group, consumer, stream, count, block_ms):
                 self.xreadgroup_counts.append(count)
                 return []
+
+            def xgroup_create(self, stream, group, *, start_id="0", mkstream=True):
+                pass
 
             def xack(self, stream, group, entry_id):
                 return 1

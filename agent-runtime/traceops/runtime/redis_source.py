@@ -107,6 +107,11 @@ class UnimplementedRedisTransport:
                    block_ms: int) -> list[tuple[str, list[tuple[str, dict[str, str]]]]]:
         raise NotImplementedError(self._MESSAGE)
 
+    def xgroup_create(self, stream: str, group: str, *, start_id: str = "0",
+                      mkstream: bool = True) -> None:
+        """`XGROUP CREATE <s> <g> <start> MKSTREAM`；已存在时抛 BUSYGROUP。"""
+        ...
+
     def xack(self, stream: str, group: str, entry_id: str) -> int:
         raise NotImplementedError(self._MESSAGE)
 
@@ -175,12 +180,45 @@ class RedisStreamEventSource:
         self.min_idle_ms = min_idle_ms
         # XAUTOCLAIM 游标：跨轮保留，避免每轮重扫 PEL 头部导致尾部饿死
         self._claim_cursor: str = DEFAULT_RECLAIM_START_ID
+        #: 消费者组是否已确保存在。只做一次 —— 每轮都建组是白费往返。
+        self._group_ready = False
+
+    def _ensure_group(self) -> None:
+        """确保消费者组存在（幂等）。
+
+        为什么必须有这一步：Java 侧只做 `XADD`（生产者不建组，这是 Redis
+        Streams 的正常分工），而本类直接 `XREADGROUP`。于是**全新部署**里
+        读取必然报 `NOGROUP No such key ... or consumer group ...`，
+        看起来像"Redis 有问题"，实际是少了一个初始化步骤。
+
+        三个细节决定正确性：
+
+        1. `MKSTREAM`：流还不存在时也要能建组（否则首个消息到来前永远建不了）
+        2. 起始位置用 **`0` 而不是 `$`**：`$` 从"现在"开始，会静默跳过
+           **已积压**的事件 —— 而首次部署最需要处理的正是那些。
+           运维看到的症状是"事故建了但永远没结论"，日志里却一切正常。
+        3. `BUSYGROUP` 必须吞掉：组已存在是正常情况（重启、多 worker 并发）。
+        """
+        if self._group_ready:
+            return
+        try:
+            # 走**公开**接口而不是 `_command`：私有命令让测试替身必须模仿
+            # 内部细节，既脆弱又逼人抄实现。传输层只需暴露 xgroup_create。
+            self.transport.xgroup_create(
+                self.stream, self.group, start_id="0", mkstream=True)
+        except Exception as exc:
+            text = str(exc).upper()
+            if "BUSYGROUP" not in text:
+                raise
+            # 已存在 → 正常，继续
+        self._group_ready = True
 
     def poll(self, *, limit: int = 50) -> list[dict[str, Any]]:
         """先认领 pending，再读新消息；合计不超过 limit。"""
         if limit <= 0:
             return []
 
+        self._ensure_group()
         messages: list[dict[str, Any]] = []
         # 1) 崩溃恢复：把本 consumer 名下"超时未 ACK"的 pending 拿回来。
         #    游标必须跨轮保留：真实 Redis 的 XAUTOCLAIM 返回 next_cursor，

@@ -58,7 +58,6 @@ public class IncidentService {
         this.correlationWindow = java.time.Duration.ofSeconds(correlationWindowSeconds);
     }
 
-    @Transactional
     /**
      * 批量接入：逐条处理，并汇总计数。
      *
@@ -89,6 +88,7 @@ public class IncidentService {
      * 指纹与去重语义 —— 人工创建是**主动行为**，不该被指纹规则吞掉。
      * 合在一个方法里会迫使每处调用都判断"这次要不要去重"，容易漏。
      */
+    @Transactional
     public ManualIncidentResult createManual(ManualIncidentRequest request) {
         Instant now = Instant.now();
         String id = UUID.randomUUID().toString();
@@ -110,6 +110,7 @@ public class IncidentService {
                 IncidentOrigin.MANUAL, runId);
     }
 
+    @Transactional
     public IngestResult ingestBatch(List<AlertWebhookRequest.Alert> alerts,
                                     List<List<String>> dependencies) {
         if (alerts == null || alerts.isEmpty()) {
@@ -213,6 +214,7 @@ public class IncidentService {
         return new IngestResult(firstId, firstStatus, anyDeduplicated, processed, created, ids);
     }
 
+    @Transactional
     public IngestResult ingest(AlertWebhookRequest.Alert alert) {
         if (alert == null || alert.fingerprint() == null || alert.fingerprint().isBlank()) {
             throw new IllegalArgumentException("alert fingerprint is required");
