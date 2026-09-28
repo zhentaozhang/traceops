@@ -1,7 +1,7 @@
 {
   "scenario_id": "F-011",
   "name": "Tie broken by reported symptom, which rules cannot see",
-  "description": "平局 + **告警原文里有破局线索**，但规则读不到它。\n\n构造：\n- `alpha-payment` 与 `zulu-cache` 同为 api-gateway 的下游叶子，拓扑深度相同\n- 两者的**错误率异常程度完全相同** → 规则的所有区分规则失效，只能靠字母序\n- 字母序让 `alpha-payment` 排第一（**错误**）\n- 但告警原文写明：`traced to cache tier: zulu-cache responses degraded`\n- 且 `zulu-cache` 有慢 span（1.8s）→ 支持 `latency_degradation`\n\n关键：**信息是够的，只是规则不读自然语言**。\n所以这条场景能区分「规则」与「规则+模型」：\n模型读 summary 能把 `zulu-cache` 提到第一，规则做不到。\n\n诚实声明：这测的是「能否利用自然语言线索」这一项具体能力，\n不是通用诊断能力。F-010 保留，用于测「信息确实不足时是否诚实弃权」。",
+  "description": "平局 + **告警原文里有破局线索**，且真正出问题的服务**在采集范围内**。\n\n构造：\n- `alpha-payment` 与 `zulu-cache` 都触发错误率异常，程度相同 → 规则区分规则失效\n- 字母序让 `alpha-payment` 排第一（**错误**）\n- 但告警原文写明 `traced to cache tier: zulu-cache responses degraded`\n- `zulu-cache` 有 1.8s 慢 span（`alpha-payment` 依赖它，因此它在调查层内）\n\n关键拓扑设计：`alpha-payment → zulu-cache` 这条依赖边是必须的。\n没有它，`zulu-cache` 只是同父兄弟，**不在采集范围内** ——\n那样模型即便读懂了线索，也拿不到证据去支撑，语义闸门会把它判成 coverage=0。\n（这是我第一次构造时踩的坑：模型判对了机制，但候选没证据，仍被判 inconclusive。）\n\n所以这条场景测的是**两件事同时成立**：\n1. 线索能破局（模型读得到，规则读不到）\n2. 该服务确实在证据覆盖范围内",
   "service_hint": "alpha-payment",
   "fault_start": "2026-10-30T10:02:00Z",
   "window_start": "2026-10-30T10:00:00Z",
@@ -13,6 +13,10 @@
     ],
     [
       "api-gateway",
+      "zulu-cache"
+    ],
+    [
+      "alpha-payment",
       "zulu-cache"
     ]
   ],

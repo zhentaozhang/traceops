@@ -41,6 +41,12 @@ class CandidateSignals:
     supporting_evidence_count: int = 0
     # R-007：候选是否给出了具体组件（区别于"只知道服务"）
     has_specific_component: bool = False
+    #: 该候选**自己**的支持观测里命中了哪些期望 marker。
+    #:
+    #: 用于排序时的机制匹配度（见 `_mechanism_fit`）。与
+    #: `supporting_evidence_count` 不同：后者只是条数，前者衡量
+    #: "机制与证据类型对不对得上"。
+    observed_markers: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -107,6 +113,50 @@ def _evaluate(signals: CandidateSignals) -> tuple[int, HypothesisStatus, list[st
     return score, status, rules
 
 
+def _observed_markers_for(supports: list, service: str | None) -> set[str]:
+    """从某候选自己的支持证据里提取命中的观测 marker。
+
+    复用 `semantic._observed_markers` —— 与语义闸门同一份判据，
+    避免出现第二份"什么算 error_rate_rise"的定义。
+    """
+    if not supports:
+        return set()
+    try:
+        from traceops.rca.semantic import _observed_markers
+
+        return _observed_markers(supports, service or "", None)
+    except Exception:
+        return set()
+
+
+def _mechanism_fit(hypothesis, signals) -> int:
+    """候选的机制与它支持证据的匹配度（**覆盖率**，用千分位整数比较）。
+
+    返回 `命中数 / 期望数` 的千分位值（0..1000），避免引入浮点排序。
+    用覆盖率而不是命中数：`latency_degradation` 只期望 1 项（slow_span），
+    `availability_degradation` 期望 2 项。若只用命中数，
+    两者都只命中 1 项 → 无法区分；用覆盖率则 1/1 > 1/2，判据才有意义。
+
+    复用 `semantic.EXPECTATIONS` 而不是另立一份期望定义 ——
+    两份定义迟早会漂移，而语义闸门已经在用同一份。
+
+    注意它**不是**"支持证据条数"：条数已由 `supporting_evidence_count` 计入
+    score（R-006 等）。这里衡量的是**机制与证据类型是否对得上**，
+    那才是"这个假设解释了证据吗"的直接判据。
+    """
+    from traceops.rca.semantic import EXPECTATIONS
+
+    expected = EXPECTATIONS.get((hypothesis.fault_type or "").strip())
+    if not expected:
+        return 0
+    observed_markers = getattr(signals, "observed_markers", None)
+    if not observed_markers:
+        return 0
+    hits = len(set(expected) & set(observed_markers))
+    # 千分位整数：排序键保持全整数，避免浮点比较带来的不确定性
+    return int(hits * 1000 / len(expected))
+
+
 def rank_hypotheses(
     hypotheses: list[RootCauseHypothesis],
     signals: list[CandidateSignals],
@@ -139,10 +189,20 @@ def rank_hypotheses(
     by_id_full = {h.id: h for h in hypotheses}
 
     def _sort_key(item: tuple[int, str, CandidateSignals]) -> tuple:
-        score, hid, _ = item
+        score, hid, signals = item
         h = by_id_full[hid]
         return (
             -score,
+            # **机制—证据匹配度**：该候选的支持证据里有多少条命中它自己
+            # 的期望观测。放在 score 之后、服务名之前。
+            #
+            # 为什么需要：同分 + 同服务时，旧排序退化成 `fault_type` 字母序，
+            # 于是 `availability_degradation` 仅因字母顺序排在
+            # `latency_degradation` 前面 —— 而后者手里有一条 1.8s 慢 span
+            # **直接支持**（slow_span 正是它的期望观测）。
+            # 字母序兜底是已知成本（ARCHITECTURE §2.12），现在用有依据的
+            # 判据替换它。判据对所有来源一致：规则/模型/人工都走这里。
+            -_mechanism_fit(h, signals),
             (h.candidate_service or "").lower(),
             h.candidate_component is None,  # False(有组件) 排前面
             (h.fault_type or "").lower(),
@@ -281,6 +341,7 @@ def derive_signals(
             [ev for ev in supports
              if ev.evidence_type == EvidenceType.EVENT and ev.observed_at < fault_start]
         ),
+        observed_markers=frozenset(_observed_markers_for(supports, hypothesis.candidate_service)),
         contradicting_evidence_count=len(contradicts),
         supporting_evidence_count=len(supports),
     )
