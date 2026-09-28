@@ -57,6 +57,14 @@ class ModelRequest:
     service_hint: str
     evidence_summary: dict[str, Any]
     allowed_services: list[str] = field(default_factory=list)
+    #: 告警原文（可选）。
+    #:
+    #: **这是规则路径看不见的信息**：告警 summary 里常有"traced to cache tier:
+    #: zulu-cache degraded"这类线索，规则不读文本，所以它无法利用。
+    #: 把原文交给模型，才能测出「模型能否利用自然语言线索」这项能力 ——
+    #: 这是 E1/E2 相对纯规则唯一可能产生真实增益的维度（规则已覆盖
+    #: 结构化信号的全部组合）。
+    alert_summary: str | None = None
     max_hypotheses: int = 3
     # **必须显式给输出上限**。不给的话 provider 会退到很小的默认值
     # （litellm 对 Anthropic 系默认 4096），结构化输出会被拦腰截断：

@@ -103,6 +103,7 @@ class OpenAICompatibleModel:
                     "allowed_services": request.allowed_services,
                     "max_hypotheses": request.max_hypotheses,
                     "evidence_summary": request.evidence_summary,
+                    "alert_summary": request.alert_summary,
                 }, ensure_ascii=False)},
             ],
         }
@@ -149,6 +150,7 @@ class OpenAICompatibleModel:
                     "allowed_services": request.allowed_services,
                     "max_hypotheses": request.max_hypotheses,
                     "evidence_summary": request.evidence_summary,
+                    "alert_summary": request.alert_summary,
                 }, ensure_ascii=False)},
             ],
             "options": {

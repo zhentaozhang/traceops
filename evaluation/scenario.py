@@ -121,6 +121,15 @@ class Scenario(BaseModel):
     name: str
     description: str = ""
     service_hint: str
+    #: 告警原文（可选）。
+    #:
+    #: 为什么需要：告警 summary 常常含**自然语言线索**（"traced to cache tier:
+    #: zulu-cache responses degraded"）。规则不读它，所以这类线索对纯规则路径
+    #: 完全不可见 —— 而人能读、模型也能读。
+    #:
+    #: 把它作为场景的一等字段（而不是塞进 signals），是为了让
+    #: 「规则读不到的信息」成为可测的差异来源。
+    alert_summary: str | None = None
     fault_start: datetime
     window_start: datetime
     window_end: datetime

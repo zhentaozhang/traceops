@@ -183,6 +183,7 @@ def build_request(scenario: Scenario) -> InvestigationRequest:
         window_end=scenario.window_end,
         config_change=config_change,
         priority="P1",
+        alert_summary=scenario.alert_summary,
     )
 
 

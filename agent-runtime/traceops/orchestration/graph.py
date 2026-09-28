@@ -77,6 +77,9 @@ class InvestigationRequest(BaseModel):
     fault_start: datetime
     window_start: datetime
     window_end: datetime
+    #: 告警原文（可选）。规则路径不读它，只透传给模型 ——
+    #: 这让"能否利用自然语言线索"成为可测的差异来源。
+    alert_summary: str | None = None
     config_change: dict[str, Any] | None = None
     priority: str = "P2"
 
@@ -485,6 +488,7 @@ def _hypothesize_node(state: InvestigationState, config: RunnableConfig) -> dict
             service_hint=request.service_hint,
             evidence_summary=_evidence_summary(evidence_list),
             allowed_services=allowed,
+            alert_summary=getattr(request, "alert_summary", None),
         )
         gateway = ModelGateway(ctx.model, ctx.budget)
         try:

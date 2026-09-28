@@ -1,0 +1,68 @@
+{
+  "scenario_id": "F-011",
+  "name": "Tie broken by reported symptom, which rules cannot see",
+  "description": "平局 + **告警原文里有破局线索**，但规则读不到它。\n\n构造：\n- `alpha-payment` 与 `zulu-cache` 同为 api-gateway 的下游叶子，拓扑深度相同\n- 两者的**错误率异常程度完全相同** → 规则的所有区分规则失效，只能靠字母序\n- 字母序让 `alpha-payment` 排第一（**错误**）\n- 但告警原文写明：`traced to cache tier: zulu-cache responses degraded`\n- 且 `zulu-cache` 有慢 span（1.8s）→ 支持 `latency_degradation`\n\n关键：**信息是够的，只是规则不读自然语言**。\n所以这条场景能区分「规则」与「规则+模型」：\n模型读 summary 能把 `zulu-cache` 提到第一，规则做不到。\n\n诚实声明：这测的是「能否利用自然语言线索」这一项具体能力，\n不是通用诊断能力。F-010 保留，用于测「信息确实不足时是否诚实弃权」。",
+  "service_hint": "alpha-payment",
+  "fault_start": "2026-10-30T10:02:00Z",
+  "window_start": "2026-10-30T10:00:00Z",
+  "window_end": "2026-10-30T10:05:00Z",
+  "topology_edges": [
+    [
+      "api-gateway",
+      "alpha-payment"
+    ],
+    [
+      "api-gateway",
+      "zulu-cache"
+    ]
+  ],
+  "scope_depth": 2,
+  "alert_summary": "checkout latency spike traced to cache tier: zulu-cache responses degraded",
+  "signals": {
+    "per_service": {
+      "alpha-payment": {
+        "error_rate_series": [
+          0.004,
+          0.09,
+          0.11
+        ],
+        "error_logs": [],
+        "slow_spans": []
+      },
+      "zulu-cache": {
+        "error_rate_series": [
+          0.004,
+          0.09,
+          0.11
+        ],
+        "error_logs": [],
+        "slow_spans": [
+          {
+            "name": "zulu-cache.get",
+            "duration_ms": 1800
+          }
+        ]
+      },
+      "api-gateway": {
+        "error_rate_series": [
+          0.004,
+          0.06,
+          0.07
+        ],
+        "error_logs": [],
+        "slow_spans": []
+      }
+    }
+  },
+  "ground_truth": {
+    "service": "zulu-cache",
+    "fault_type": "latency_degradation",
+    "expected_diagnosis": "SUPPORTED",
+    "must_identify": [
+      "zulu-cache"
+    ],
+    "wrong_answers": [
+      "alpha-payment"
+    ]
+  }
+}
