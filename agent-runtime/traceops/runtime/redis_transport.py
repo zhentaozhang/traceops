@@ -98,6 +98,35 @@ class RedisProtocolError(RedisConnectionError):
 # --------------------------------------------------------------------------- #
 # 编码
 # --------------------------------------------------------------------------- #
+def _xinfo_groups_to_dicts(raw: Any) -> list[dict[str, Any]]:
+    """`XINFO GROUPS` 的 RESP 数组 → 平铺 dict 列表。
+
+    Redis 返回的每条组是**交替键值对的数组**：
+
+        ["name", "g", "consumers", 1, "pending", 0, "lag", 7, ...]
+
+    不是一个 dict。直接按 dict 处理会静默得到空结果 ——
+    那会让监控显示"一切正常"，而实际积压可能很大。
+    这里显式做键值对拆分，缺 `lag` 字段时给 None（而不是 0）。
+    """
+    if not isinstance(raw, list):
+        return []
+    groups: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, (list, tuple)):
+            continue
+        blob = {}
+        # 交替键值：步长 2
+        for i in range(0, len(entry) - 1, 2):
+            key = entry[i]
+            value = entry[i + 1]
+            if isinstance(key, bytes):
+                key = key.decode("utf-8", errors="replace")
+            blob[str(key)] = value
+        groups.append(blob)
+    return groups
+
+
 def encode_command(args: "list[Any] | tuple[Any, ...]") -> bytes:
     """把一条命令编码成 RESP2 数组：`*<n>\\r\\n$<len>\\r\\n<arg>\\r\\n...`。
 
@@ -490,6 +519,25 @@ class RespRedisTransport:
             # BLOCK 到超时：Redis 回 `*-1`（null array），这是「没消息」而不是错误
             return []
         return _streams_from_raw(reply)
+
+    def xinfo_groups(self, stream: str) -> list[dict[str, Any]]:
+        """`XINFO GROUPS <stream>` → 每个组一条 dict（name/lag/pending/consumers）。
+
+        用于**积压监控**：没有它无法区分"消费跟得上"与"消费静默落后" ——
+        两者在外部看都只是"Redis 内存慢慢涨"。
+        """
+        raw = self._command("XINFO", "GROUPS", stream)
+        return _xinfo_groups_to_dicts(raw)
+
+    def xpending_count(self, stream: str, group: str) -> int:
+        """`XPENDING <stream> <group>` 的 summary 形式 → 未 ACK 条数。"""
+        raw = self._command("XPENDING", stream, group)
+        if isinstance(raw, list) and raw:
+            try:
+                return int(raw[0])
+            except (TypeError, ValueError):
+                return 0
+        return 0
 
     def xgroup_create(self, stream: str, group: str, *, start_id: str = "0",
                       mkstream: bool = True) -> None:

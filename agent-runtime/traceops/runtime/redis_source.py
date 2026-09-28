@@ -183,6 +183,50 @@ class RedisStreamEventSource:
         #: 消费者组是否已确保存在。只做一次 —— 每轮都建组是白费往返。
         self._group_ready = False
 
+    def lag_report(self) -> dict[str, Any]:
+        """消费者积压报告（**只读**，不改变任何消费状态）。
+
+        为什么需要：没有它，一个静默追赶不上的消费者与一个健康的空转消费者
+        在外部**完全无法区分** —— 两者都表现为"Redis 内存慢慢涨"。
+
+        三个字段的含义：
+
+        | 字段 | 含义 | 异常时的含义 |
+        |---|---|---|
+        | `lag` | 尚未投递的消息数 | 持续增长 = 消费跟不上生产 |
+        | `pending` | 已投递但未 ACK | 持续增长 = worker 在处理中崩溃残留 |
+        | `consumers` | 在线消费者数 | 为 0 而 lag 在涨 = worker 全挂了 |
+
+        `lag` 为 `None` 而不是 `0` 表示**组不存在** —— 报 0 会伪装成
+        "完全跟上了"，那是比没有指标更糟的误导。
+        """
+        groups = []
+        try:
+            groups = self.transport.xinfo_groups(self.stream)
+        except Exception:
+            groups = []
+
+        for group in groups:
+            if str(group.get("name", "")) == self.group:
+                lag = group.get("lag")
+                if lag is None and group.get("pending") is None:
+                    lag = None
+                return {
+                    "stream": self.stream,
+                    "group": self.group,
+                    "lag": int(lag) if isinstance(lag, (int, float)) else None,
+                    "pending": int(group.get("pending", 0) or 0),
+                    "consumers": int(group.get("consumers", 0) or 0),
+                }
+        # 组不存在：明确表达"没有数据"，而不是 0
+        return {
+            "stream": self.stream,
+            "group": self.group,
+            "lag": None,
+            "pending": None,
+            "consumers": 0,
+        }
+
     def _ensure_group(self) -> None:
         """确保消费者组存在（幂等）。
 

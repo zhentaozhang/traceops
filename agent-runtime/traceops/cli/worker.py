@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -184,6 +185,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-tool-calls", type=int, default=int(
         os.environ.get("TRACEOPS_MAX_TOOL_CALLS", "40")))
     parser.add_argument("--once", action="store_true", help="process a single batch then exit")
+    parser.add_argument("--lag", action="store_true",
+                        help="print consumer-group lag (read-only) and exit; "
+                             "use this to answer 'is consumption keeping up?'")
     parser.add_argument("--purge", action="store_true",
                         help="run evidence retention cleanup then exit (requires --evidence-db)")
     parser.add_argument("--purge-dry-run", action="store_true",
@@ -240,6 +244,13 @@ def main(argv: list[str] | None = None) -> int:
             return 3
         source = RedisStreamEventSource(
             transport, stream=args.stream, group=args.group, consumer=args.consumer)
+        if args.lag:
+            # 只读查询后立即退出：这是运维用来回答"消费跟得上吗"的工具，
+            # 不该顺手开始消费。
+            report = source.lag_report()
+            print(json.dumps(report, ensure_ascii=False))
+            transport.close()
+            return 0
     else:
         source = InMemoryEventSource()
         if args.self_check:
