@@ -321,12 +321,33 @@ class _UrllibTransport:
 
     def post(self, url: str, payload: dict, *, headers: dict | None = None,
              timeout: float = 10.0) -> tuple[int, Any]:
+        """POST，并**对瞬时故障重试**。
+
+        为什么重试放在这一层：所有模型调用都经过它，
+        把重试放在这里只需写一次，而且能同时覆盖
+        "连接抖动"（异常）与"端点暂时不可用"（5xx/429）两种情况。
+
+        为什么 4xx 不重试：请求本身有问题（模型名写错、超预算），
+        重试只会得到同样的失败，还白等 3 次退避。
+        """
+        from traceops.runtime.retry_http import RetryPolicy, is_retryable_status, with_retry
+
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(url, data=data, headers=dict(headers or {}),
                                           method="POST")
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.status, response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
-            return exc.code, body
+
+        def _attempt() -> tuple[int, Any]:
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    return response.status, response.read().decode("utf-8")
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+                # 5xx/429 视作瞬时：抛出去让 with_retry 决定是否再试
+                if is_retryable_status(exc.code):
+                    raise ConnectionError(
+                        f"transient HTTP {exc.code} from {url}: {body[:200]}") from exc
+                return exc.code, body
+
+        # 单次尝试的 timeout 已经是外部传入的上限；重试次数刻意保守（2），
+        # 因为一次调查里可能有多轮调用，重试太多会让总耗时不可控。
+        return with_retry(_attempt, policy=RetryPolicy(max_attempts=2, base_delay=0.5))

@@ -27,6 +27,11 @@ spring:
 
 traceops:
   events:
+    # 流长度上限（近似裁剪）。不设上限的 Stream 只涨不跌：
+    # XACK 只从 PEL 移除，**不删除数据** —— 这是 Streams 最常见的内存泄漏。
+    # 10000 条约等于最近 1000 次调查的完整事件，够排障且内存可预测。
+    # 设为 0 表示不裁剪（需显式选择，不要靠"忘了配"）。
+    max-len: ${TRACEOPS_EVENTS_MAX_LEN:10000}
     redis:
       enabled: ${TRACEOPS_EVENTS_REDIS_ENABLED:false}
   outbox:

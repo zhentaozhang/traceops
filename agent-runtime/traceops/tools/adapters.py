@@ -55,15 +55,44 @@ class UrllibTransport:
     """
 
     def _request(self, req: urllib.request.Request, timeout: float) -> tuple[int, Any]:
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read()
-                return resp.status, _decode(raw, resp.headers.get("Content-Type", ""))
-        except urllib.error.HTTPError as exc:
-            raw = exc.read()
-            return exc.code, _decode(raw, exc.headers.get("Content-Type", "") if exc.headers else "")
-        except urllib.error.URLError as exc:
-            raise TransportError(f"request to {req.full_url} failed: {exc.reason}") from exc
+        """发请求，并**对瞬时故障重试**。
+
+        为什么数据源也要重试：一次 TLS 抖动或数据源重启会让 `collect`
+        把整个数据源记进 `missing_data` —— 那一类证据就全没了，
+        覆盖率下降进而让语义闸门降级。而这类故障重试一次通常就恢复。
+
+        为什么 4xx 不重试：查询模板写错、时间窗越界属于确定性错误，
+        重试只会白等并浪费预算。
+
+        注意重试次数保守（2 次）：一次调查要打多个数据源，
+        每个都重试多次会让总耗时不可控，反而触发上层 deadline。
+        """
+        from traceops.runtime.retry_http import (
+            RetryPolicy, is_retryable_status, with_retry,
+        )
+
+        def _attempt() -> tuple[int, Any]:
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    raw = resp.read()
+                    return resp.status, _decode(raw, resp.headers.get("Content-Type", ""))
+            except urllib.error.HTTPError as exc:
+                raw = exc.read()
+                if is_retryable_status(exc.code):
+                    # 保留 status：上层要靠它区分"数据源暂时不可用"与"查询写错了"，
+                    # 丢掉它会把可排查的错误变成不可排查的。
+                    raise TransportError(
+                        f"transient HTTP {exc.code} from {req.full_url}",
+                        status=exc.code,
+                        body=_decode(raw, exc.headers.get("Content-Type", "")
+                                      if exc.headers else "")) from exc
+                return exc.code, _decode(
+                    raw, exc.headers.get("Content-Type", "") if exc.headers else "")
+            except urllib.error.URLError as exc:
+                raise TransportError(
+                    f"request to {req.full_url} failed: {exc.reason}") from exc
+
+        return with_retry(_attempt, policy=RetryPolicy(max_attempts=2, base_delay=0.5))
 
     def get(
         self,

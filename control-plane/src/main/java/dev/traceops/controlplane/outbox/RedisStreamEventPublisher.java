@@ -30,11 +30,25 @@ public class RedisStreamEventPublisher implements EventPublisher {
 
     static final String STREAM_KEY = "traceops.events";
 
+    /**
+     * 流长度上限（近似裁剪）。
+     *
+     * <p>为什么必须有：Redis Stream 的 `XACK` **不删除数据**（只从 PEL 移除），
+     * 所以不裁剪的流只涨不跌 —— 这是 Streams 最常见的内存泄漏。
+     * 每个调查约 9 条事件，规模化后很容易到几十万条。
+     *
+     * <p>为什么是 10000：足够保留最近约 1000 次调查的完整事件用于排障，
+     * 同时把内存钉在一个可预测的量级。需要更长重放时可以显式传更大值。
+     */
+    public static final int DEFAULT_MAX_LEN = 10_000;
+
     private final StringRedisTemplate redis;
+    private final int maxLen;
 
     public RedisStreamEventPublisher(
             @org.springframework.beans.factory.annotation.Value("${spring.data.redis.host:localhost}") String host,
-            @org.springframework.beans.factory.annotation.Value("${spring.data.redis.port:6379}") int port) {
+            @org.springframework.beans.factory.annotation.Value("${spring.data.redis.port:6379}") int port,
+            @org.springframework.beans.factory.annotation.Value("${traceops.events.max-len:10000}") int maxLen) {
         // **自己装配而不是注入**：实测容器里存在一个未被 afterPropertiesSet()
         // 的 StringRedisTemplate，注入它会得到"template not initialized"，
         // 而它的失败是静默的（返回值 null、无异常）—— 事件就此丢失。
@@ -45,7 +59,14 @@ public class RedisStreamEventPublisher implements EventPublisher {
         StringRedisTemplate template = new StringRedisTemplate(factory);
         template.afterPropertiesSet();
         this.redis = template;
-        log.info("RedisStreamEventPublisher initialised against {}:{}", host, port);
+        this.maxLen = maxLen;
+        log.info("RedisStreamEventPublisher initialised against {}:{} (maxLen={})",
+                host, port, maxLen);
+    }
+
+    /** 配置的流长度上限；0 表示不裁剪（需显式选择）。 */
+    public int maxLen() {
+        return maxLen;
     }
 
     @Override
@@ -56,8 +77,17 @@ public class RedisStreamEventPublisher implements EventPublisher {
             byte[] key = STREAM_KEY.getBytes(java.nio.charset.StandardCharsets.UTF_8);
             byte[] field = "payload".getBytes(java.nio.charset.StandardCharsets.UTF_8);
             byte[] value = message.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            Object reply = connection.execute("XADD", key, "*".getBytes(java.nio.charset.StandardCharsets.UTF_8),
-                    field, value);
+            // MAXLEN ~ <n>：近似裁剪。精确形式每次插入都要重启计数并可能删多条，
+            // 近似形式只在能整块丢弃 radix tree 节点时裁剪，成本低得多；
+            // 代价是长度会略超上限，对"保留最近若干条"的用途完全可接受。
+            // maxLen<=0 时退化为不裁剪（显式选择，不靠"忘了配"）。
+            Object reply = maxLen > 0
+                    ? connection.execute("XADD", key, "MAXLEN".getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                            "~".getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                            String.valueOf(maxLen).getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                            "*".getBytes(java.nio.charset.StandardCharsets.UTF_8), field, value)
+                    : connection.execute("XADD", key,
+                            "*".getBytes(java.nio.charset.StandardCharsets.UTF_8), field, value);
             if (reply == null) {
                 return null;
             }
