@@ -12,6 +12,8 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+
+from traceops.runtime.sqlite_config import configure_connection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -84,7 +86,7 @@ class EvidenceStore:
 
         if self._path is not None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(str(self._path))
+            self._conn = configure_connection(sqlite3.connect(str(self._path)))
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
 

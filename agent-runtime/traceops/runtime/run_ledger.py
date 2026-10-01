@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import sqlite3
+
+from traceops.runtime.sqlite_config import configure_connection
 import threading
 from pathlib import Path
 
@@ -53,7 +55,8 @@ class RunLedger:
             # check_same_thread=False：认领逻辑本身用 threading.Lock 串行化，
             # 因此连接跨线程使用是安全的。默认 True 会让"线程池化的 worker"
             # 在 claim 时直接抛 ProgrammingError —— 单线程测试永远发现不了。
-            self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
+            self._conn = configure_connection(
+                sqlite3.connect(str(self._path), check_same_thread=False))
             self._conn.executescript(SCHEMA)
             self._conn.commit()
             if preload:

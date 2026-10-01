@@ -31,6 +31,7 @@ from enum import Enum
 from pathlib import Path
 
 from traceops.remediation.approval import ApprovalDecision
+from traceops.runtime.sqlite_config import configure_connection
 from traceops.security.access import Principal
 
 
@@ -124,11 +125,13 @@ class ApprovalStore:
         self._lock = threading.Lock()
         if self._path is not None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
+            self._conn = configure_connection(
+                sqlite3.connect(str(self._path), check_same_thread=False))
             self._conn.executescript(SCHEMA)
             self._conn.commit()
         else:
-            self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+            self._conn = configure_connection(
+                sqlite3.connect(":memory:", check_same_thread=False))
             self._conn.executescript(SCHEMA)
             self._conn.commit()
 
