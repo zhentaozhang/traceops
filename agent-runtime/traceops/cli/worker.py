@@ -28,6 +28,7 @@ from traceops.evidence.store import EvidenceStore
 from traceops.orchestration.graph import InvestigationRequest, RunContext
 from traceops.runtime.budget import BudgetManager
 from traceops.runtime.deadletter import InMemoryDeadLetterSink
+from traceops.runtime.shutdown import StopSignal
 from traceops.runtime.retry import RetryPolicy
 from traceops.evidence.retention import RetentionPolicy
 from traceops.runtime.run_ledger import RunLedger
@@ -153,6 +154,40 @@ def _describe_adapters(adapters, args) -> list[str]:
         )
         if adapter
     ]
+
+
+def _run_until_stopped(worker, controller, *, sink=None, dead_letters=None,
+                       once: bool = False, max_iterations: int | None = None) -> int:
+    """批次级主循环：每轮**开始前**检查停机标志。
+
+    为什么在批次之间检查而不是在消息之间：一个批次的处理是有意义的原子单位，
+    中途退出会把已投递未 ACK 的消息变成 pending。批次级退出点确定，
+    且当前批次的消息都会被 ACK。
+
+    返回实际执行的轮数（测试用；生产里忽略）。
+    """
+    iterations = 0
+    while True:
+        if controller.stopping:
+            return iterations
+        if max_iterations is not None and iterations >= max_iterations:
+            return iterations
+        iterations += 1
+        stats = worker.poll_once()
+        if sink is not None:
+            for message in sink.messages:
+                print(dumps(message), flush=True)
+            sink.messages.clear()
+        if dead_letters is not None:
+            for record in dead_letters.records:
+                print(f"dead-letter: {dumps(record.to_dict())}", file=sys.stderr)
+            dead_letters.records.clear()
+        if stats.processed or stats.failed or stats.skipped_duplicate:
+            print(f"poll: processed={stats.processed} succeeded={stats.succeeded} "
+                  f"failed={stats.failed} skipped={stats.skipped_duplicate}",
+                  file=sys.stderr)
+        if once:
+            return iterations
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -281,21 +316,17 @@ def main(argv: list[str] | None = None) -> int:
           f"consumer={args.consumer} adapters={_describe_adapters(adapters, args)}",
           file=sys.stderr)
 
+    # 协作式停机：SIGTERM（容器停止）与 SIGINT（Ctrl-C）只设标志，
+    # 在处理完**当前批次**后退出。硬杀会让正在处理的调查消失，
+    # 消息留在 PEL 里要等 min_idle_ms（默认 60s）才能被认领回去。
+    controller = StopSignal()
     try:
-        while True:
-            stats = worker.poll_once()
-            for message in sink.messages:
-                print(dumps(message), flush=True)
-            sink.messages.clear()
-            for record in dead_letters.records:
-                print(f"dead-letter: {dumps(record.to_dict())}", file=sys.stderr)
-            dead_letters.records.clear()
-            if stats.processed or stats.failed or stats.skipped_duplicate:
-                print(f"poll: processed={stats.processed} succeeded={stats.succeeded} "
-                      f"failed={stats.failed} skipped={stats.skipped_duplicate}",
-                      file=sys.stderr)
-            if args.once:
-                return 0
+        with controller.installed():
+            _run_until_stopped(worker, controller, sink=sink,
+                               dead_letters=dead_letters, once=args.once)
+        if controller.signal_name:
+            print(f"worker stopped by {controller.signal_name}", file=sys.stderr)
+        return 0
     except TopologyError as exc:
         print(f"topology error: {exc}", file=sys.stderr)
         return 2
