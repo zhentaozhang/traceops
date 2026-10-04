@@ -156,6 +156,19 @@ def _describe_adapters(adapters, args) -> list[str]:
     ]
 
 
+def _build_budget(args) -> BudgetManager:
+    """生产预算：**显式**设置墙钟上限。
+
+    为什么在工厂里显式设置而不是依赖 BudgetManager 的默认值：
+    默认值在库层是为了"忘了配也不至于无限跑"，而生产入口应当把自己
+    实际想要的策略写出来 —— 这样读代码的人不用去猜库的默认是什么。
+    """
+    return BudgetManager(
+        max_tool_calls=args.max_tool_calls,
+        deadline_seconds=args.deadline_seconds,
+    )
+
+
 def _run_until_stopped(worker, controller, *, sink=None, dead_letters=None,
                        once: bool = False, max_iterations: int | None = None) -> int:
     """批次级主循环：每轮**开始前**检查停机标志。
@@ -220,6 +233,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-tool-calls", type=int, default=int(
         os.environ.get("TRACEOPS_MAX_TOOL_CALLS", "40")))
     parser.add_argument("--once", action="store_true", help="process a single batch then exit")
+    parser.add_argument("--deadline-seconds", type=float,
+                        default=float(os.environ.get("TRACEOPS_DEADLINE_SECONDS", "900")),
+                        help="wall-clock limit per investigation (default 900); "
+                             "bounds one pathological run from occupying a worker")
     parser.add_argument("--lag", action="store_true",
                         help="print consumer-group lag (read-only) and exit; "
                              "use this to answer 'is consumption keeping up?'")
@@ -299,7 +316,7 @@ def main(argv: list[str] | None = None) -> int:
         return RunContext(
             store=store,
             adapters=adapters,
-            budget=BudgetManager(max_tool_calls=args.max_tool_calls),
+            budget=_build_budget(args),
             gateway=gateway,
             topology=topology,
             model=build_model(args),

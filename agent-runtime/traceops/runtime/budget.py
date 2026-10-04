@@ -47,7 +47,21 @@ class BudgetManager:
         max_tokens: int = DEFAULT_MAX_TOKENS,
         max_tool_calls: int = 50,
         max_rounds: int = 10,
-        deadline_seconds: float | None = None,
+        # 墙钟上限，默认 15 分钟。
+        #
+        # 为什么必须有默认值：`max_tool_calls` 能拦住**次数**，拦不住
+        # "50 次调用每次都很慢" —— 数据源持续慢响应时，一个调查可以无限期
+        # 占住 worker。它还会连带破坏两件事：
+        #   1. `min_idle_ms`（PEL 恢复门限）无法定标 —— 若调查可能跑 10 分钟，
+        #      60 秒就会**误抢**正在正常处理的活，同一事故被两个 worker 同时查；
+        #   2. 优雅停机被架空 —— SIGTERM 后要"处理完当前批次"，
+        #      而没有上限的调查能让该批次永远不结束，最终仍被宽限期硬杀。
+        #
+        # 15 分钟的量级依据：纯确定性路径实测秒级完成；接入本地模型后
+        # 单轮约 3 秒、7 节点约 20 秒。900 秒给远程模型与重试留足余量，
+        # 同时远小于"永远"。需要更长时可显式传更大值，或传 None 关闭
+        # （关闭是显式选择，不是默认）。
+        deadline_seconds: float | None = 900,
     ) -> None:
         self.max_tokens = max_tokens
         self.max_tool_calls = max_tool_calls

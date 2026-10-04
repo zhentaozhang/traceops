@@ -35,8 +35,19 @@ class TestPolicyShape:
         assert policy.max_attempts <= 5, "more than 5 attempts usually amplifies the outage"
 
     def test_backoff_grows(self):
-        policy = RetryPolicy(base_delay=0.01, max_delay=1.0)
-        assert policy.delay_for(1) < policy.delay_for(2) < policy.delay_for(3)
+        """退避要递增 —— 但抖动会让相邻值重叠，所以比较**基准值**（jitter=0）。
+
+        这是我自己写错过的测试：带抖动时 delay_for(1) 可能偶尔大于
+        delay_for(2)（两者都在各自区间内随机）。递增性属于**基准曲线**，
+        抖动是在其上叠加的扰动，不该用带抖动的采样验证单调性。
+        """
+        no_jitter = RetryPolicy(base_delay=0.01, max_delay=1.0, jitter=0.0)
+        assert no_jitter.delay_for(1) < no_jitter.delay_for(2) < no_jitter.delay_for(3)
+
+        # 带抖动时仍能验证期望值单调（多次采样取均值）
+        with_jitter = RetryPolicy(base_delay=0.01, max_delay=1.0, jitter=0.5)
+        means = [sum(with_jitter.delay_for(n) for _ in range(50)) / 50 for n in (1, 2, 3)]
+        assert means[0] < means[1] < means[2], f"expected growth, got {means}"
 
     def test_backoff_is_capped(self):
         """上限约束的是**指数增长部分**，抖动会在此基础上小幅浮动。
