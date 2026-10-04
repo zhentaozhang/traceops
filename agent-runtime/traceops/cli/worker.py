@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -203,6 +204,53 @@ def _run_until_stopped(worker, controller, *, sink=None, dead_letters=None,
             return iterations
 
 
+class _StructuredFormatter(logging.Formatter):
+    """把 `extra=` 里的结构化字段**渲染出来**。
+
+    为什么必须渲染：只把字段挂到 LogRecord 上而不输出，等于**字段存在但不可见**
+    —— 排查时仍然只能看到一句纯文本。日志聚合器需要的是
+    `key=value` 形式（或 JSON），供后续按字段过滤聚合。
+
+    跳过 LogRecord 的内置属性（`name` / `levelname` / `msg` 等），
+    只追加调用方额外传的字段。
+    """
+
+    # LogRecord 的内置属性 + formatter 计算出的派生属性（asctime/message 由
+    # `super().format()` 填充，也属于"已渲染过"，不能再作为 extra 追加）。
+    _BUILTIN = frozenset(vars(logging.LogRecord("", 0, "", 0, "", (), None)).keys()) \
+        | {"message", "asctime"}
+
+    def format(self, record: logging.LogRecord) -> str:
+        base = super().format(record)
+        extras = {
+            key: value for key, value in vars(record).items()
+            if key not in self._BUILTIN and not key.startswith("_")
+        }
+        if not extras:
+            return base
+        tail = " ".join(f"{key}={value}" for key, value in extras.items())
+        return f"{base} | {tail}"
+
+
+def _configure_logging(level: str) -> None:
+    """在**入口**配置一次日志；库代码永远不配置。
+
+    为什么只在入口配置：库若自己加 handler / basicConfig，会覆盖宿主程序
+    （测试、嵌入到别的应用）的日志设置。标准做法是库只取 logger、不装 handler。
+
+    输出到 stderr 而不是 stdout：stdout 被事件 JSON 占用
+    （`print(dumps(message))`），把日志混进去会让下游的 JSON 解析失败。
+    """
+    root = logging.getLogger("traceops")
+    if root.handlers:
+        return  # 已配置（例如被测试夹具接管），不要重复添加
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(_StructuredFormatter(
+        "%(asctime)s %(levelname)s %(name)s %(message)s"))
+    root.addHandler(handler)
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="TraceOps investigation worker")
     parser.add_argument("--mode", choices=["memory", "redis"], default="memory")
@@ -233,6 +281,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-tool-calls", type=int, default=int(
         os.environ.get("TRACEOPS_MAX_TOOL_CALLS", "40")))
     parser.add_argument("--once", action="store_true", help="process a single batch then exit")
+    parser.add_argument("--log-level", default=os.environ.get("TRACEOPS_LOG_LEVEL", "INFO"),
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                        help="log verbosity for traceops.* loggers")
     parser.add_argument("--deadline-seconds", type=float,
                         default=float(os.environ.get("TRACEOPS_DEADLINE_SECONDS", "900")),
                         help="wall-clock limit per investigation (default 900); "
@@ -251,6 +302,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--self-check", action="store_true",
                         help="memory mode: inject one synthetic event to verify wiring")
     args = parser.parse_args(argv)
+    _configure_logging(getattr(args, "log_level", "INFO"))
 
     store = EvidenceStore(path=Path(args.evidence_db) if args.evidence_db else None)
     adapters = build_adapters(args)

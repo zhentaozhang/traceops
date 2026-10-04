@@ -15,6 +15,8 @@
 """
 from __future__ import annotations
 
+import logging
+
 from dataclasses import dataclass
 from enum import Enum
 
@@ -23,6 +25,9 @@ from traceops.remediation.approval import Approval, ApprovalDecision, PlanIntegr
 from traceops.remediation.plan import RemediationPlan
 from traceops.remediation.policy import PolicyDecision
 
+
+
+log = logging.getLogger(__name__)
 
 class ExecutionStatus(str, Enum):
     SUCCESS = "success"

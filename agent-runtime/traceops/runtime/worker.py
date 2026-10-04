@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+import logging
+
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -96,6 +98,9 @@ def _envelope(event_type: str, payload: dict[str, Any], *, run_id: str, incident
         },
         "payload": payload,
     }
+
+
+log = logging.getLogger(__name__)
 
 
 def started_event(run: InvestigationRun) -> dict[str, Any]:
@@ -332,6 +337,12 @@ class InvestigationWorker:
         try:
             request = self.derive_request(message)
         except Exception as exc:  # 请求本身非法 → 不重试
+            # 结构化字段（extra=）而不是拼进 message：拼进去就再也无法
+            # 按 message_id / 异常类型过滤和聚合，而那正是排障第一步。
+            log.warning("invalid investigation request",
+                        extra={"message_id": str(message.get("id", "")),
+                               "error_type": type(exc).__name__,
+                               "reason": str(exc)[:200]})
             self._dead_letter(message, exc)
             self.sink.publish(_invalid_request_event(message, str(exc)))
             stats.failed += 1

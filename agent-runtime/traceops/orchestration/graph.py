@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+import logging
+
 import functools
 
 from dataclasses import dataclass, field
@@ -64,6 +66,9 @@ _PLAN_TEMPLATES: list[tuple[str, str, EvidenceType, str]] = [
     ("query_service_traces", "tempo", EvidenceType.TRACE, "qt-slow-traces-v1"),
 ]
 
+
+
+log = logging.getLogger(__name__)
 
 class InvestigationRequest(BaseModel):
     """一次调查的输入。对应 contracts/events/v1/investigation.requested.schema.json。"""
