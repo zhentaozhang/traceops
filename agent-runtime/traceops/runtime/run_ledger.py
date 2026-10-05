@@ -148,6 +148,28 @@ class RunLedger:
                 "WHERE run_id = ?", (outcome, now_iso(), run_id))
             self._conn.commit()
 
+    def reclaim(self, run_id: str) -> bool:
+        """接管一个**陈旧**认领的 run：刷新认领时间，表明现在由本 worker 持有。
+
+        为什么不能用 `claim()` 实现接管：`claim` 走 `INSERT OR IGNORE`，
+        已存在的行会被忽略并返回 False —— 那正是"别人持有"的语义。
+        接管需要的是**抢占**：更新 claimed_at，让其他 worker 的
+        `reclaimable()` 重新判定为"新鲜"。
+
+        只对 IN_PROGRESS 的行生效：已完成的 run 不该被任何人接管。
+        """
+        with self._lock:
+            if self._conn is not None:
+                cursor = self._conn.execute(
+                    "UPDATE run_ledger SET claimed_at = ?, recorded_at = ? "
+                    "WHERE run_id = ? AND state = 'IN_PROGRESS'",
+                    (now_iso(), now_iso(), run_id),
+                )
+                self._conn.commit()
+                return cursor.rowcount == 1
+            # 内存模式没有时间概念，接管等价于"仍标记为进行中"
+            return self._records.get(run_id) == "IN_PROGRESS"
+
     def reclaimable(self, run_id: str, *, older_than_seconds: float) -> bool:
         """崩溃恢复：处于 IN_PROGRESS 且认领时间超过阈值的 run 可被重新认领。
 
@@ -157,8 +179,12 @@ class RunLedger:
         if state != "IN_PROGRESS":
             return False
         if self._conn is None:
-            # 内存模式无法表达时间，保守返回 True（进程重启本就清空内存）
-            return True
+            # 内存模式无法表达时间，因此**无法**判断认领是否陈旧。
+            # 保守返回 False（不接管）：接管一个仍在进行中的调查会让
+            # 同一事故被跑两遍，而 `claim` 的原子性只能防"同时开始"，
+            # 防不住"两个都在跑"。宁可让消息留在 PEL 等持有者重连/重启，
+            # 也不要制造重复执行。
+            return False
         row = self._conn.execute(
             "SELECT claimed_at FROM run_ledger WHERE run_id = ?", (run_id,)).fetchone()
         if not row or not row[0]:

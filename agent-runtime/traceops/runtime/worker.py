@@ -236,6 +236,10 @@ class WorkerStats:
     succeeded: int = 0
     failed: int = 0
     skipped_duplicate: int = 0
+    #: 接管了**陈旧认领**（持有者大概率已死）的消息数。
+    #: 与 skipped_duplicate 分开计数：一个是"别人在做，让给他"，
+    #: 一个是"他死了，我接手" —— 运维需要区分这两件事。
+    reclaimed: int = 0
     run_ids: list[str] = field(default_factory=list)
 
 
@@ -250,6 +254,7 @@ class InvestigationWorker:
         known_run_ids: set[str] | None = None,
         dead_letters: Any | None = None,
         retry_policy: RetryPolicy | None = None,
+        stale_claim_seconds: float = 900.0,
         ledger: RunLedger | None = None,
     ) -> None:
         self.source = source
@@ -263,6 +268,10 @@ class InvestigationWorker:
         self.dead_letters = dead_letters
         # 重试策略：按 failure_reason 分类，不盲目重试（见 runtime/retry.py）
         self.retry_policy = retry_policy or RetryPolicy()
+        # 认领多久算"陈旧"。默认与 BudgetManager 的 deadline 一致（900s）：
+        # 一个调查最长跑这么久，超过它还没结束，说明持有者大概率已经死了，
+        # 此时接管是安全的；小于它则会**误抢**正在正常处理的消息。
+        self.stale_claim_seconds = stale_claim_seconds
 
     def audit_timeline(self, *, gateway=None, kind=None, subject=None,
                        since=None, until=None):
@@ -309,9 +318,20 @@ class InvestigationWorker:
                 self.source.ack(message["id"])
                 continue
             if run_id is not None and not self.ledger.claim(run_id):
-                stats.skipped_duplicate += 1
-                self.source.ack(message["id"])
-                continue
+                # 认领失败有两种含义，**必须区分**：
+                #
+                # 1. 另一个 worker 正在处理（新鲜认领）→ **不能 ACK**。
+                #    "别人正在做"不等于"已经做完了"。ACK 掉之后若持有者崩溃，
+                #    这条消息再也没有任何 worker 会处理 —— 事故永久停摆。
+                #    留在 PEL 里，持有者完成时会自己 ACK，或它死掉后被别人接管。
+                if not self.ledger.reclaimable(run_id, older_than_seconds=self.stale_claim_seconds):
+                    # **不 ACK**：持有者还在跑。ACK 会把它从 PEL 里移除，
+                    # 而持有者一旦崩溃，这条消息就再没有任何 worker 会处理。
+                    stats.skipped_duplicate += 1
+                    continue
+                # 陈旧认领（持有者大概率已死）→ 接管：重新认领并继续执行
+                self.ledger.reclaim(run_id)
+                stats.reclaimed += 1
             if run_id is not None:
                 self._known_run_ids.add(run_id)
             self._handle(message, stats)

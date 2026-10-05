@@ -284,6 +284,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--log-level", default=os.environ.get("TRACEOPS_LOG_LEVEL", "INFO"),
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                         help="log verbosity for traceops.* loggers")
+    parser.add_argument("--stale-claim-seconds", type=float,
+                        default=float(os.environ.get("TRACEOPS_STALE_CLAIM_SECONDS", "900")),
+                        help="how long a run claim must be idle before another worker may "
+                             "take it over; should be >= deadline so live work is not stolen")
     parser.add_argument("--deadline-seconds", type=float,
                         default=float(os.environ.get("TRACEOPS_DEADLINE_SECONDS", "900")),
                         help="wall-clock limit per investigation (default 900); "
@@ -378,6 +382,7 @@ def main(argv: list[str] | None = None) -> int:
         source=source, sink=sink, derive_request=derive_request_from_event,
         build_context=build_context, dead_letters=dead_letters,
         retry_policy=RetryPolicy(max_attempts=3),
+        stale_claim_seconds=args.stale_claim_seconds,
         ledger=ledger,
     )
 
