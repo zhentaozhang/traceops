@@ -31,7 +31,18 @@ public class RedisConfig {
             @org.springframework.beans.factory.annotation.Value("${spring.data.redis.host:localhost}") String host,
             @org.springframework.beans.factory.annotation.Value("${spring.data.redis.port:6379}") int port) {
         RedisStandaloneConfiguration config = new RedisStandaloneConfiguration(host, port);
-        LettuceConnectionFactory factory = new LettuceConnectionFactory(config);
+        // **必须设超时**：没有超时时，Redis 不可达会让调用方无限等待。
+        // 实测后果：`/api/v1/health/ready` 不返回 503，而是直接挂住 ——
+        // 健康检查阻塞会拖垮编排系统的探测，比"明确报 DOWN"严重得多。
+        // 超时通过 LettuceClientConfiguration 设置（ClientOptions.Builder 没有
+        // socketTimeout 方法 —— 这是 Lettuce 6 的 API 形状）。
+        org.springframework.data.redis.connection.lettuce.LettuceClientConfiguration clientConfig =
+                org.springframework.data.redis.connection.lettuce.LettuceClientConfiguration
+                        .builder()
+                        .commandTimeout(java.time.Duration.ofSeconds(2))
+                        .build();
+        LettuceConnectionFactory factory = new LettuceConnectionFactory(
+                config, clientConfig);
         // 启动期就握手：连不上要立刻失败，而不是让后续投递静默丢数据
         factory.afterPropertiesSet();
         return factory;
