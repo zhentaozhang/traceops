@@ -75,11 +75,37 @@ class DeadLetterSink(Protocol):
 
 
 class InMemoryDeadLetterSink:
-    def __init__(self) -> None:
+    """有界死信收件箱。
+
+    为什么必须有界：`records` 原本只追加、无上限，而 `DeadLetterRecord`
+    只限制了**单条原文长度**（MAX_RAW_CHARS），不限制**条数**。
+    死信恰恰在故障期增长最快 —— 上游开始发畸形消息时每条都进死信。
+    如果诊断工具本身把进程撑死，运维连"看看死信里有什么"都做不到。
+
+    策略：保留**最近** N 条（排障要的是"刚发生了什么"，不是最早的），
+    丢弃量单独计数（静默丢弃不可接受），并允许显式设 0 表示无界。
+    """
+
+    #: 默认上限。500 足够容纳一次故障风暴的样本用于排障，
+    #: 又远小于"吃掉内存"的量级。
+    DEFAULT_MAX_RECORDS = 500
+
+    def __init__(self, max_records: int = DEFAULT_MAX_RECORDS) -> None:
+        if max_records < 0:
+            raise ValueError(f"max_records must be >= 0, got {max_records!r}")
+        #: 0 表示无界（显式选择，不是默认）。
+        self.max_records = max_records
         self.records: list[DeadLetterRecord] = []
+        #: 因超出上限被丢弃的条数。必须可读 —— 否则"有多少被丢了"无从判断。
+        self.dropped = 0
 
     def send(self, record: DeadLetterRecord) -> None:
         self.records.append(record)
+        if self.max_records and len(self.records) > self.max_records:
+            # 保留尾部（最新的）：排障关心的是最近发生了什么
+            overflow = len(self.records) - self.max_records
+            del self.records[:overflow]
+            self.dropped += overflow
 
     def count_by_category(self) -> dict[FailureCategory, int]:
         counts: dict[FailureCategory, int] = {}
