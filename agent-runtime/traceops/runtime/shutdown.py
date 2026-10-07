@@ -40,6 +40,9 @@ from typing import Any, Iterator
 class StopSignal:
     """协作式停机标志。
 
+    **构造即安装信号处理器**（SIGINT/SIGTERM）—— 这不是普通构造。
+    想撤销用 `with controller.installed():`（退出 with 时恢复旧处理器）。
+
     线程安全：信号处理器在主线程被调用，而检查点可能在别处；
     用 `threading.Event` 而不是裸 bool 以保证可见性。
     """
@@ -97,6 +100,3 @@ class StopSignal:
             self._previous = {}
 
 
-def install_stop_signal() -> StopSignal:
-    """便捷入口：安装并返回控制器（调用方负责用 `with` 恢复）。"""
-    return StopSignal()

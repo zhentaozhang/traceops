@@ -12,16 +12,9 @@ import base64
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from pydantic import BaseModel, Field
-
 from traceops.domain.models import Evidence, EvidenceType
 
 DEFAULT_MAX_RECORDS = 500
-
-
-class TimeRange(BaseModel):
-    start: datetime
-    end: datetime
 
 
 def _norm_tags(tags: list[dict[str, Any]] | None) -> dict[str, Any]:

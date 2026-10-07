@@ -120,6 +120,17 @@ def execute_plan(
     try:
         executor.execute(plan.action, plan.target, plan.parameters)
     except Exception as exc:
+        # 写操作失败必须留痕：这是最需要事后追溯的一类失败
+        # （谁批的、改了什么、报了什么错）。只写进 ExecutionResult.error
+        # 的话，调用方不落盘就等于没发生。
+        log.error("remediation execution failed",
+                  extra={"action": plan.action,
+                         "target": plan.target,
+                         "plan_id": plan.plan_id,
+                         "incident_id": plan.incident_id,
+                         "error_type": type(exc).__name__,
+                         "reason": str(exc)},
+                  exc_info=True)
         return ExecutionResult(
             status=ExecutionStatus.FAILED,
             attempts=1,

@@ -49,7 +49,7 @@ from traceops.orchestration.detectors import (
     traces_are_anomalous,
 )
 from traceops.rca.chain import build_propagation_chain
-from traceops.rca.contradiction import find_contradictions
+from traceops.rca.contradiction import find_contradictions, relation_type_of
 from traceops.rca.semantic import check_all
 from traceops.rca.ranking import RankedCandidate, derive_signals, rank_hypotheses
 from traceops.rca.report import build_report
@@ -413,6 +413,16 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
                 errors = list(state.get("errors", [])) + [f"budget exhausted: {exc}"]
                 return {"status": "FAILED", "errors": errors, "missing_data": missing}
             except Exception as exc:  # 单数据源失败不终止调查，记入 missing_data
+                # 必须留日志：missing_data 只进最终报告的 "missing" 列表，
+                # 运维在 worker 日志里看不到它，也不知道是哪个数据源、什么异常。
+                # 静默 continue 在这里等于"证据凭空消失"。
+                log.warning("datasource query failed; evidence skipped",
+                            extra={"tool": item["tool"],
+                                   "error_type": type(exc).__name__,
+                                   "reason": str(exc),
+                                   "run_id": request.investigation_run_id,
+                                   "incident_id": request.incident_id},
+                            exc_info=True)
                 missing.append(f"{item['tool']}: {exc}")
                 continue
             unwrapped = _unwrap_raw(raw, item["evidence_type"])
@@ -688,7 +698,9 @@ def _link_node(state: InvestigationState, config: RunnableConfig) -> dict[str, A
             HypothesisEvidence(
                 hypothesis_id=item.hypothesis_id,
                 evidence_id=item.evidence_id,
-                relation_type=RelationType.CONTRADICTS,
+                # 关系类型由矛盾模块定义 —— 不在这里硬编码常量，
+                # 否则两处独立真值，改一处就会静默漂移。
+                relation_type=relation_type_of(item),
                 reason=item.reason,
                 created_by=CreatedBy.RULE,
             )

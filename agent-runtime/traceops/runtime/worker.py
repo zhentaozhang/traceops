@@ -418,6 +418,15 @@ class InvestigationWorker:
                 self.sink.publish(failed_event(run, reason=reason,
                                                retryable=is_retryable(reason),
                                                detail="; ".join(result.errors)))
+                # 失败事件会进 Redis/控制面，但那是**下游**看得到的东西；
+                # worker 自己的日志必须也有一份 —— 否则从 worker 主机上
+                # 排查时只能看到"少了一条消息"。
+                log.error("investigation failed",
+                          extra={"message_id": message.get("id"),
+                                 "run_id": run.run_id,
+                                 "incident_id": request.incident_id,
+                                 "failure_reason": reason,
+                                 "errors": "; ".join(result.errors)})
                 stats.failed += 1
                 return
             run.complete()
@@ -425,6 +434,10 @@ class InvestigationWorker:
             self.sink.publish(completed_event(run, result.report))
             stats.succeeded += 1
         except BudgetExhausted as exc:
+            log.warning("investigation budget exhausted",
+                        extra={"message_id": message.get("id"),
+                               "run_id": run.run_id,
+                               "reason": str(exc)})
             run.fail(reason=FAILURE_BUDGET, node="collect")
             self.ledger.finish(run.run_id, outcome=f"FAILED:{FAILURE_BUDGET}")
             self.sink.publish(failed_event(run, reason=FAILURE_BUDGET,
@@ -432,6 +445,12 @@ class InvestigationWorker:
                                            detail=str(exc)))
             stats.failed += 1
         except Exception as exc:  # 未预期错误：保留 checkpoint 供恢复
+            log.error("investigation raised an unexpected error",
+                      extra={"message_id": message.get("id"),
+                             "run_id": run.run_id,
+                             "error_type": type(exc).__name__,
+                             "reason": str(exc)},
+                      exc_info=True)
             run.fail(reason=FAILURE_INTERNAL, node=run.current_node)
             self.ledger.finish(run.run_id, outcome=f"FAILED:{FAILURE_INTERNAL}")
             self.sink.publish(failed_event(run, reason=FAILURE_INTERNAL,
