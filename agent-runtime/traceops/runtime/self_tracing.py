@@ -175,6 +175,11 @@ class TraceRecorder:
             self.endpoint, data=payload,
             headers={"Content-Type": "application/json"}, method="POST")
         try:
+            # scheme 守卫放在 try 内：UnsafeUrlError 是 ValueError 子类，
+            # 走"永不抛出"契约 —— 坏端点返回 False，与网络故障同待遇。
+            from traceops.security.urls import assert_http_url
+
+            assert_http_url(request.full_url)
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 return 200 <= response.status < 300
         except (urllib.error.URLError, OSError, ValueError):

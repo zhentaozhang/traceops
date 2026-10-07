@@ -70,6 +70,12 @@ class UrllibTransport:
         from traceops.runtime.retry_http import (
             RetryPolicy, is_retryable_status, with_retry,
         )
+        # 咽喉处守卫：所有 HTTP 数据源适配器与 MCP 客户端都经由这里。
+        # file:///data:/ftp: 一律拒绝 —— urlopen 对它们有原生支持，
+        # 不拦的话数据源地址误配会把本地文件读进证据库（实测可行）。
+        from traceops.security.urls import assert_http_url
+
+        assert_http_url(req.full_url)
 
         def _attempt() -> tuple[int, Any]:
             try:

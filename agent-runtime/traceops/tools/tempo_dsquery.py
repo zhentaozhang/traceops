@@ -119,6 +119,11 @@ class GrafanaDsQueryClient:
             headers={"Content-Type": "application/json", **self.headers},
             method="POST",
         )
+        # 边界守卫：Grafana 基地址来自配置，误配成 file:// 时
+        # urlopen 会读本地文件并把它当 Tempo 返回值解析。
+        from traceops.security.urls import assert_http_url
+
+        assert_http_url(request.full_url)
         with urllib.request.urlopen(request, timeout=self.timeout) as response:
             body = json.loads(response.read().decode())
         return dsquery_frames_to_batches(body)

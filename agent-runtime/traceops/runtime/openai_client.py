@@ -332,6 +332,12 @@ class _UrllibTransport:
         """
         from traceops.runtime.retry_http import RetryPolicy, is_retryable_status, with_retry
 
+        # 边界守卫：模型端点同样来自配置。file:// 会把本地文件当模型响应
+        # 解析；UnsafeUrlError 是 ValueError 子类，不在可重试集合里 ——
+        # 确定性错误立即失败，不浪费预算。
+        from traceops.security.urls import assert_http_url
+
+        assert_http_url(url)
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(url, data=data, headers=dict(headers or {}),
                                           method="POST")
