@@ -318,12 +318,25 @@ class InvestigationWorker:
                 self.source.ack(message["id"])
                 continue
             if run_id is not None and not self.ledger.claim(run_id):
-                # 认领失败有两种含义，**必须区分**：
+                # 认领失败有**三种**含义，必须区分 —— 这是三种不同的动作：
                 #
-                # 1. 另一个 worker 正在处理（新鲜认领）→ **不能 ACK**。
+                # 1. 已经跑完（DONE）→ **必须 ACK**。
+                #    这个 run 不需要再处理了，消息留在 PEL 里只会被
+                #    XAUTOCLAIM 无限重投（worker 每次跳过、每次不 ACK）。
+                #    实测：entry 归属别的 consumer 时 XACK 根本不生效，
+                #    消息就永久钉在 PEL 里，`pending` 只增不减。
+                #
+                # 2. 另一个 worker 正在处理（IN_PROGRESS + 新鲜）→ **不能 ACK**。
                 #    "别人正在做"不等于"已经做完了"。ACK 掉之后若持有者崩溃，
                 #    这条消息再也没有任何 worker 会处理 —— 事故永久停摆。
                 #    留在 PEL 里，持有者完成时会自己 ACK，或它死掉后被别人接管。
+                #
+                # 3. 持有者大概已死（IN_PROGRESS + 陈旧）→ 接管并执行。
+                state = self.ledger.claim_state(run_id)
+                if state == "DONE":
+                    stats.skipped_duplicate += 1
+                    self.source.ack(message["id"])
+                    continue
                 if not self.ledger.reclaimable(run_id, older_than_seconds=self.stale_claim_seconds):
                     # **不 ACK**：持有者还在跑。ACK 会把它从 PEL 里移除，
                     # 而持有者一旦崩溃，这条消息就再没有任何 worker 会处理。
