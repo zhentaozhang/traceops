@@ -47,9 +47,32 @@ public final class EventMessages {
             String configVersion,
             String priority,
             Instant now) {
+        return investigationRequested(incidentId, serviceHint, runId, environment, configVersion,
+                priority, now, now.minus(DEFAULT_WINDOW), now, null);
+    }
 
-        Instant end = now;
-        Instant start = now.minus(DEFAULT_WINDOW);
+    /**
+     * 组装一条调查请求，允许显式指定时间窗与因果来源。
+     *
+     * <p>为什么要有这个重载：重试必须问**同一个问题**。
+     * {@link #investigationRequested(...)} 永远用"当前时间往前 5 分钟"，
+     * 于是每次重试问的窗口都不一样 —— 那不是重试，是换了个问题再问一遍。
+     * 重试路径因此必须显式传入原始窗口。
+     *
+     * <p>{@code causationId} 指向"导致这次重试的那条失败事件"，
+     * 缺失时因果链断裂，事后无法回答"这一轮重试是因为哪次失败"。
+     */
+    public static Map<String, Object> investigationRequested(
+            String incidentId,
+            String serviceHint,
+            String runId,
+            String environment,
+            String configVersion,
+            String priority,
+            Instant now,
+            Instant windowStart,
+            Instant windowEnd,
+            String causationId) {
 
         Map<String, Object> envelope = new LinkedHashMap<>();
         envelope.put("event_id", newEventId());
@@ -57,14 +80,14 @@ public final class EventMessages {
         envelope.put("schema_version", SCHEMA_VERSION);
         envelope.put("occurred_at", now.toString());
         envelope.put("correlation_id", incidentId);
-        envelope.put("causation_id", null);
+        envelope.put("causation_id", causationId);
         envelope.put("aggregate_id", runId);
         envelope.put("aggregate_version", 1);
         envelope.put("producer", PRODUCER);
 
         Map<String, Object> timeRange = new LinkedHashMap<>();
-        timeRange.put("start", start.toString());
-        timeRange.put("end", end.toString());
+        timeRange.put("start", windowStart.toString());
+        timeRange.put("end", windowEnd.toString());
 
         Map<String, Object> budget = new LinkedHashMap<>();
         budget.put("max_tool_calls", 50);

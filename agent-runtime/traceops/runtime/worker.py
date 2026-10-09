@@ -17,7 +17,7 @@ import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, runtime_checkable
 
 from traceops.orchestration.graph import InvestigationRequest, RunContext, run_investigation
 from traceops.runtime.budget import BudgetExhausted, BudgetManager
@@ -27,7 +27,7 @@ from traceops.runtime.deadletter import (
     classify_failure,
     now_iso,
 )
-from traceops.runtime.retry import RetryPolicy, RetryTracker, is_retryable
+from traceops.runtime.retry import is_retryable
 from traceops.evidence.audit import AuditCenter, AuditKind
 from traceops.runtime.run_ledger import RunLedger
 from traceops.runtime.investigation_run import InvestigationConfigSnapshot, InvestigationRun, RunStatus
@@ -45,6 +45,7 @@ class EventSource(Protocol):
     def ack(self, message_id: str) -> None: ...
 
 
+@runtime_checkable
 class EventSink(Protocol):
     """发布 investigation.* 结果事件。"""
 
@@ -240,6 +241,11 @@ class WorkerStats:
     #: 与 skipped_duplicate 分开计数：一个是"别人在做，让给他"，
     #: 一个是"他死了，我接手" —— 运维需要区分这两件事。
     reclaimed: int = 0
+    #: **结果事件没能发出去**的次数。
+    #: 这是一个必须存在的计数：调查本身可能成功，但结论没进 Redis，
+    #: 控制面那边看到的就是"这件事没发生过"。不单独计数的话，
+    #: 运维看到的只有"处理了 N 条"，看不出其中 N 条的结论丢了。
+    publish_failed: int = 0
     run_ids: list[str] = field(default_factory=list)
 
 
@@ -253,7 +259,6 @@ class InvestigationWorker:
         build_context: BuildContext,
         known_run_ids: set[str] | None = None,
         dead_letters: Any | None = None,
-        retry_policy: RetryPolicy | None = None,
         stale_claim_seconds: float = 900.0,
         ledger: RunLedger | None = None,
     ) -> None:
@@ -266,8 +271,9 @@ class InvestigationWorker:
         self._known_run_ids = set(known_run_ids or ())
         # 坏消息不能静默 ACK 掉：转移到死信流，保留审计痕迹
         self.dead_letters = dead_letters
-        # 重试策略：按 failure_reason 分类，不盲目重试（见 runtime/retry.py）
-        self.retry_policy = retry_policy or RetryPolicy()
+        # **重试不在这里决策**：worker 只在失败事件里说清"这类失败重试
+        # 有没有意义"（is_retryable），次数、退避和何时放弃由控制面决定
+        # —— 事故状态机和持久化 outbox 都在那边，而这里的计数活不过重启。
         # 认领多久算"陈旧"。默认与 BudgetManager 的 deadline 一致（900s）：
         # 一个调查最长跑这么久，超过它还没结束，说明持有者大概率已经死了，
         # 此时接管是安全的；小于它则会**误抢**正在正常处理的消息。
@@ -294,17 +300,29 @@ class InvestigationWorker:
                 center.add(AuditCenter.from_dead_letter(record))
         return center.timeline(kind=kind, subject=subject, since=since, until=until)
 
-    def _retry_decision(self, reason: str):
-        """独立的记账器：一次失败 → 一个决策。放在这里而不是 Run 上，
-        因为单次 poll_once 就是一次尝试。"""
-        tracker = RetryTracker(policy=self.retry_policy)
-        tracker.record_failure(reason=reason)
-        return tracker.decide(reason=reason)
-
     def poll_once(self, *, limit: int = 50) -> WorkerStats:
         stats = WorkerStats()
         batch = self.source.poll(limit=limit)
         for message in batch:
+            # **类型闸门在第一位**：worker 只对 investigation.requested 有反应。
+            #
+            # 为什么必须放在最前面：控制面和 worker 读的是**同一条**流
+            # traceops.events（不同消费组），worker 自己也会往这条流写
+            # investigation.updated / completed / failed。所以 worker 的
+            # 消费组一定会读到**自己写的消息**。
+            #
+            # 此前这类消息会被当成"非法请求"：进 dead_letter，并**再发一条
+            # investigation.failed** —— 每条自己写的消息都变成一条新的失败
+            # 事件，形成自我放大的回路（实测：跑一次 worker，流里多出两条
+            # failed，dead_letter 表被自己的输出污染）。
+            #
+            # 注意区分：**不关心的事件**（自己写的）跳过并 ACK；
+            # **关心但坏了的事件**（真请求缺字段）仍然进 dead_letter。
+            if not _is_requested_event(message):
+                stats.skipped_duplicate += 1
+                self.source.ack(message["id"])
+                continue
+
             run_id = _extract_run_id(message)
             # **认领**而不是"检查一下有没有见过"。
             # 旧写法 is_seen(...) 与后面的 record(...) 之间隔着整个调查时长，
@@ -366,6 +384,34 @@ class InvestigationWorker:
             occurred_at=now_iso(),
         ))
 
+    def _publish(self, message: dict[str, Any], stats: WorkerStats,
+                 *, event_type: str = "unknown") -> bool:
+        """发一条结果事件；发不出去就**记账并继续**，不让 worker 死掉。
+
+        为什么不能让异常直接冒出去：publish 失败通常是下游的问题
+        （Redis 抖了一下、网络断了）。如果它能把整个 worker 带走，
+        那么一个下游抖动就会让**所有**在途调查中断 —— 故障被放大成停机。
+        调查本身已经做完，把结论丢掉很可惜，但让 worker 活着更重要：
+        它可以继续跑完下一批。
+
+        但"丢掉"必须**可见**：stats.publish_failed 会进 poll 统计，
+        日志里也有 error 级记录。静默丢弃的结果是控制面那边永远等不到结论，
+        而 worker 这边一切正常 —— 这种故障最难查。
+
+        返回是否发布成功，让调用方能据此判断要不要补救。
+        """
+        try:
+            self.sink.publish(message)
+            return True
+        except Exception as exc:
+            stats.publish_failed += 1
+            log.error("failed to publish result event",
+                      extra={"event_type": event_type,
+                             "error_type": type(exc).__name__,
+                             "reason": str(exc)[:500]},
+                      exc_info=True)
+            return False
+
     def _handle(self, message: dict[str, Any], stats: WorkerStats) -> None:
         try:
             request = self.derive_request(message)
@@ -377,7 +423,8 @@ class InvestigationWorker:
                                "error_type": type(exc).__name__,
                                "reason": str(exc)[:200]})
             self._dead_letter(message, exc)
-            self.sink.publish(_invalid_request_event(message, str(exc)))
+            self._publish(_invalid_request_event(message, str(exc)), stats,
+                          event_type="investigation.invalid")
             stats.failed += 1
             return
 
@@ -404,7 +451,7 @@ class InvestigationWorker:
                                     config=config_snapshot)
         run.queue()
         run.start(node="plan")
-        self.sink.publish(started_event(run))
+        self._publish(started_event(run), stats, event_type="investigation.started")
         stats.run_ids.append(run.run_id)
         # 进度上报：每个节点完成时发一条 investigation.updated。
         # 此前整个调查只发 started_event 一条，前端只能看到 "RUNNING" ——
@@ -415,9 +462,10 @@ class InvestigationWorker:
             index = step_counter["index"]
             step_counter["index"] += 1
             evidence_count = len(state.get("evidence") or [])
-            self.sink.publish(progress_event(
+            self._publish(progress_event(
                 run, node=node_name, step_index=index,
-                description=None, evidence_count=evidence_count))
+                description=None, evidence_count=evidence_count), stats,
+                event_type="investigation.updated")
 
         try:
             result = run_investigation(request, ctx, on_node=_on_node)
@@ -428,9 +476,10 @@ class InvestigationWorker:
                 run.fail(reason=reason, node="collect")
                 # 是否可重试由统一策略决定，不在各处零散判断
                 self.ledger.finish(run.run_id, outcome=f"FAILED:{reason}")
-                self.sink.publish(failed_event(run, reason=reason,
-                                               retryable=is_retryable(reason),
-                                               detail="; ".join(result.errors)))
+                self._publish(failed_event(run, reason=reason,
+                                           retryable=is_retryable(reason),
+                                           detail="; ".join(result.errors)), stats,
+                              event_type="investigation.failed")
                 # 失败事件会进 Redis/控制面，但那是**下游**看得到的东西；
                 # worker 自己的日志必须也有一份 —— 否则从 worker 主机上
                 # 排查时只能看到"少了一条消息"。
@@ -444,7 +493,8 @@ class InvestigationWorker:
                 return
             run.complete()
             self.ledger.finish(run.run_id, outcome="COMPLETED")
-            self.sink.publish(completed_event(run, result.report))
+            self._publish(completed_event(run, result.report), stats,
+                          event_type="investigation.completed")
             stats.succeeded += 1
         except BudgetExhausted as exc:
             log.warning("investigation budget exhausted",
@@ -453,9 +503,10 @@ class InvestigationWorker:
                                "reason": str(exc)})
             run.fail(reason=FAILURE_BUDGET, node="collect")
             self.ledger.finish(run.run_id, outcome=f"FAILED:{FAILURE_BUDGET}")
-            self.sink.publish(failed_event(run, reason=FAILURE_BUDGET,
-                                           retryable=is_retryable(FAILURE_BUDGET),
-                                           detail=str(exc)))
+            self._publish(failed_event(run, reason=FAILURE_BUDGET,
+                                       retryable=is_retryable(FAILURE_BUDGET),
+                                       detail=str(exc)), stats,
+                          event_type="investigation.failed")
             stats.failed += 1
         except Exception as exc:  # 未预期错误：保留 checkpoint 供恢复
             log.error("investigation raised an unexpected error",
@@ -466,9 +517,10 @@ class InvestigationWorker:
                       exc_info=True)
             run.fail(reason=FAILURE_INTERNAL, node=run.current_node)
             self.ledger.finish(run.run_id, outcome=f"FAILED:{FAILURE_INTERNAL}")
-            self.sink.publish(failed_event(run, reason=FAILURE_INTERNAL,
-                                           retryable=is_retryable(FAILURE_INTERNAL),
-                                           detail=repr(exc)))
+            self._publish(failed_event(run, reason=FAILURE_INTERNAL,
+                                       retryable=is_retryable(FAILURE_INTERNAL),
+                                       detail=repr(exc)), stats,
+                          event_type="investigation.failed")
             stats.failed += 1
 
 
@@ -530,6 +582,40 @@ def _normalise_message_shape(message: dict[str, Any]) -> tuple[dict[str, Any], d
     return message.get("envelope") or {}, outer
 
 
+#: worker 唯一关心的入站事件类型。
+#:
+#: 用常量而不是字面量，是因为这个值同时出现在三处（类型闸门、
+#: derive 校验、文档），字面量复制粘贴迟早会漂。
+REQUESTED_EVENT_TYPE = "investigation.requested"
+
+#: **worker 自己会写出去**的事件类型：它们出现在同一条流上，
+#: 但不是给 worker 的输入。
+#:
+#: 闸门只跳过这些"认得出但不管"的事件；类型缺失或未知的消息
+#: 仍然交给 derive 判非法 → 进 dead_letter。跳过范围太宽的后果是
+#: 毒消息被静默吞掉 —— 看不见的坏消息比看得见的坏消息危险得多。
+_OWN_OUTPUT_EVENT_TYPES = frozenset({
+    "investigation.updated",
+    "investigation.completed",
+    "investigation.failed",
+    "investigation.started",
+    "investigation.invalid",
+})
+
+
+def _is_requested_event(message: dict[str, Any]) -> bool:
+    """这条消息是不是 worker 该处理的入站请求？
+
+    三种情况：
+    - ``event_type == investigation.requested`` → 处理（合法性交给 derive 判）
+    - ``event_type`` 是 worker 自己写的那种 → 跳过（但必须 ACK，见 poll_once）
+    - ``event_type`` 缺失或未知 → 也处理，交给 derive 判非法并进 dead_letter
+    """
+    envelope, _payload = _normalise_message_shape(message)
+    event_type = envelope.get("event_type")
+    return event_type not in _OWN_OUTPUT_EVENT_TYPES
+
+
 def derive_request_from_event(message: dict[str, Any]) -> InvestigationRequest:
     """把 investigation.requested 的 payload 转成调查请求。
 
@@ -538,7 +624,7 @@ def derive_request_from_event(message: dict[str, Any]) -> InvestigationRequest:
     """
     envelope, payload = _normalise_message_shape(message)
 
-    if envelope.get("event_type") not in (None, "investigation.requested"):
+    if envelope.get("event_type") not in (None, REQUESTED_EVENT_TYPE):
         raise ValueError(f"unexpected event_type: {envelope.get('event_type')!r}")
     if envelope.get("producer") not in (None, "control-plane"):
         raise ValueError(f"unexpected producer: {envelope.get('producer')!r}")

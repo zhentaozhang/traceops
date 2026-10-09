@@ -30,7 +30,6 @@ from traceops.orchestration.graph import InvestigationRequest, RunContext
 from traceops.runtime.budget import BudgetManager
 from traceops.runtime.deadletter import InMemoryDeadLetterSink
 from traceops.runtime.shutdown import StopSignal
-from traceops.runtime.retry import RetryPolicy
 from traceops.evidence.retention import RetentionPolicy
 from traceops.runtime.run_ledger import RunLedger
 from traceops.runtime.worker import (
@@ -188,7 +187,11 @@ def _run_until_stopped(worker, controller, *, sink=None, dead_letters=None,
             return iterations
         iterations += 1
         stats = worker.poll_once()
-        if sink is not None:
+        if sink is not None and isinstance(sink, InMemoryEventSink):
+            # 只有内存 sink 需要把消息打印出来 —— Redis sink 里的消息
+            # 已经在 Redis 里了，再打印一遍只是噪音。
+            # 之前这里无条件访问 sink.messages，redis 模式下直接
+            # AttributeError 崩掉：整个 worker 跑完一批就死。
             for message in sink.messages:
                 print(dumps(message), flush=True)
             sink.messages.clear()
@@ -198,7 +201,8 @@ def _run_until_stopped(worker, controller, *, sink=None, dead_letters=None,
             dead_letters.records.clear()
         if stats.processed or stats.failed or stats.skipped_duplicate:
             print(f"poll: processed={stats.processed} succeeded={stats.succeeded} "
-                  f"failed={stats.failed} skipped={stats.skipped_duplicate}",
+                  f"failed={stats.failed} skipped={stats.skipped_duplicate} "
+                  f"publish_failed={stats.publish_failed}",
                   file=sys.stderr)
         if once:
             return iterations
@@ -314,6 +318,9 @@ def main(argv: list[str] | None = None) -> int:
     dead_letters = InMemoryDeadLetterSink()
     # 账本必须持久化：否则重启后未 ACK 的消息会被重复调查
     ledger = RunLedger(path=Path(args.ledger_db) if args.ledger_db else None)
+    # 内存 sink 只是**默认**；--mode redis 会换成真正写 Redis 的那个。
+    # 此前无论什么模式都用内存 sink：redis 模式下产出的结论只进了
+    # 内存列表然后打到 stdout，控制面那边**一条终态事件都收不到**。
     sink = InMemoryEventSink()
 
     if args.purge:
@@ -341,6 +348,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "redis":
         from traceops.runtime.redis_transport import RespRedisTransport
         from traceops.runtime.redis_source import RedisStreamEventSource
+        from traceops.runtime.redis_sink import RedisStreamEventSink
 
         transport = RespRedisTransport(host=args.host, port=args.port)
         try:
@@ -352,6 +360,10 @@ def main(argv: list[str] | None = None) -> int:
             return 3
         source = RedisStreamEventSource(
             transport, stream=args.stream, group=args.group, consumer=args.consumer)
+        # 写端：把结论事件 XADD 回同一条流。控制面用**另一个消费组**读它们
+        # （control-plane-investigation vs traceops-workers）——
+        # 同一个流，两个组，各自拿到自己该看的那部分。
+        sink = RedisStreamEventSink(transport, stream=args.stream)
         if args.lag:
             # 只读查询后立即退出：这是运维用来回答"消费跟得上吗"的工具，
             # 不该顺手开始消费。
@@ -381,7 +393,6 @@ def main(argv: list[str] | None = None) -> int:
     worker = InvestigationWorker(
         source=source, sink=sink, derive_request=derive_request_from_event,
         build_context=build_context, dead_letters=dead_letters,
-        retry_policy=RetryPolicy(max_attempts=3),
         stale_claim_seconds=args.stale_claim_seconds,
         ledger=ledger,
     )

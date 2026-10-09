@@ -1,4 +1,14 @@
-"""调查重试策略（蓝图 §8.4 / §13.2）。
+"""调查失败原因的重试分类（蓝图 §8.4 / §13.2）。
+
+## 这里只做分类，不做排期
+
+"这次失败重试有没有意义"是 agent 侧的事：只有 agent 知道失败发生在
+哪一步、是不是瞬时的。但"重试几次、隔多久重试、什么时候放弃"是**控制面**
+的事：事故状态机和持久化 outbox 都在那边，而 agent 进程重启就丢了自己
+那份计数。
+
+所以本模块只剩分类器 `is_retryable`。重试的次数、退避和预算上限在
+`control-plane/.../investigation/InvestigationRetryService.java` 里。
 
 ## 分类的依据
 
@@ -24,8 +34,6 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 # contracts/events/v1/investigation-failed.schema.json 里的枚举，逐字对应
 RETRYABLE_REASONS: frozenset[str] = frozenset({
     "MCP_SERVER_UNAVAILABLE",
@@ -47,81 +55,13 @@ NON_RETRYABLE_REASONS: frozenset[str] = frozenset({
 
 
 def is_retryable(reason: str) -> bool:
-    """只有明确列为可重试的原因才重试；其余（含未知）一律不重试。"""
-    return (reason or "").strip().upper() in RETRYABLE_REASONS
+    """只有明确列为可重试的原因才重试；其余（含未知）一律不重试。
 
-
-@dataclass(frozen=True)
-class RetryDecision:
-    should_retry: bool
-    reason: str
-    delay_seconds: float = 0.0
-
-
-@dataclass
-class RetryPolicy:
-    max_attempts: int = 3
-    base_delay_seconds: float = 1.0
-    max_delay_seconds: float = 30.0
-    deadline_seconds: float | None = None
-
-    def should_attempt(self, *, attempt: int, reason: str,
-                       elapsed_seconds: float = 0.0) -> bool:
-        if not is_retryable(reason):
-            return False
-        if attempt >= self.max_attempts:
-            return False
-        if self.deadline_seconds is not None and elapsed_seconds >= self.deadline_seconds:
-            return False
-        return True
-
-    def delay_for(self, attempt: int) -> float:
-        """指数退避，带上限。没有上限时第 10 次要等 512 秒，等于放弃。"""
-        raw = self.base_delay_seconds * (2 ** max(0, attempt))
-        return min(raw, self.max_delay_seconds)
-
-
-@dataclass
-class RetryTracker:
-    """一次 Run 的重试记账。进程内对象；持久化走 snapshot()。"""
-
-    policy: RetryPolicy = field(default_factory=RetryPolicy)
-    failures: int = 0
-    last_reason: str | None = None
-    succeeded: bool = False
-
-    def record_failure(self, *, reason: str) -> None:
-        self.failures += 1
-        self.last_reason = reason
-
-    def record_success(self) -> None:
-        self.succeeded = True
-
-    def decide(self, *, reason: str, elapsed_seconds: float = 0.0) -> RetryDecision:
-        if self.succeeded:
-            return RetryDecision(False, "already succeeded")
-
-        if not is_retryable(reason):
-            return RetryDecision(False, f"not retryable: {reason}")
-
-        if not self.policy.should_attempt(
-                attempt=self.failures, reason=reason, elapsed_seconds=elapsed_seconds):
-            if self.policy.deadline_seconds is not None \
-                    and elapsed_seconds >= self.policy.deadline_seconds:
-                return RetryDecision(False, "deadline exceeded")
-            return RetryDecision(
-                False, f"attempts exhausted ({self.failures}/{self.policy.max_attempts})")
-
-        return RetryDecision(
-            True,
-            f"retrying after {reason}",
-            delay_seconds=self.policy.delay_for(self.failures),
-        )
-
-    def snapshot(self) -> dict:
-        return {
-            "failures": self.failures,
-            "max_attempts": self.policy.max_attempts,
-            "last_reason": self.last_reason,
-            "succeeded": self.succeeded,
-        }
+    不可重试清单**先判**：两个清单是同一个枚举的互补划分，写在一起时
+    一眼能看出它们没有重叠 —— 一旦有人往可重试清单里加了一个已经在
+    不可重试清单里的值，这里会明确地按"不可重试"处理，而不是碰运气。
+    """
+    key = (reason or "").strip().upper()
+    if key in NON_RETRYABLE_REASONS:
+        return False
+    return key in RETRYABLE_REASONS

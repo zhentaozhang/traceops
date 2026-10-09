@@ -1,4 +1,4 @@
-"""调查重试与恢复测试（蓝图 §8.4 / §13.2）。
+"""调查重试分类与进度保留（蓝图 §8.4 / §13.2）。
 
 ## 要解决的问题
 
@@ -6,21 +6,20 @@
 1. **盲目重试**：预算耗尽的调查重跑必然再次耗尽，纯烧钱
 2. **永不重试**：MCP 短暂不可用就让事故永远停在 FAILED
 
-正确做法：按失败原因分类决定是否可重试，并且重试时**继承已完成的进度**
-（checkpoint），而不是从零开始。
+正确做法：按失败原因分类决定是否可重试。
 
-`retryable` 的判定必须与 contracts 的 failure_reason 枚举同构。
+## 边界：这里只测分类
+
+**重试的次数、退避和预算上限在控制面**（`InvestigationRetryService.java`），
+不在 agent 侧：事故状态机和持久化 outbox 都在控制面，agent 进程重启
+就丢了自己那份计数。所以 agent 侧只保留 `is_retryable` 这个分类器，
+它必须与 contracts 的 failure_reason 枚举同构。
+
+分工由 `test_retry_ownership.py` 锁住。
 """
 from __future__ import annotations
 
-import pytest
-
-from traceops.runtime.retry import (
-    RetryDecision,
-    RetryPolicy,
-    RetryTracker,
-    is_retryable,
-)
+from traceops.runtime.retry import is_retryable
 
 
 class TestRetryClassification:
@@ -54,6 +53,9 @@ class TestRetryClassification:
     def test_datasource_query_error_is_retryable(self):
         assert is_retryable("DATASOURCE_QUERY_ERROR") is True
 
+    def test_evidence_write_error_is_retryable(self):
+        assert is_retryable("EVIDENCE_WRITE_ERROR") is True
+
     def test_datasource_missing_is_not_retryable(self):
         """数据源根本不存在，重试也不会出现。"""
         assert is_retryable("DATASOURCE_MISSING") is False
@@ -68,81 +70,40 @@ class TestRetryClassification:
         """未知原因默认不重试：宁可停下等人，也不要盲目循环。"""
         assert is_retryable("SOMETHING_NEW") is False
 
+    def test_the_two_lists_do_not_overlap(self):
+        """两个清单是同一枚举的互补划分。
 
-class TestRetryPolicy:
-    def test_max_attempts_enforced(self):
-        policy = RetryPolicy(max_attempts=3)
-        assert policy.should_attempt(attempt=0, reason="MCP_SERVER_UNAVAILABLE") is True
-        assert policy.should_attempt(attempt=1, reason="MCP_SERVER_UNAVAILABLE") is True
-        assert policy.should_attempt(attempt=2, reason="MCP_SERVER_UNAVAILABLE") is True
-        assert policy.should_attempt(attempt=3, reason="MCP_SERVER_UNAVAILABLE") is False
+        如果有人往可重试清单里加了一个已经在不可重试清单里的值，
+        这次重叠会立刻暴露 —— 否则分歧只会出现在"谁先判"这种隐式约定上。
+        """
+        from traceops.runtime.retry import NON_RETRYABLE_REASONS, RETRYABLE_REASONS
 
-    def test_non_retryable_reason_stops_immediately(self):
-        policy = RetryPolicy(max_attempts=10)
-        assert policy.should_attempt(attempt=0, reason="BUDGET_EXHAUSTED") is False
+        assert not (RETRYABLE_REASONS & NON_RETRYABLE_REASONS)
 
-    def test_backoff_grows_with_attempts(self):
-        policy = RetryPolicy(max_attempts=5, base_delay_seconds=1.0)
-        assert policy.delay_for(0) == 1.0
-        assert policy.delay_for(1) == 2.0
-        assert policy.delay_for(2) == 4.0
+    def test_the_lists_cover_every_contract_failure_reason(self):
+        """分类必须覆盖契约里的全部 failure_reason。
 
-    def test_backoff_is_capped(self):
-        """指数退避必须有上限，否则第 10 次要等 512 秒。"""
-        policy = RetryPolicy(max_attempts=10, base_delay_seconds=1.0, max_delay_seconds=30.0)
-        assert policy.delay_for(10) == 30.0
+        漏掉一个 = 那个原因会走"未知 → 不重试"这条默认路径，
+        看起来安全，实际上是把一个明确的分类变成了隐式的分类。
+        """
+        import json
+        import pathlib
 
-    def test_deadline_exhausted_blocks_retry(self):
-        """整体截止时间已过，即使原因可重试也不再排下一次。"""
-        policy = RetryPolicy(max_attempts=5, deadline_seconds=60)
-        assert policy.should_attempt(attempt=0, reason="MODEL_TIMEOUT", elapsed_seconds=61) is False
+        from traceops.runtime.retry import NON_RETRYABLE_REASONS, RETRYABLE_REASONS
 
+        schema_path = (
+            pathlib.Path(__file__).resolve().parents[3]
+            / "contracts" / "events" / "v1" / "investigation-failed.schema.json"
+        )
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        contract_reasons = set(
+            schema["properties"]["payload"]["properties"]["failure_reason"]["enum"]
+        )
 
-class TestRetryTracker:
-    """一次 Run 的重试记账。"""
-
-    def test_records_failed_attempts(self):
-        tracker = RetryTracker(RetryPolicy(max_attempts=3))
-        tracker.record_failure(reason="MODEL_TIMEOUT")
-        tracker.record_failure(reason="MODEL_TIMEOUT")
-        assert tracker.failures == 2
-
-    def test_decision_on_success_clears(self):
-        tracker = RetryTracker(RetryPolicy(max_attempts=3))
-        tracker.record_failure(reason="MODEL_TIMEOUT")
-        tracker.record_success()
-        decision = tracker.decide(reason="MODEL_TIMEOUT")
-        assert decision.should_retry is False
-        assert decision.reason == "already succeeded"
-
-    def test_decision_carries_delay(self):
-        tracker = RetryTracker(RetryPolicy(max_attempts=3, base_delay_seconds=2.0))
-        tracker.record_failure(reason="MODEL_TIMEOUT")
-        decision = tracker.decide(reason="MODEL_TIMEOUT")
-        assert decision.should_retry is True
-        assert decision.delay_seconds == 4.0  # 第 2 次尝试的退避
-
-    def test_exhausted_attempts_gives_terminal_decision(self):
-        tracker = RetryTracker(RetryPolicy(max_attempts=2))
-        tracker.record_failure(reason="MCP_SERVER_UNAVAILABLE")
-        tracker.record_failure(reason="MCP_SERVER_UNAVAILABLE")
-        decision = tracker.decide(reason="MCP_SERVER_UNAVAILABLE")
-        assert decision.should_retry is False
-        assert "attempts exhausted" in decision.reason
-
-    def test_non_retryable_gives_immediate_terminal(self):
-        tracker = RetryTracker(RetryPolicy(max_attempts=10))
-        decision = tracker.decide(reason="BUDGET_EXHAUSTED")
-        assert decision.should_retry is False
-        assert "not retryable" in decision.reason
-
-    def test_snapshot_for_persistence(self):
-        tracker = RetryTracker(RetryPolicy(max_attempts=3))
-        tracker.record_failure(reason="MODEL_TIMEOUT")
-        snap = tracker.snapshot()
-        assert snap["failures"] == 1
-        assert snap["max_attempts"] == 3
-        assert snap["last_reason"] == "MODEL_TIMEOUT"
+        assert contract_reasons == (RETRYABLE_REASONS | NON_RETRYABLE_REASONS), (
+            "契约里的 failure_reason 与 agent 侧的分类清单不一致："
+            f"契约独有 {contract_reasons - (RETRYABLE_REASONS | NON_RETRYABLE_REASONS)}，"
+            f"清单独有 {(RETRYABLE_REASONS | NON_RETRYABLE_REASONS) - contract_reasons}")
 
 
 class TestRetryKeepsCheckpoint:

@@ -45,17 +45,20 @@ public class InvestigationResultService {
     private final AppliedInvestigationEventRepository appliedEvents;
     private final InvestigationFindingRepository findings;
     private final FindingHistoryRepository history;
+    private final InvestigationRetryService retryService;
     private final ObjectMapper mapper;
 
     public InvestigationResultService(IncidentRepository incidents,
             AppliedInvestigationEventRepository appliedEvents,
             InvestigationFindingRepository findings,
             FindingHistoryRepository history,
+            InvestigationRetryService retryService,
             ObjectMapper mapper) {
         this.incidents = incidents;
         this.appliedEvents = appliedEvents;
         this.findings = findings;
         this.history = history;
+        this.retryService = retryService;
         this.mapper = mapper;
     }
 
@@ -174,19 +177,14 @@ public class InvestigationResultService {
             if (previous == IncidentStatus.NEW) {
                 Applied advanced = advanceOrReject(incident, result, previous,
                         List.of(IncidentStatus.INVESTIGATING), now);
-                return advanced.outcome() == Applied.Outcome.APPLIED
-                        ? new Applied(advanced.eventId(), advanced.investigationRunId(),
-                                advanced.incidentId(), Applied.Outcome.RETRY_PENDING,
-                                advanced.previousStatus(), advanced.resultingStatus(),
-                                null, false, true, result.reportRef(),
-                                "retryable failure; incident stays INVESTIGATING for a new run")
-                        : advanced;
+                if (advanced.outcome() != Applied.Outcome.APPLIED) {
+                    return advanced;
+                }
+                return retryOrFail(incident, result, advanced.previousStatus(),
+                        advanced.resultingStatus(), now);
             }
             if (previous == IncidentStatus.INVESTIGATING) {
-                return new Applied(result.eventId(), result.investigationRunId(), result.incidentId(),
-                        Applied.Outcome.RETRY_PENDING, previous, previous, null,
-                        false, true, result.reportRef(),
-                        "retryable failure; incident stays INVESTIGATING for a new run");
+                return retryOrFail(incident, result, previous, previous, now);
             }
             // 已进入诊断/审批/处置阶段却收到可重试失败：状态机没有回退边，
             // 不能把一个已经诊断过的事故拽回 INVESTIGATING，交人工决定是否重开。
@@ -199,6 +197,44 @@ public class InvestigationResultService {
 
         // 不可重试：明确失败，转终态 FAILED（需人工介入，不进自动重试）。
         return advanceOrReject(incident, result, previous, List.of(IncidentStatus.FAILED), now);
+    }
+
+    /**
+     * 安排下一轮重试；预算耗尽则把事故判死。
+     *
+     * <p>这是"可重试失败"真正产生行为的地方。此前它只返回 {@code RETRY_PENDING}
+     * 并写下一句"等新一轮 Run"——但没有任何东西会发出那一轮，事故就永远停住了。
+     *
+     * <p>两种结局，缺一不可：
+     * <ul>
+     *   <li>预算还有 → 真的发一条新的 investigation.requested（新的 run_id、
+     *       同一个事故、同一个时间窗、causation_id 指向失败事件），返回 RETRY_PENDING。</li>
+     *   <li>预算用完 → 把事故推成 FAILED。**不这么做事故就永远卡在 INVESTIGATING**：
+     *       既没有诊断结论，也不是失败，值班同学看到的是一个"永远在调查中"的事故。</li>
+     * </ul>
+     */
+    private Applied retryOrFail(Incident incident, InvestigationResult result,
+            IncidentStatus previous, IncidentStatus resulting, Instant now) {
+        if (retryService.budgetExhausted(incident)) {
+            log.warn("retry budget exhausted, failing the incident: incident={} attempts={}",
+                    incident.getId(), incident.getRetryAttempts());
+            return advanceOrReject(incident, result, previous, List.of(IncidentStatus.FAILED), now);
+        }
+
+        boolean scheduled = retryService.scheduleRetry(incident, result.eventId(), now);
+        if (!scheduled) {
+            // 排不上重试（事故已是终态 / 预算耗尽）：绝不能让事故悬在半空。
+            // 落到 FAILED 才是诚实的表达——它确实没查出结论。
+            log.warn("retry could not be scheduled, failing the incident: incident={}",
+                    incident.getId());
+            return advanceOrReject(incident, result, previous, List.of(IncidentStatus.FAILED), now);
+        }
+
+        incidents.save(incident);
+        return new Applied(result.eventId(), result.investigationRunId(), result.incidentId(),
+                Applied.Outcome.RETRY_PENDING, previous, resulting, null,
+                false, true, result.reportRef(),
+                "retryable failure; a new investigation run was scheduled for this incident");
     }
 
     /**

@@ -35,7 +35,10 @@ public class OutboxRelay {
 
     @Transactional
     public int relayOnce() {
-        List<OutboxEvent> batch = repository.findTop50ByPublishedAtIsNullOrderByCreatedAtAsc();
+        // 只取"当前可投递"的事件：退避中的重试请求（not_before 在未来）不参与本轮，
+        // 否则它会挡在批次中间 —— relay 遇错即 break（保序），一条还没到时间的
+        // 重试会把后面所有事件一起卡住。
+        List<OutboxEvent> batch = repository.findDeliverable(Instant.now());
         int published = 0;
         for (OutboxEvent event : batch) {
             try {

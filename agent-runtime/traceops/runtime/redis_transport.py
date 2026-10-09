@@ -539,6 +539,37 @@ class RespRedisTransport:
                 return 0
         return 0
 
+    def xadd(self, stream: str, payload: str, *, max_len: int | None = None) -> str | None:
+        """`XADD <stream> [MAXLEN ~ <n>] * payload <json>`，返回条目 id。
+
+        返回 ``None`` 表示**没有拿到回执** —— 事件没有发出去。
+        为什么不在这里抛异常：调用方（`RedisStreamEventSink`）要区分
+        "没回执"和"命令被 Redis 拒绝"，两种都是失败，但错误信息不同。
+
+        `MAXLEN ~` 是近似裁剪：Redis 只需要在某个节点上裁一次，
+        比精确裁剪便宜得多；代价是流的长度可能略微超过 max_len。
+        这正是我们要的 —— 宁可多留几十条，也不能为了精确长度付出 O(n) 代价。
+        """
+        stream = _require_text("stream", stream)
+        if not isinstance(payload, str):
+            raise ValueError(f"payload must be a str, got {type(payload).__name__}")
+        if max_len is not None:
+            max_len = _require_int("max_len", max_len, minimum=1)
+
+        args: list[Any] = ["XADD", stream]
+        if max_len is not None:
+            args += ["MAXLEN", "~", max_len]
+        args += ["*", "payload", payload]
+
+        reply = self._command(*args)
+        if reply is None:
+            return None
+        if isinstance(reply, bytes):
+            return reply.decode("utf-8", errors="replace")
+        if isinstance(reply, str):
+            return reply
+        raise RedisProtocolError(f"XADD 应返回条目 id 字符串，实际 {reply!r}")
+
     def xgroup_create(self, stream: str, group: str, *, start_id: str = "0",
                       mkstream: bool = True) -> None:
         """`XGROUP CREATE <s> <g> <start> MKSTREAM`。

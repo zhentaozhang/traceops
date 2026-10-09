@@ -99,9 +99,15 @@ public class IncidentService {
         incidents.save(incident);
 
         String runId = EventMessages.newRunId();
+        // 记住这次调查要问的窗口：重试必须问同一个问题，否则每轮重试都在换问题。
+        Instant windowEnd = now;
+        Instant windowStart = now.minus(EventMessages.DEFAULT_WINDOW);
+        incident.rememberInvestigationWindow(windowStart, windowEnd);
         Map<String, Object> message = EventMessages.investigationRequested(
                 incident.getId(), request.service(), runId, environment, configVersion,
-                "manual", now);
+                // 优先级必须是契约枚举里的值（low|normal|high）。此前这里写的是 "manual"，
+                // 契约校验会直接判它违规 —— 人工来源由 incident.origin 表达，不该塞进 priority。
+                "normal", now, windowStart, windowEnd, null);
         outbox.save(OutboxEvent.pending(EventMessages.newEventId(),
                 EventMessages.INVESTIGATION_REQUESTED, runId, 1L, toJson(message), now));
         incident.transitionTo(IncidentStatus.INVESTIGATING, now);
@@ -239,9 +245,13 @@ public class IncidentService {
         incidents.save(incident);
 
         String runId = EventMessages.newRunId();
+        // 记住这次调查要问的窗口：重试必须问同一个问题，否则每轮重试都在换问题。
+        Instant windowEnd = now;
+        Instant windowStart = now.minus(EventMessages.DEFAULT_WINDOW);
+        incident.rememberInvestigationWindow(windowStart, windowEnd);
         Map<String, Object> message = EventMessages.investigationRequested(
                 incident.getId(), alert.service(), runId, environment, configVersion,
-                priorityOf(alert), now);
+                priorityOf(alert), now, windowStart, windowEnd, null);
         String eventId = String.valueOf(((Map<?, ?>) message.get("envelope")).get("event_id"));
         outbox.save(OutboxEvent.pending(eventId, EventMessages.INVESTIGATION_REQUESTED, runId, 1L,
                 toJson(message), now));

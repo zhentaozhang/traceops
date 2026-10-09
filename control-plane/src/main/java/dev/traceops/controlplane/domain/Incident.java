@@ -46,6 +46,27 @@ public class Incident {
 
     private Instant updatedAt;
 
+    /**
+     * 首次调查请求使用的时间窗。
+     *
+     * <p>为什么必须记住它：重试要问的是**同一个问题**。如果重试时用"当前时间往前 5 分钟"，
+     * 那每一轮重试问的窗口都不同 —— 这不是重试，是换了问题再问一遍，
+     * 结论不可比，还可能查不到同一个故障的证据。
+     *
+     * <p>只写一次：后续重试不得覆盖（覆盖 = 窗口随重试滑动，退化成新问题）。
+     */
+    private Instant investigationWindowStart;
+
+    private Instant investigationWindowEnd;
+
+    /**
+     * 已经安排过多少轮重试。
+     *
+     * <p>必须持久化：重试次数是跨进程、跨重启的事实。放在内存里的话，
+     * 控制面一重启计数就归零，一次持续抖动就能把重试预算无限刷新。
+     */
+    private int retryAttempts;
+
     @Version
     private long version;
 
@@ -90,6 +111,26 @@ public class Incident {
         this.updatedAt = now;
     }
 
+    /**
+     * 记住本次调查要问的时间窗。
+     *
+     * <p>只在第一次记录：后续重试沿用同一个窗口，否则每轮重试都在问不同的问题。
+     * 幂等：重复调用不会改写已记录的窗口。
+     */
+    public void rememberInvestigationWindow(Instant start, Instant end) {
+        if (investigationWindowStart == null && start != null && end != null) {
+            this.investigationWindowStart = start;
+            this.investigationWindowEnd = end;
+        }
+    }
+
+    /** 记录一次重试，返回累计次数。 */
+    public int recordRetryAttempt() {
+        this.retryAttempts += 1;
+        this.updatedAt = Instant.now();
+        return this.retryAttempts;
+    }
+
     public String getId() {
         return id;
     }
@@ -128,5 +169,18 @@ public class Incident {
 
     public long getVersion() {
         return version;
+    }
+
+    /** 首次调查请求使用的窗口起点（可能为 null：尚未发过调查请求）。 */
+    public Instant getInvestigationWindowStart() {
+        return investigationWindowStart;
+    }
+
+    public Instant getInvestigationWindowEnd() {
+        return investigationWindowEnd;
+    }
+
+    public int getRetryAttempts() {
+        return retryAttempts;
     }
 }
