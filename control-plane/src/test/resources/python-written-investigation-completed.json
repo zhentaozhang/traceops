@@ -1,0 +1,29 @@
+{
+  "envelope": {
+    "aggregate_id": "run-live-1",
+    "aggregate_version": 3,
+    "causation_id": null,
+    "correlation_id": "inc-live-1",
+    "event_id": "evt-ba914660-f4a3-4019-97b1-1b990e66ea0f",
+    "event_type": "investigation.completed",
+    "occurred_at": "2026-10-31T16:17:27.774940+00:00",
+    "producer": "agent-runtime",
+    "schema_version": "1.0"
+  },
+  "payload": {
+    "abstained": true,
+    "diagnosis_status": "INCONCLUSIVE",
+    "evidence_summary": {
+      "total": 0
+    },
+    "investigation_run_id": "run-live-1",
+    "rca_report_ref": "run-live-1/report",
+    "root_cause_candidates": [],
+    "usage": {
+      "duration_seconds": 0,
+      "rounds": 7,
+      "tokens": 0,
+      "tool_calls": 3
+    }
+  }
+}
