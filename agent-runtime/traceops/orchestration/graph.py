@@ -139,6 +139,16 @@ class InvestigationResult:
     errors: list[str]
     tool_calls: int
     tokens_used: int
+    #: 本次调查里"查过、但确实没有数据"的查询。
+    #:
+    #: 它和 `errors`（没法查）是**两回事**，必须分开存：
+    #:
+    #: - errors → 数据源挂了，报告不能基于它做任何结论
+    #: - no_data_queries → 查过了，确实没有 —— 这是**阴性观测**，
+    #:   可以支持 REFUTED（"如果真是池耗尽，日志里该有超时，但查了没有"）
+    #:
+    #: 混在一起的后果正是 aurora-lab 记录的：把"没看见"当成"看见了"。
+    no_data_queries: list[str] = field(default_factory=list)
 
 
 class InvestigationState(TypedDict, total=False):
@@ -160,6 +170,8 @@ class InvestigationState(TypedDict, total=False):
     status: str
     errors: list[str]
     missing_data: list[str]
+    #: "查过、确实没有"的查询（与 errors 分开，见 InvestigationResult.no_data_queries）
+    no_data_queries: list[str]
 
 
 CTX_CONFIG_KEY = "traceops_ctx"
@@ -292,6 +304,34 @@ def _unwrap_raw(raw: Any, evidence_type: EvidenceType) -> dict[str, Any]:
     return raw
 
 
+def _is_empty_payload(raw: Any) -> bool:
+    """这次查询是不是「查了，但什么都没有」。
+
+    判据与 `ToolGateway._is_empty_result` 同源 —— 那一份是"什么算空"的
+    **唯一**真值：Gateway 用它区分 OK / NO_DATA 做审计，这里用它区分
+    "有证据" / "没有数据"。两处若各写一套，形状迟早漂移，
+    于是审计说 NO_DATA、编排却造出一条空证据（这正是当前存在的缺陷）。
+
+    这里判的是**归一化之后**的形状（`_unwrap_raw` 已剥掉外层 status/data），
+    而 Gateway 判的是原始响应。两者覆盖的真实形状一致：
+      - Prometheus matrix: {"resultType": "matrix", "result": []}
+      - Loki streams:      {"streams": []}
+      - Tempo batches:     {"batches": []}
+    """
+    if raw is None:
+        return True
+    if isinstance(raw, (str, list, dict, tuple, set)) and len(raw) == 0:
+        return True
+    if isinstance(raw, dict):
+        for key in ("result", "records", "spans", "series", "batches", "streams", "traces"):
+            value = raw.get(key)
+            if isinstance(value, (list, tuple)) and len(value) == 0:
+                return True
+        if raw.get("traces_considered") == 0:
+            return True
+    return False
+
+
 def _observed_at(raw: dict[str, Any], evidence_type: EvidenceType, fallback: datetime) -> datetime:
     """从数据本身取观测时间；取不到时用窗口结束时间。
 
@@ -399,6 +439,7 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
     ctx.gateway = gateway
     evidence_list: list[Evidence] = []
     missing = list(state.get("missing_data", []))
+    no_data = list(state.get("no_data_queries", []))
 
     for item in state["plan"]:
         # 内置工具走 Gateway（权限/限额/审计）；事件证据由控制面事件转换而来，不调工具
@@ -430,6 +471,27 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
             window = (request.window_start, request.window_end)
             raw = unwrapped
 
+        # **「查了，没有」必须在归一化之前判定**。
+        #
+        # 归一化器对空输入一律拒绝（metric/log/trace 三个都是），
+        # 那是刻意的：空结果不是证据。如果放任它抛到下面的 except，
+        # 就会被记成 missing_data（"没法查"）—— 语义正好反了：
+        # 我们明明查了，确实没有。
+        #
+        # 判据复用 Gateway 的 `_is_empty_result`（同一份"什么算空"的真值），
+        # 不在这里另写一套形状判断 —— 两份定义必然漂移。
+        if item["tool"] != "config_change_event" and _is_empty_payload(raw):
+            no_data.append(
+                f"{item['tool']}[{item.get('service', request.service_hint)}]: "
+                "query succeeded but returned no data"
+            )
+            log.info("datasource query returned no data; no evidence created",
+                     extra={"tool": item["tool"],
+                            "service": item.get("service", request.service_hint),
+                            "run_id": request.investigation_run_id,
+                            "incident_id": request.incident_id})
+            continue
+
         try:
             evidence = normalize(
                 evidence_type=item["evidence_type"],
@@ -449,7 +511,7 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
                 observed_at=observed_at,
                 window=window,
             )
-        except Exception as exc:  # 空结果/形状异常 → 记为缺失数据，不伪造证据
+        except Exception as exc:  # 形状异常 → 记为缺失数据，不伪造证据
             missing.append(f"{item['tool']}: {exc}")
             continue
 
@@ -457,7 +519,7 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
         ctx.store.add(evidence)
         evidence_list.append(evidence)
 
-    return {"evidence": evidence_list, "missing_data": missing}
+    return {"evidence": evidence_list, "missing_data": missing, "no_data_queries": no_data}
 
 
 @_charged
@@ -991,6 +1053,7 @@ def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str,
         fault_start=request.fault_start,
         store=ctx.store,
         missing_data=missing,
+        no_data=list(state.get("no_data_queries", [])),
         affected_services=_affected_services(state, config),
         correlation_notes=_correlation_notes(state),
         propagation_chain=_propagation_chain(state, ctx),
@@ -1064,6 +1127,7 @@ def _initial_state(request: InvestigationRequest) -> InvestigationState:
         "status": "RUNNING",
         "errors": [],
         "missing_data": [],
+        "no_data_queries": [],
     }
 
 
@@ -1120,4 +1184,5 @@ def run_investigation(request: InvestigationRequest, ctx: RunContext, *,
         errors=list(final.get("errors", [])),
         tool_calls=ctx.budget.tool_calls,
         tokens_used=ctx.budget.tokens_used,
+        no_data_queries=list(final.get("no_data_queries", [])),
     )

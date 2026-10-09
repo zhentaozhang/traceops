@@ -32,7 +32,44 @@ MAX_TOOL_CALLS = 40
 
 
 class ScenarioDataUnavailable(RuntimeError):
-    """该场景没有声明这类信号（模拟"数据源里查不到数据"）。"""
+    """该场景没有声明这类信号（模拟"数据源里查不到数据"）。
+
+    .. deprecated::
+        **不再用于表达"场景没声明这类信号"**。那件事现在返回合法的空
+        payload（见 `_empty_*_payload`），因为它是"查了，没有"，不是
+        "没法查"。保留这个类型只为兼容既有引用；新代码不该再抛它。
+
+    真正需要抛的场景是"查询本身失败了"（比如数据源挂了）—— 那种情况
+    走普通异常路径，gateway 会记成 ERROR。
+    """
+
+
+def _empty_metric_payload(service: str) -> dict[str, Any]:
+    """Prometheus 的"查到了，但是空的"响应。
+
+    形状必须和真实 Prometheus 一致（`resultType: matrix` + 空 `result`），
+    否则 normalizer 会抛 ValueError，绕一圈又变成 ERROR。
+    """
+    return {
+        "status": "success",
+        "data": {"resultType": "matrix", "result": []},
+    }
+
+
+def _empty_log_payload(service: str) -> dict[str, Any]:
+    """Loki 的"查到了，但是空的"响应（`resultType: streams` + 空 `result`）。"""
+    return {
+        "status": "success",
+        "data": {"resultType": "streams", "result": []},
+    }
+
+
+def _empty_trace_payload() -> dict[str, Any]:
+    """Tempo 的"查到了，但是空的"响应（`traces_considered: 0` + 空 `batches`）。
+
+    这正是 gateway `_is_empty_result` 认得的第三种空形状。
+    """
+    return {"traces_considered": 0, "batches": []}
 
 
 def _epoch(value: datetime) -> float:
@@ -72,9 +109,11 @@ def error_rate_payload(scenario: Scenario, service: str | None = None) -> dict[s
     service = service or scenario.service_hint
     series = _series_for(scenario, service)
     if not series:
-        raise ScenarioDataUnavailable(
-            f"{scenario.scenario_id}: no error-rate series declared for {service}"
-        )
+        # **空结果不是错误**。场景没为这个服务声明错误率序列 = 这个服务
+        # 在这个时间窗里没有错误率数据 —— 和真实 Prometheus 返回空 result
+        # 是同一件事。抛异常会让 gateway 记成 ERROR（"没法查"），
+        # 而语义是 NO_DATA（"查了，没有"）—— 两者的结论方向正好相反。
+        return _empty_metric_payload(service)
     last = _epoch(scenario.fault_start)
     values = [[last - STEP_SECONDS * (len(series) - 1 - i), float(v)] for i, v in enumerate(series)]
     return {
@@ -90,9 +129,7 @@ def logs_payload(scenario: Scenario, service: str | None = None) -> dict[str, An
     service = service or scenario.service_hint
     messages = _logs_for(scenario, service)
     if not messages:
-        raise ScenarioDataUnavailable(
-            f"{scenario.scenario_id}: no error logs declared for {service}"
-        )
+        return _empty_log_payload(service)
     base_ns = int(_epoch(scenario.fault_start) * 1_000_000_000)
     values = [[str(base_ns + i * 1_000_000_000), message] for i, message in enumerate(messages)]
     return {
@@ -113,9 +150,7 @@ def traces_payload(scenario: Scenario, service: str | None = None) -> dict[str, 
     service = service or scenario.service_hint
     spans, offset_ms = _spans_for(scenario, service)
     if not spans:
-        raise ScenarioDataUnavailable(
-            f"{scenario.scenario_id}: no slow spans declared for {service}"
-        )
+        return _empty_trace_payload()
     start_us = int(_epoch(scenario.fault_start) * 1_000_000) + offset_ms * 1000
     tempo_spans = [
         {

@@ -232,6 +232,16 @@ class RCAReport(BaseModel):
         ),
     )
     missing_data: list[str] = Field(default_factory=list)
+    # 「查过了，确实没有」的查询。
+    #
+    # 为什么必须和 missing_data 分开：
+    #   - missing_data = **没法查**（数据源挂了 / 查询失败）→ 禁止 REFUTED
+    #   - no_data      = **查了，没有**（查询成功，结果为空）→ 阴性观测，
+    #     可以支持 REFUTED（"如果真是池耗尽，日志里该有超时，但查了没有"）
+    #
+    # 把两者混为一谈就是把"没看见"当成"看见了" —— aurora-lab 记录的
+    # "absence of evidence into fabricated findings" 正是这个 bug 的下游。
+    no_data: list[str] = Field(default_factory=list)
     abstained: bool = False
     # 根因**开始**的时间。来自 rank1 候选支持证据的最早 observed_at，
     # 没有支持证据时为 None（**不拿 fault_start 充数**）。

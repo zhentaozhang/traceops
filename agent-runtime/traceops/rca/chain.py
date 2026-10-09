@@ -52,6 +52,24 @@ class PropagationNode:
         }
 
 
+def _has_observation(evidence: Evidence) -> bool:
+    """这条证据里是否真的有**观测记录**。
+
+    与 `graph._observed_services` 同一判据（记录数 > 0）——
+    "查过了"不等于"观测到了"。空证据不是观测。
+    """
+    data = evidence.normalized_data or {}
+    records = (
+        data.get("total_records")
+        or data.get("result_count")
+        or len(data.get("records") or [])
+        or len(data.get("spans") or [])
+        or len(data.get("series") or [])
+        or len(data.get("events") or [])
+    )
+    return bool(records)
+
+
 def build_propagation_chain(
     *,
     root_service: str,
@@ -84,6 +102,11 @@ def build_propagation_chain(
         if evidence.service_id is None:
             continue  # 变更事件没有归属服务，不进链
         if evidence.service_id not in candidates:
+            continue
+        if not _has_observation(evidence):
+            # 零记录的证据**不进链**。归一化器已经拒绝空结果，这里是第二道闸：
+            # 链的每一跳都声称"我们观测到了这个服务"，
+            # 一条空证据会让"我们查了它"冒充"我们看见它出问题了"。
             continue
         evidence_by_service.setdefault(evidence.service_id, []).append(evidence)
 

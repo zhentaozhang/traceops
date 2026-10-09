@@ -9,10 +9,10 @@ Evidence-driven Agentic RCA Platform —— 面向微服务系统的智能故障
 
 | 平面 | 状态 | 测试 |
 |---|---|---|
-| Control Plane（Java / Spring Boot） | ✅ 告警接入、事故关联、状态机、Outbox、结果消费、**诊断结论 REST 查询** | 70 passing |
-| Investigation Plane（Python / LangGraph） | ✅ 7 节点图、双层采集、传播链、重试分类 | 510 passing（含评估） |
+| Control Plane（Java / Spring Boot） | ✅ 告警接入、事故关联、状态机、Outbox、结果消费、**诊断结论 REST 查询**、**失败自动重试** | 126 passing |
+| Investigation Plane（Python / LangGraph） | ✅ 7 节点图、双层采集、传播链、重试分类 | 908 passing |
 | Evidence Plane（Python） | ✅ 4 类归一化、内容寻址校验、**SQLite 持久化**、查询模板、证据图 | 同上 |
-| Evaluation Plane（Python） | ✅ 6 场景（含三服务级联 F-005）+ 18 指标 + runner | 同上 |
+| Evaluation Plane（Python） | ✅ 12 场景（含三服务级联 F-005、F-011 自然语言线索）+ 18 指标 + runner | 96 passing |
 | Execution Plane（受控修复） | ✅ Action Registry + Policy + Approval + Executor | 21 passing |
 | Topology（服务依赖） | ✅ 双向语义、环检测、平局裁决 | 19 passing |
 | 观测栈（docker compose） | ✅ **已拉起**：Prometheus/Loki/Tempo/Grafana + mcp-grafana | 4 服务 healthy |
@@ -33,15 +33,17 @@ Evidence-driven Agentic RCA Platform —— 面向微服务系统的智能故障
 
 
 
+
 ## 仓库结构
 
 ```
 traceops/
 
+│   └── reference/             # 外部项目（dsh-superagent）逐行取证报告，只读
 ├── contracts/                 # Java↔Python 版本化事件契约（JSON Schema 单一事实来源）
 │   ├── common/                #   事件信封、时间窗口
 │   ├── events/v1/             #   investigation.requested/updated/completed/failed
-│   └── tests/                 #   Python 侧契约测试（10 passing）
+│   └── tests/                 #   Python 侧契约测试（13 passing）
 ├── control-plane/             # Java 21 · Spring Boot 3.5（状态机 + Outbox + Web + 契约校验）
 ├── agent-runtime/             # Python 3.11 · LangGraph 1.2（证据引擎 + 规则 RCA + 适配器 + 预算）
 ├── evaluation/                # 场景 JSON + harness + 指标 + runner CLI
@@ -68,10 +70,10 @@ cd traceops
 python -m venv --system-site-packages .venv
 .venv/bin/python -m pip install -e agent-runtime --no-build-isolation
 
-# 全部测试（510）
-PYTHONPATH=agent-runtime .venv/bin/python -m pytest agent-runtime/tests evaluation -q
+# 全部测试（agent-runtime 908 + evaluation 96 + contracts 13 = 1017）
+PYTHONPATH=agent-runtime .venv/bin/python -m pytest agent-runtime/tests evaluation contracts -q
 
-# 跑评估：6 场景 + 指标
+# 跑评估：12 场景 + 指标
 .venv/bin/python -m evaluation.runner
 ```
 
@@ -79,7 +81,7 @@ PYTHONPATH=agent-runtime .venv/bin/python -m pytest agent-runtime/tests evaluati
 
 ```bash
 cd traceops/control-plane
-mvn -s .mvn/settings.xml -B test        # 18 tests
+mvn -s .mvn/settings.xml -B test        # 126 tests
 mvn -s .mvn/settings.xml spring-boot:run # :8081
 
 curl -X POST localhost:8081/api/v1/alerts -H 'Content-Type: application/json' -d '{
@@ -141,11 +143,12 @@ order-service 的日志： "ERROR redis timeout - connection pool exhausted"
 
 ## 已知局限（不粉饰）
 
-- 评估指标的 1.00 来自**合成场景**，不是真实准确率；六个场景按检测规则反向构造，
+- 评估指标的 1.00 来自**合成场景**，不是真实准确率；12 个场景按检测规则反向构造，
   存在"规则自证"风险
 - F-005 的 `chain=1.00` 已通过（拆出 `propagation_chain` + 双层采集后修复）。
-  但 F-005 的 citation precision 只有 0.10：多服务采集会把症状服务证据也收进来，
-  这是"多查服务"与"引用要精确"的固有权衡
+  F-005 的 citation precision 实测 **0.60**（此前文档写的 0.10 是过期值：
+  根因是级联场景的分母算错，已修，见 EVALUATION.md）。剩余差距是"多查服务"
+  与"引用要精确"的固有权衡
 - **Tempo 2.5 下 `get_tempo_trace` 恒 404**（Tempo 缺 `/api/v2/traces` 端点）。
   已降级为用 `search_tempo_traces` 的 spanSet 构造证据，并在
   `Evidence.normalized_data` 标记 `degraded=True`。升到 Tempo ≥ 2.6 可恢复完整 span 树

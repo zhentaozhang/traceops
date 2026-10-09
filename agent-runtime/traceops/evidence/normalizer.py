@@ -83,6 +83,12 @@ class MetricNormalizer:
             elif "value" in item:  # vector
                 ts, v = item["value"]
                 series.append({"metric": item.get("metric", {}), "value": [ts, float(v)]})
+        # **空结果不是证据**。与 TraceNormalizer / LogNormalizer 保持一致：
+        # "查了，什么都没有"不能变成一条零系列的证据 ——
+        # 那会让报告引用一批空东西，并把"没看见"记成"看见了"。
+        # 真的查不了（数据源挂了）由适配器抛异常，走 ERROR 路径。
+        if not series:
+            raise ValueError("metric payload: contains no series (an empty result is not evidence)")
         return {"kind": self.kind, "result_type": raw["resultType"],
                 "series": series, "result_count": len(series),
                 "total_records": len(series), "truncated": False}
@@ -117,6 +123,10 @@ class LogNormalizer:
                     "span_id": meta.get("span_id"),
                 }
                 records.append(rec)
+        # **空结果不是证据**（与 metric / trace 同策略）：
+        # 一条零行的日志证据会让"查了，没有"冒充"查到了"。
+        if not records:
+            raise ValueError("log payload: contains no records (an empty result is not evidence)")
         return {"kind": self.kind, "records": records,
                 "total_records": total, "truncated": truncated}
 

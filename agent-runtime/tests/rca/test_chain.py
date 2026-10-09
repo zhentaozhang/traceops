@@ -32,12 +32,42 @@ WINDOW = (TS - timedelta(minutes=10), TS + timedelta(minutes=10))
 
 
 def ev(service: str, etype: EvidenceType, *, at: datetime | None = None) -> Evidence:
+    """构造一条**真实形状**的证据。
+
+    `normalized_data` 必须带记录：归一化器对空结果一律拒绝
+    （metric / log / trace 三者一致），所以"零记录证据"在生产里已经不存在。
+    这里写出的形状要和归一化器的输出一致，否则测试就在验证一个
+    现实中不存在的状态。
+    """
+    payload: dict = {"kind": etype.value, "total_records": 1, "result_count": 1}
+    if etype is EvidenceType.LOG:
+        payload["records"] = [{"timestamp": TS.isoformat(), "message": "ERROR pool exhausted",
+                               "labels": {"level": "ERROR"}}]
+    elif etype is EvidenceType.METRIC:
+        payload["series"] = [{"metric": {"service": service}, "values": [[TS.timestamp(), "0.4"]]}]
+    elif etype is EvidenceType.TRACE:
+        payload["spans"] = [{"operation_name": "redis GET", "duration_us": 3_000_000}]
     return Evidence(
         incident_id="inc-001", investigation_run_id="run-001",
         evidence_type=etype, source_id="src", service_id=service,
         observed_at=at or TS, window_start=WINDOW[0], window_end=WINDOW[1],
         query_template_id="qt-v1", query_params={},
-        normalized_data={"kind": etype.value},
+        normalized_data=payload,
+    )
+
+
+def zero_record_ev(service: str) -> Evidence:
+    """一条**零记录**的证据 —— 「查了，什么都没有」。
+
+    生产里归一化器会拒绝这种输入，但链构建必须自己守住这道闸：
+    链上每一跳都声称"我们观测到了这个服务"。
+    """
+    return Evidence(
+        incident_id="inc-001", investigation_run_id="run-001",
+        evidence_type=EvidenceType.LOG, source_id="src", service_id=service,
+        observed_at=TS, window_start=WINDOW[0], window_end=WINDOW[1],
+        query_template_id="qt-v1", query_params={},
+        normalized_data={"kind": "log", "total_records": 0, "records": []},
     )
 
 
@@ -110,6 +140,23 @@ class TestChainConstruction:
     def test_empty_evidence_yields_empty_chain(self):
         chain = build_propagation_chain(root_service="redis", evidence_list=[], topology=topology())
         assert chain == []
+
+    def test_zero_record_evidence_never_enters_the_chain(self):
+        """零记录的证据**不是观测** —— 不能让服务进链。
+
+        链上每一跳都声称"我们观测到了这个服务"。一条空证据会让
+        "我们查过它"冒充"我们看见它出问题了"。
+        """
+        evidence_list = [
+            ev("redis", EvidenceType.LOG, at=TS),
+            zero_record_ev("order-service"),
+            zero_record_ev("api-gateway"),
+        ]
+        chain = build_propagation_chain(
+            root_service="redis", evidence_list=evidence_list, topology=topology())
+
+        assert [n.service for n in chain] == ["redis"], (
+            "只有零记录证据的服务不该进链")
 
 
 class TestChainEvidenceLinks:
