@@ -64,7 +64,13 @@ def main(argv: list[str] | None = None) -> int:
         outcomes = []
         for scenario in scenarios:
             try:
-                outcome = run_scenario(scenario, model=model if profile.enable_model else None)
+                # **必须传 profile**：只打印 digest 而不传，等于三个臂跑同一份
+                # 配置 —— 结果相同不是"场景没区分力"，是"根本没跑不同的东西"。
+                outcome = run_scenario(
+                    scenario,
+                    model=model if profile.enable_model else None,
+                    profile=profile,
+                )
                 outcomes.append({
                     "scenario_id": scenario.scenario_id,
                     "ac1": outcome.service_ac_at_1,

@@ -10,9 +10,9 @@ Evidence-driven Agentic RCA Platform —— 面向微服务系统的智能故障
 | 平面 | 状态 | 测试 |
 |---|---|---|
 | Control Plane（Java / Spring Boot） | ✅ 告警接入、事故关联、状态机、Outbox、结果消费、**诊断结论 REST 查询**、**失败自动重试** | 126 passing |
-| Investigation Plane（Python / LangGraph） | ✅ 7 节点图、双层采集、传播链、重试分类 | 908 passing |
+| Investigation Plane（Python / LangGraph） | ✅ 7 节点图、双层采集、传播链、重试分类 | 915 passing |
 | Evidence Plane（Python） | ✅ 4 类归一化、内容寻址校验、**SQLite 持久化**、查询模板、证据图 | 同上 |
-| Evaluation Plane（Python） | ✅ 12 场景（含三服务级联 F-005、F-011 自然语言线索）+ 18 指标 + runner | 96 passing |
+| Evaluation Plane（Python） | ✅ 12 场景（含三服务级联 F-005、F-011 自然语言线索）+ 18 指标 + runner | 106 passing |
 | Execution Plane（受控修复） | ✅ Action Registry + Policy + Approval + Executor | 21 passing |
 | Topology（服务依赖） | ✅ 双向语义、环检测、平局裁决 | 19 passing |
 | 观测栈（docker compose） | ✅ **已拉起**：Prometheus/Loki/Tempo/Grafana + mcp-grafana | 4 服务 healthy |
@@ -70,7 +70,7 @@ cd traceops
 python -m venv --system-site-packages .venv
 .venv/bin/python -m pip install -e agent-runtime --no-build-isolation
 
-# 全部测试（agent-runtime 908 + evaluation 96 + contracts 13 = 1017）
+# 全部测试（agent-runtime 915 + evaluation 106 + contracts 13 = 1034）
 PYTHONPATH=agent-runtime .venv/bin/python -m pytest agent-runtime/tests evaluation contracts -q
 
 # 跑评估：12 场景 + 指标
@@ -143,12 +143,20 @@ order-service 的日志： "ERROR redis timeout - connection pool exhausted"
 
 ## 已知局限（不粉饰）
 
-- 评估指标的 1.00 来自**合成场景**，不是真实准确率；12 个场景按检测规则反向构造，
-  存在"规则自证"风险
+- 评估指标全部来自**合成场景**，不是真实准确率；12 个场景按检测规则反向构造，
+  存在"规则自证"风险。当前 `AC@1=0.91`（不是满分：F-000 应弃权、F-010 是设计内的平局）
+- **`AC@3`/`AC@5` 不可引用**：候选池最大只有 4，`AC@5` 是数学恒等式。
+  只看 `lift@1=3.64`（对阵 `chance@1=0.25`）
 - F-005 的 `chain=1.00` 已通过（拆出 `propagation_chain` + 双层采集后修复）。
   F-005 的 citation precision 实测 **0.60**（此前文档写的 0.10 是过期值：
   根因是级联场景的分母算错，已修，见 EVALUATION.md）。剩余差距是"多查服务"
   与"引用要精确"的固有权衡
+- **E4/E5 消融目前测不出差异**，且这是**结构性**的：语义闸门的触发条件与
+  候选生成条件互斥（`coverage==0` 不可达），矛盾检测也无法让 `REFUTED` 成立。
+  确定性路径上这两个闸门是防御性代码，只在模型提出低质量假设时才有效
+  （`agent-runtime/tests/rca/test_gate_reachability.py` 钉住这个边界）
+- `must_identify_rate=0.91`（不是 1.00）：F-007 的双故障只报出了 redis，
+  `billing-api` 从未被采集。这是真实的漏报，不是口径问题
 - **Tempo 2.5 下 `get_tempo_trace` 恒 404**（Tempo 缺 `/api/v2/traces` 端点）。
   已降级为用 `search_tempo_traces` 的 spanSet 构造证据，并在
   `Evidence.normalized_data` 标记 `degraded=True`。升到 Tempo ≥ 2.6 可恢复完整 span 树

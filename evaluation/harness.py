@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
+from evaluation.investigation_profile import DEFAULT_PROFILE
 from evaluation.metrics import ScenarioOutcome, score_scenario
 from evaluation.scenario import Scenario
 from traceops.evidence.store import EvidenceStore
@@ -222,11 +223,17 @@ def build_request(scenario: Scenario) -> InvestigationRequest:
     )
 
 
-def run_scenario(scenario: Scenario, *, model=None) -> ScenarioOutcome:
+def run_scenario(scenario: Scenario, *, model=None, profile=None) -> ScenarioOutcome:
     """执行一次调查并打分。每次运行使用全新的 store / budget，互不污染。
 
     `model` 传入时启用 LLM 假设生成（E1/E2 消融臂需要它；
     不传则走纯确定性路径，即 E3/E4/E5）。
+
+    `profile` 传入时把该臂的策略**真的**应用到这个 RunContext 上。
+    必须真的应用：算一个 digest 却只拿去打印、不传给运行，等于三个臂
+    跑的是同一份配置 —— 消融会得出"三臂结果相同"，而真相是
+    "三臂根本没跑不同的东西"。这种失败比"测不出差异"更危险：
+    它把"没接线"包装成"消融完成、E5 无增益"。
     """
     store = EvidenceStore()
     adapters = ScenarioAdapters(scenario)
@@ -235,6 +242,9 @@ def run_scenario(scenario: Scenario, *, model=None) -> ScenarioOutcome:
         if scenario.topology_edges
         else None
     )
+    # 不传 profile 时用 DEFAULT_PROFILE —— 它就是当前代码行为，
+    # 由 test_investigation_profile 逐项比对代码常量，所以默认不变。
+    effective = profile or DEFAULT_PROFILE
     ctx = RunContext(
         store=store,
         adapters=adapters,
@@ -242,6 +252,13 @@ def run_scenario(scenario: Scenario, *, model=None) -> ScenarioOutcome:
         topology=topology,
         scope_depth=scenario.scope_depth,
         model=model,
+        # E4 vs E5 的唯一差别：假设验证的两项能力
+        enable_semantic_gate=effective.enable_semantic_gate,
+        enable_contradiction=effective.enable_contradiction,
     )
     result = run_investigation(build_request(scenario), ctx)
+    # 把本次**实际使用**的策略 digest 记进报告：两次调查同一事故结论不同时，
+    # 要能回答"是策略变了还是数据变了"。
+    if result.report is not None:
+        result.report.profile_digest = effective.digest()
     return score_scenario(scenario, result)
