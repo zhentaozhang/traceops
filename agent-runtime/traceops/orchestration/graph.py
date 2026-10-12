@@ -54,7 +54,13 @@ from traceops.rca.semantic import check_all
 from traceops.rca.ranking import RankedCandidate, derive_signals, rank_hypotheses
 from traceops.rca.report import build_report
 from traceops.runtime.budget import BudgetExhausted, BudgetManager
-from traceops.runtime.model import ModelGateway, ModelRequest, ModelUnavailable, hypothesis_to_domain
+from traceops.runtime.model import (
+    REJECTION_REASONS,
+    ModelGateway,
+    ModelRequest,
+    ModelUnavailable,
+    hypothesis_to_domain,
+)
 from traceops.tools.gateway import SPILL_REF_KEY, ToolGateway, register_builtin_tools
 
 SLOW_SPAN_THRESHOLD_MS = 500
@@ -129,6 +135,16 @@ class RunContext:
     enable_semantic_gate: bool = True
     # 确定性矛盾检测：生成 CONTRADICTS 关系，供 R-005 降权。
     enable_contradiction: bool = True
+    # ---- 影子模式 ----
+    # 列在里面的弃权闸门**照常计算、照常记录，但不改变结论**。
+    #
+    # 与 `enable_semantic_gate=False` 的区别：那个是"不启用、也不观测"，
+    # 这个是"观测但不执行"。线上校准需要后者 —— 关掉闸门跑一周等于一周没有
+    # 保护；影子模式同时得到"闸门生效时的结论"和"闸门放开时的结论"。
+    # 可用名见 `traceops/rca/shadow.py`：ambiguity_gate / semantic_gate /
+    # refutation_gate。
+    shadow_gates: frozenset[str] = frozenset()
+
 
 
 @dataclass
@@ -172,6 +188,11 @@ class InvestigationState(TypedDict, total=False):
     missing_data: list[str]
     #: "查过、确实没有"的查询（与 errors 分开，见 InvestigationResult.no_data_queries）
     no_data_queries: list[str]
+    #: 被校验或去重丢掉的模型提案（带原因码）。
+    #:
+    #: 必须声明在 TypedDict 里 —— LangGraph 只合并这里列出的键，未声明的键
+    #: 会被静默丢弃，表现为"节点明明 append 了、报告里永远是空列表"。
+    rejected_proposals: list[dict[str, Any]]
 
 
 CTX_CONFIG_KEY = "traceops_ctx"
@@ -566,6 +587,7 @@ def _hypothesize_node(state: InvestigationState, config: RunnableConfig) -> dict
     ctx = _ctx_from(config)
     evidence_list = state.get("evidence", [])
     missing = list(state.get("missing_data", []))
+    rejected_proposals: list[dict[str, Any]] = []
 
     # 分层规则（三件事分开，别一刀切）：
     #   1. **生成候选**：只有调查层证据可以。影响层是上游/兄弟的症状，
@@ -611,17 +633,36 @@ def _hypothesize_node(state: InvestigationState, config: RunnableConfig) -> dict
             response = None
         if response is not None:
             existing = {(h.candidate_service, h.fault_type, h.candidate_component) for h in hypotheses}
+            for rejected in response.rejected:
+                rejected_proposals.append({
+                    "candidate_service": rejected.candidate_service,
+                    "fault_type": rejected.fault_type,
+                    "reason": rejected.reason,
+                    "reason_text": REJECTION_REASONS.get(rejected.reason, rejected.reason),
+                })
             for proposal in response.hypotheses:
                 key = (proposal.candidate_service, proposal.fault_type, proposal.candidate_component)
                 if key in existing:
-                    continue  # 与规则假设重复，不产生并列候选
+                    # 与规则假设重复不产生并列候选，但必须留痕 —— 否则"模型提了
+                    # 但被去重"和"模型没提"在事后无法区分。
+                    rejected_proposals.append({
+                        "candidate_service": proposal.candidate_service,
+                        "fault_type": proposal.fault_type,
+                        "reason": "duplicate_of_rule_hypothesis",
+                        "reason_text": REJECTION_REASONS["duplicate_of_rule_hypothesis"],
+                    })
+                    continue
                 existing.add(key)
                 hypotheses.append(hypothesis_to_domain(
                     proposal, investigation_run_id=request.investigation_run_id))
 
     if not hypotheses:
         missing.append("no candidate hypotheses generated from collected evidence")
-    return {"hypotheses": hypotheses, "missing_data": missing}
+    return {
+        "hypotheses": hypotheses,
+        "missing_data": missing,
+        "rejected_proposals": rejected_proposals,
+    }
 
 
 #: 机制关键词：用于给模型"命中了什么"，而不是把日志原文喂进去。
@@ -1091,6 +1132,7 @@ def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str,
         propagation_chain=_propagation_chain(state, ctx),
         incident_id=request.incident_id,
         topology=ctx.topology,
+        rejected_proposals=list(state.get("rejected_proposals", [])),
         semantic_checks=(
             {
                 check.hypothesis_id: check
@@ -1100,8 +1142,9 @@ def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str,
                     topology=ctx.topology,
                 )
             }
-            if ctx.enable_semantic_gate else None
+            if ctx.enable_semantic_gate or "semantic_gate" in ctx.shadow_gates else None
         ),
+        shadow_gates=ctx.shadow_gates,
     )
     return {"report": report, "status": report.diagnosis_status}
 

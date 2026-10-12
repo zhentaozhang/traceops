@@ -22,9 +22,17 @@ from typing import Any, Protocol
 from traceops.runtime.budget import BudgetExhausted, BudgetManager
 
 
+#: 提案被丢弃的原因码。取值固定，报告要能按原因聚合。
+REJECTION_REASONS: dict[str, str] = {
+    "missing_candidate_service": "缺少 candidate_service",
+    "missing_fault_type": "缺少 fault_type",
+    "service_out_of_scope": "候选服务不在证据或拓扑范围内",
+    "duplicate_of_rule_hypothesis": "与规则生成的假设完全重复，不产生并列候选",
+}
+
+
 class ModelUnavailable(RuntimeError):
     """模型不可用（超时/限流/凭证失效）。调用方应记入 missing_data，而不是伪造结果。"""
-
 
 class ModelContractViolation(ModelUnavailable):
     """模型输出违反契约（结构不合法，如自称 confidence）。
@@ -74,6 +82,21 @@ class ModelRequest:
 
 
 @dataclass(frozen=True)
+class RejectedProposal:
+    """被校验丢掉的模型提案，连同**丢弃原因**。
+
+    为什么要留这个：`_validate` 原本对越界提案 `continue` 静默丢弃 ——
+    模型提了三条、一条都没用上，事后无法回答"它是提错了还是我们收窄了范围"。
+    这类"看起来有能力、实际没接线"的静默路径正是这个仓库反复修的病症。
+    """
+
+    candidate_service: str
+    fault_type: str
+    #: `REJECTION_REASONS` 里的键。
+    reason: str
+
+
+@dataclass(frozen=True)
 class ModelResponse:
     hypotheses: list[ModelHypothesis]
     input_tokens: int
@@ -81,6 +104,8 @@ class ModelResponse:
     # 模型的停止原因。`length` 表示被截断 —— 必须可辨识，否则
     # "预算配少了"会被误读成"模型能力不行"。
     finish_reason: str = "stop"
+    #: 被校验丢弃的提案（带原因）。空列表 ≠ "模型什么也没提"，后者看 `hypotheses`。
+    rejected: list[RejectedProposal] = field(default_factory=list)
 
     @property
     def total_tokens(self) -> int:
@@ -186,14 +211,18 @@ class ModelGateway:
         except BudgetExhausted:
             raise  # settle 不会抛，这里防御性保留
 
-        validated = self._validate(response, allowed)
+        kept, rejected = self._validate(response, allowed)
         return ModelResponse(
-            hypotheses=validated,
+            hypotheses=kept,
             input_tokens=response.input_tokens,
             output_tokens=response.output_tokens,
+            finish_reason=response.finish_reason,
+            rejected=rejected,
         )
 
-    def _validate(self, response: ModelResponse, allowed: set[str]) -> list[ModelHypothesis]:
+    def _validate(
+        self, response: ModelResponse, allowed: set[str]
+    ) -> tuple[list[ModelHypothesis], list[RejectedProposal]]:
         """模型输出必须过 schema + 白名单：越界假设直接丢弃，不进入排序。
 
         两道关卡的顺序是**先结构后业务**：
@@ -203,15 +232,32 @@ class ModelGateway:
         结构校验放在前面，因为"字段越界"（例如模型自称 confidence）是
         **契约级违规**，比"服务不在白名单"更根本 —— 前者说明模型没守住
         输出格式，后者只是这次猜得离谱。
+
+        丢弃必须**留痕**：返回的 `rejected` 带原因码，最终写进报告的
+        `rejected_proposals`。静默丢弃会让"模型提了但没用上"和"模型没提"
+        在事后完全无法区分。
         """
         kept: list[ModelHypothesis] = []
+        rejected: list[RejectedProposal] = []
         for hypothesis in response.hypotheses:
-            if not hypothesis.candidate_service or not hypothesis.fault_type:
+            if not hypothesis.candidate_service:
+                rejected.append(RejectedProposal(
+                    candidate_service="", fault_type=hypothesis.fault_type,
+                    reason="missing_candidate_service"))
+                continue
+            if not hypothesis.fault_type:
+                rejected.append(RejectedProposal(
+                    candidate_service=hypothesis.candidate_service, fault_type="",
+                    reason="missing_fault_type"))
                 continue
             if allowed and hypothesis.candidate_service not in allowed:
+                rejected.append(RejectedProposal(
+                    candidate_service=hypothesis.candidate_service,
+                    fault_type=hypothesis.fault_type,
+                    reason="service_out_of_scope"))
                 continue
             kept.append(hypothesis)
-        return kept
+        return kept, rejected
 
     def model_info(self) -> dict[str, Any]:
         return {

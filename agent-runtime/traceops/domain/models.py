@@ -256,6 +256,18 @@ class RCAReport(BaseModel):
     # 为什么必须记录：两次调查同一事故结论不同时，要能回答
     # "是策略变了还是数据变了"。没有这个字段就只能靠猜。
     profile_digest: str | None = None
+    # 影子判定：某些闸门被要求"只观察不生效"时，把它们本来会下的结论记在这里。
+    #
+    # 为什么必须进报告而不是只打日志：这是**唯一**能回答"这个弃权闸门拦得对不对"
+    # 的证据。只写日志的话，问题一旦发生就已经过去了，无从回看。
+    # 每条形如 {"gate", "would_be", "reason", "reason_text", "detail"}。
+    shadow_decisions: list[dict] = Field(default_factory=list)
+    # 被丢掉的模型提案（带原因码）。
+    #
+    # 静默丢弃会让"模型提了但没用上"和"模型什么也没提"在事后完全无法区分 ——
+    # 而这两件事的修法相反：前者要放宽校验，后者要改进提示词或输入。
+    # 每条形如 {"candidate_service", "fault_type", "reason", "reason_text"}。
+    rejected_proposals: list[dict] = Field(default_factory=list)
     generated_at: datetime = Field(default_factory=_utcnow)
 
     def all_evidence_ids(self) -> set[str]:
