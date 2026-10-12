@@ -60,6 +60,11 @@ class ToolSpec(BaseModel):
 SPILL_REF_KEY = "_spill"
 #: 预览字符数上限。固定值（不用上下文比例）：单次调用场景下上下文占用是固定的。
 _SPILL_PREVIEW_CHARS = 2000
+#: 单次读回的默认字符数。与 super-agent 的 `textPage` 同量级（4000 UTF-16 单位），
+#: 目的是让"读完一份大结果"变成若干次可预算的分页，而不是一次塞满上下文。
+_SPILL_PAGE_CHARS = 4000
+#: 单页硬上限。超过这个值的请求一律被夹住 —— 分页的意义就是不让调用方一次要太多。
+_SPILL_PAGE_MAX_CHARS = 8000
 
 
 class SpillStore:
@@ -95,6 +100,73 @@ class SpillStore:
             "preview": encoded[:_SPILL_PREVIEW_CHARS],
             "truncated": True,
         }
+
+    # ---- 读回 ----
+    #
+    # 只有 save 的时候，落盘等于"把证据扔进了黑洞"：调用方拿到一个指针，
+    # 却没有任何路径把它换回内容。对证据引擎来说这比丢弃更糟 ——
+    # 审计说「结果已保留」，实际不可读。
+    #
+    # 读回必须同时守住三件事，缺一条就是漏洞：
+    #   1. **路径围栏**：引用里带的是绝对路径，直接 open() 就能读任意文件。
+    #      解析后必须仍在 root 之内。
+    #   2. **内容校验**：落盘是内容寻址的，读回时重算摘要与引用里的 digest 比对。
+    #      不一致说明文件被换过 —— 这条路径专门用来把"原始数据"喂给证据链，
+    #      读回来的东西必须真的是当初写下去的那份。
+    #   3. **分页**：一次读全量等于把溢出问题原样搬回上下文。
+
+    def _confined_path(self, ref: dict[str, Any]) -> Path:
+        raw_path = ref.get("path")
+        if not raw_path:
+            raise ValueError("spill reference has no path (spill_failed?)")
+        resolved = Path(str(raw_path)).resolve()
+        root = self.root.resolve()
+        if not resolved.is_relative_to(root):
+            # 明确的越界，不是"文件不存在"：后者可能只是被清理了，
+            # 前者是有人构造了一个指向别处的引用。
+            raise PermissionError(
+                f"spill reference points outside the spill root: {resolved} not under {root}")
+        return resolved
+
+    def load(self, ref: dict[str, Any]) -> Any:
+        """按引用取回完整内容（不截断）。路径越界或内容被改都抛异常。"""
+        return json.loads(self._read_verified(ref))
+
+    def page(self, ref: dict[str, Any], *, offset: int = 0,
+             max_chars: int = _SPILL_PAGE_CHARS) -> dict[str, Any]:
+        """分页读回一段文本（对应 super-agent 的 `textPage` 契约）。
+
+        返回 `{text, offset, total_chars, next_offset, truncated}` ——
+        `next_offset is None` 是"读完了"的唯一判据，调用方不必自己比较长度。
+        """
+        text = self._read_verified(ref)
+        limit = max(1, min(int(max_chars), _SPILL_PAGE_MAX_CHARS))
+        start = max(0, min(int(offset), len(text)))
+        end = min(start + limit, len(text))
+        return {
+            "text": text[start:end],
+            "offset": start,
+            "total_chars": len(text),
+            "next_offset": end if end < len(text) else None,
+            "truncated": end < len(text),
+        }
+
+    def _read_verified(self, ref: dict[str, Any]) -> str:
+        """围栏 + 摘要校验的统一读路径。
+
+        分页也要校验：否则调用方可以把一个被换掉的文件分十页读完，
+        每页都"成功"，拼起来却不是原件。
+        """
+        path = self._confined_path(ref)
+        encoded = path.read_text(encoding="utf-8")
+        expected = ref.get("digest")
+        if expected:
+            actual = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            if actual != expected:
+                raise ValueError(
+                    "spilled payload does not match its digest: "
+                    f"expected {expected}, got {actual}")
+        return encoded
 
 
 class ToolGateway:
@@ -264,6 +336,33 @@ class ToolGateway:
                 "spill_failed": True,
                 "error": str(exc)[:200],
             }}
+
+    # ---- spill read-back ----
+    @staticmethod
+    def is_spill_reference(result: Any) -> bool:
+        """这个返回值是"指针"还是"数据"。"""
+        return isinstance(result, dict) and SPILL_REF_KEY in result
+
+    def load_spilled(self, result: dict[str, Any]) -> Any:
+        """把 spill 引用换回完整原始内容。
+
+        给**编排层**用（证据归一化需要全量），不是给模型用 —— 模型侧走
+        `page_spilled`，一次只给一页，避免把溢出问题原样搬回上下文。
+        """
+        ref = result[SPILL_REF_KEY]
+        if ref.get("spill_failed"):
+            raise ValueError(
+                "spilled payload was never written: " + str(ref.get("error", "unknown")))
+        return self._spill.load(ref)
+
+    def page_spilled(self, result: dict[str, Any], *, offset: int = 0,
+                     max_chars: int = _SPILL_PAGE_CHARS) -> dict[str, Any]:
+        """分页读回（模型/报告侧）。"""
+        ref = result[SPILL_REF_KEY]
+        if ref.get("spill_failed"):
+            raise ValueError(
+                "spilled payload was never written: " + str(ref.get("error", "unknown")))
+        return self._spill.page(ref, offset=offset, max_chars=max_chars)
 
     # ---- audit ----
     def _record(self, tool: str, outcome: str, params: dict[str, Any],

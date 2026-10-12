@@ -55,7 +55,7 @@ from traceops.rca.ranking import RankedCandidate, derive_signals, rank_hypothese
 from traceops.rca.report import build_report
 from traceops.runtime.budget import BudgetExhausted, BudgetManager
 from traceops.runtime.model import ModelGateway, ModelRequest, ModelUnavailable, hypothesis_to_domain
-from traceops.tools.gateway import ToolGateway, register_builtin_tools
+from traceops.tools.gateway import SPILL_REF_KEY, ToolGateway, register_builtin_tools
 
 SLOW_SPAN_THRESHOLD_MS = 500
 
@@ -443,6 +443,7 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
 
     for item in state["plan"]:
         # 内置工具走 Gateway（权限/限额/审计）；事件证据由控制面事件转换而来，不调工具
+        spilled_ref: dict[str, Any] | None = None
         if item["tool"] == "config_change_event":
             raw = {"event": {**item["payload"], "type": "config_change"}}
             observed_at = item["observed_at"]
@@ -466,6 +467,30 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
                             exc_info=True)
                 missing.append(f"{item['tool']}: {exc}")
                 continue
+            # **超限结果必须先读回再归一化**。
+            #
+            # Gateway 对超过 max_result_bytes 的结果返回的是指针
+            # `{_spill: {...}}`，不是数据本身。此前这里直接把指针交给
+            # Normalizer，三个归一化器全部拒绝，ValueError 落进
+            # missing_data —— 一次完全成功的查询，只因为数据量大，
+            # 变成了"缺失数据"。证据覆盖率下降的根因居然只是体积。
+            #
+            # 落盘保护的是**上下文**，不是证据链：归一化在本进程内完成，
+            # 全量读回不占模型 token，所以这里读全量是对的。
+            if gateway.is_spill_reference(raw):
+                try:
+                    spilled_ref = raw[SPILL_REF_KEY]
+                    raw = gateway.load_spilled(raw)
+                except Exception as exc:
+                    log.warning("spilled datasource result could not be read back",
+                                extra={"tool": item["tool"],
+                                       "error_type": type(exc).__name__,
+                                       "reason": str(exc),
+                                       "run_id": request.investigation_run_id},
+                                exc_info=True)
+                    missing.append(
+                        f"{item['tool']}: result was spilled but unreadable ({exc})")
+                    continue
             unwrapped = _unwrap_raw(raw, item["evidence_type"])
             observed_at = _observed_at(unwrapped, item["evidence_type"], request.window_end)
             window = (request.window_start, request.window_end)
@@ -514,6 +539,13 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
         except Exception as exc:  # 形状异常 → 记为缺失数据，不伪造证据
             missing.append(f"{item['tool']}: {exc}")
             continue
+
+        # 超限结果把落盘指针挂到证据上：证据本身是**归一化后的摘要**
+        # （`normalized_data` 有记录数上限），全量原文在 spill 文件里。
+        # 不记这个指针的话，报告引用了一条证据、却说不出"全量在哪" ——
+        # 那正是「落盘即黑洞」的一半症状。另一半（读回）在上面的 load_spilled。
+        if spilled_ref is not None and spilled_ref.get("path"):
+            evidence.raw_snapshot_ref = str(spilled_ref["path"])
 
         ctx.store.register_source(item["source_id"])
         ctx.store.add(evidence)
