@@ -18,5 +18,10 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["traceops*"]
 
+# 提示词是运行时读的数据文件，不是 Python 源码 —— 不声明就不会进 wheel，
+# 于是"源码目录里能跑、装完就 PromptNotFound"。
+[tool.setuptools.package-data]
+"traceops.prompts" = ["*.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

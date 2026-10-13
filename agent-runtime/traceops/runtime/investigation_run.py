@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 
+from traceops.prompts import prompt_version
+
 
 class RunStatus(str, Enum):
     CREATED = "CREATED"
@@ -86,16 +88,23 @@ class InvestigationConfigSnapshot:
         """
         provider = "none"
         name = "deterministic-rules"
+        prompt_version_used: str | None = None
         if model_name:
             name = model_name
             # 客户端名形如 "openai-compatible:<model>"，前缀即 provider
             provider = model_name.split(":", 1)[0] if ":" in model_name else model_name
+            # 提示词版本是**内容哈希**，不是手填的串：改一个字符版本就变，
+            # 不改就一定不变。只有真的挂了模型，这次 run 才用到了提示词 ——
+            # 纯规则跑的 run 记一个提示词版本反而是假信息。
+            prompt_version_used = prompt_version()
+
         return cls(
             model_provider=provider,
             model_name=name,
             # 采集深度与预算都会改变结论，因此属于可复现性信息
             topology_version=f"file-declared;scope_depth={scope_depth}",
             workflow_version=f"p0-v1;max_tool_calls={max_tool_calls}",
+            system_prompt_version=prompt_version_used,
             config_version=config_version,
         )
 
