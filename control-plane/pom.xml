@@ -44,11 +44,12 @@
       <artifactId>h2</artifactId>
       <scope>runtime</scope>
     </dependency>
+    <!-- 生产代码里用（ContractValidator 在组装事件时校验契约）。
+         曾经是 test 作用域 —— 那正好对应"契约只在测试里校验"这个真实状态。 -->
     <dependency>
       <groupId>com.networknt</groupId>
       <artifactId>json-schema-validator</artifactId>
       <version>${json-schema-validator.version}</version>
-      <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>org.springframework.boot</groupId>
@@ -62,6 +63,35 @@
       <plugin>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+      <!-- 把仓库根目录的 contracts/ 复制进 classpath。
+           契约文件只有一份（在仓库根），Java 侧不维护副本 ——
+           维护副本就一定会漂移，而漂移的契约比没有契约更坏。 -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-resources-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>copy-event-contracts</id>
+            <phase>process-resources</phase>
+            <goals>
+              <goal>copy-resources</goal>
+            </goals>
+            <configuration>
+              <outputDirectory>${project.build.outputDirectory}/contracts</outputDirectory>
+              <resources>
+                <resource>
+                  <directory>${project.basedir}/../contracts</directory>
+                  <includes>
+                    <include>common/*.schema.json</include>
+                    <include>events/v1/*.schema.json</include>
+                    <include>models/*.schema.json</include>
+                  </includes>
+                </resource>
+              </resources>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
     </plugins>
   </build>

@@ -75,7 +75,7 @@ class TestWorkerUsesRealSnapshot:
         event = {
             "id": "e-1",
             "payload": {
-                "envelope": {"event_id": "evt-1", "event_type": "investigation.requested",
+                "envelope": {"event_id": "evt-11111111-1111-4111-8111-111111111111", "event_type": "investigation.requested",
                              "schema_version": "1.0", "occurred_at": "2026-10-30T10:02:00Z",
                              "producer": "control-plane", "correlation_id": "inc-1",
                              "aggregate_id": "run-1", "aggregate_version": 1, "causation_id": None},

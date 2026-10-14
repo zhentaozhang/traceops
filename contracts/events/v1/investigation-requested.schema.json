@@ -11,7 +11,10 @@
   "additionalProperties": false,
   "properties": {
     "envelope": {
-      "$ref": "../../common/event-envelope.schema.json"
+      "allOf": [
+        {"$ref": "../../common/event-envelope.schema.json"},
+        {"properties": {"event_type": {"const": "investigation.requested"}}}
+      ]
     },
     "payload": {
       "type": "object",
@@ -47,6 +50,11 @@
         "config_version": {
           "type": "string",
           "description": "调查配置快照版本（模型、Prompt、策略、工具 Schema）。Run 恢复时按此版本取配置。"
+        },
+        "alert_summary": {
+          "type": "string",
+          "maxLength": 4000,
+          "description": "告警原文（自然语言线索）。规则路径不读它，只透传给模型 —— 这让\"能否利用自然语言线索\"成为可测的差异来源。此前该字段在契约与两侧实现里都不存在，于是评测场景里的线索在生产里从未到达过模型。"
         },
         "priority": {
           "type": "string",

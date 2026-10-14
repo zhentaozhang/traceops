@@ -218,7 +218,9 @@ def build_request(scenario: Scenario) -> InvestigationRequest:
         window_start=scenario.window_start,
         window_end=scenario.window_end,
         config_change=config_change,
-        priority="P1",
+        # 契约里只有 low|normal|high 三档。这里曾经写 "P1" —— 评测自己
+        # 用了一套词汇，于是"评测里能跑通"并不代表"生产契约能接受"。
+        priority="high",
         alert_summary=scenario.alert_summary,
     )
 

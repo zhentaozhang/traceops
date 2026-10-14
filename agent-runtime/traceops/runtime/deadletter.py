@@ -125,6 +125,14 @@ def classify_failure(error: str) -> FailureCategory:
     if "expecting property name" in lowered or "expecting value" in lowered \
             or "jsondecodeerror" in lowered or "extra data" in lowered:
         return FailureCategory.MALFORMED_JSON
+    # 顺序是有意的，且两条契约规则必须排在 "envelope"/"payload" 之前：
+    # 契约违规的消息里几乎必然出现 "envelope" 或 "payload" 这两个词，
+    # 若按关键词先命中就会把"生产方和消费方对同一条事件的理解不一致"
+    # 误记成"这条消息碰巧不完整"。前者要改生产方，后者只需丢弃。
+    if "envelope is missing" in lowered:
+        return FailureCategory.MISSING_ENVELOPE
+    if "contract violation" in lowered:
+        return FailureCategory.SCHEMA_VIOLATION
     if "envelope" in lowered:
         return FailureCategory.MISSING_ENVELOPE
     if "missing required fields" in lowered or "payload" in lowered \

@@ -28,6 +28,7 @@ from traceops.runtime.deadletter import (
     now_iso,
 )
 from traceops.runtime.retry import is_retryable
+from traceops.runtime.event_contract import validate_event
 from traceops.evidence.audit import AuditCenter, AuditKind
 from traceops.runtime.run_ledger import RunLedger
 from traceops.runtime.investigation_run import InvestigationConfigSnapshot, InvestigationRun, RunStatus
@@ -624,15 +625,12 @@ def derive_request_from_event(message: dict[str, Any]) -> InvestigationRequest:
     """
     envelope, payload = _normalise_message_shape(message)
 
-    if envelope.get("event_type") not in (None, REQUESTED_EVENT_TYPE):
-        raise ValueError(f"unexpected event_type: {envelope.get('event_type')!r}")
-    if envelope.get("producer") not in (None, "control-plane"):
-        raise ValueError(f"unexpected producer: {envelope.get('producer')!r}")
-
-    required = ("investigation_run_id", "incident_id", "time_range", "service_hint")
-    missing = [key for key in required if key not in payload]
-    if missing:
-        raise ValueError(f"payload missing required fields: {missing}")
+    # 契约是唯一事实来源。这里原来手写了一份 required 列表和两条枚举检查，
+    # 那是 schema 的第二份副本 —— 副本一定会漂移，而且漂移后无法判断谁对。
+    # 真实案例：Java 侧发出 priority="manual"，两侧手写检查都没有 priority 这一项，
+    # 于是坏消息一路走到 payload.get("priority", "normal")，取了个没人认识的值。
+    # 现在校验的是 contracts/ 里那份文件本身。
+    validate_event(REQUESTED_EVENT_TYPE, {"envelope": envelope, "payload": payload})
 
     window = payload["time_range"]
     return InvestigationRequest(
@@ -645,6 +643,13 @@ def derive_request_from_event(message: dict[str, Any]) -> InvestigationRequest:
         window_end=window["end"],
         config_change=payload.get("config_change"),
         priority=payload.get("priority", "normal"),
+        # 告警原文：规则读不到、只有模型能用的那一维信息。
+        # 契约里加了这个字段却没在这里读，等于整条链路白改 ——
+        # 这正是它之前的状态：字段在模型请求里有、在生产路径上永远是 None。
+        alert_summary=payload.get("alert_summary"),
+        budget=payload.get("budget"),
+        scope_depth=payload.get("scope_depth"),
+        topology_edges=payload.get("topology_edges"),
     )
 
 

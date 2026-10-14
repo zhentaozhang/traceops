@@ -1,5 +1,7 @@
 package dev.traceops.controlplane.events;
 
+import dev.traceops.controlplane.contracts.ContractValidator;
+
 import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
@@ -9,8 +11,9 @@ import java.util.UUID;
 /**
  * 按 contracts/ 里的 JSON Schema 组装事件消息：{envelope, payload} 两层。
  *
- * <p>这里刻意手写 Map 而不是注解生成：契约文件是唯一事实来源，
- * 任何字段变动都必须同时改 schema 和 Java 侧的 ContractComplianceTest。
+ * <p>这里刻意手写 Map 而不是注解生成：契约文件是唯一事实来源。
+ * 组装完成后立即过一遍 {@link ContractValidator} —— 契约不是文档，
+ * 是运行时闸门；不校验的契约只能记录意图，拦不住任何东西。
  */
 public final class EventMessages {
 
@@ -48,7 +51,7 @@ public final class EventMessages {
             String priority,
             Instant now) {
         return investigationRequested(incidentId, serviceHint, runId, environment, configVersion,
-                priority, now, now.minus(DEFAULT_WINDOW), now, null);
+                priority, now, now.minus(DEFAULT_WINDOW), now, null, null);
     }
 
     /**
@@ -73,6 +76,30 @@ public final class EventMessages {
             Instant windowStart,
             Instant windowEnd,
             String causationId) {
+        return investigationRequested(incidentId, serviceHint, runId, environment, configVersion,
+                priority, now, windowStart, windowEnd, causationId, null);
+    }
+
+    /**
+     * 组装一条调查请求，并把告警原文一起带上。
+     *
+     * <p>为什么必须带：告警摘要里的自然语言是规则读不到、模型才读得到的唯一维度。
+     * 此前这条链上没有任何一环填过它 —— 契约里没有这个字段、这里不写、
+     * Agent 侧也不读，于是评测里"靠自然语言线索才能定位"的场景在生产路径上
+     * 永远不可能成立。字段存在但没人填，比字段不存在更难发现。
+     */
+    public static Map<String, Object> investigationRequested(
+            String incidentId,
+            String serviceHint,
+            String runId,
+            String environment,
+            String configVersion,
+            String priority,
+            Instant now,
+            Instant windowStart,
+            Instant windowEnd,
+            String causationId,
+            String alertSummary) {
 
         Map<String, Object> envelope = new LinkedHashMap<>();
         envelope.put("event_id", newEventId());
@@ -106,10 +133,19 @@ public final class EventMessages {
         payload.put("priority", priority);
         payload.put("budget", budget);
         payload.put("scope_depth", 1);
+        // 空摘要就不写这个字段：写一个空串会让 Agent 侧"有线索但为空"
+        // 和"没有线索"看起来一样。
+        if (alertSummary != null && !alertSummary.isBlank()) {
+            payload.put("alert_summary", alertSummary);
+        }
 
         Map<String, Object> message = new LinkedHashMap<>();
         message.put("envelope", envelope);
         message.put("payload", payload);
+        // 在这里而不是在 Outbox 里校验：坏消息必须在**产生它的那次请求**里
+        // 就失败掉。放到投递侧校验的话，坏消息已经入库、已经出队、已经被
+        // 下游拒绝，而真正写错字段的那一行早就从栈里消失了。
+        ContractValidator.requireValid(INVESTIGATION_REQUESTED, message);
         return message;
     }
 }

@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 DEFAULT_MAX_TOKENS = 100_000  # 工程上限（REVISIONS-1.1 R6），不是平均预期
+DEFAULT_MAX_TOOL_CALLS = 50
+DEFAULT_MAX_ROUNDS = 10
 
 
 class BudgetExhausted(Exception):
@@ -45,8 +47,8 @@ class BudgetManager:
     def __init__(
         self,
         max_tokens: int = DEFAULT_MAX_TOKENS,
-        max_tool_calls: int = 50,
-        max_rounds: int = 10,
+        max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
+        max_rounds: int = DEFAULT_MAX_ROUNDS,
         # 墙钟上限，默认 15 分钟。
         #
         # 为什么必须有默认值：`max_tool_calls` 能拦住**次数**，拦不住

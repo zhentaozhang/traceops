@@ -124,7 +124,10 @@ public class InvestigationRetryService {
         String runId = EventMessages.newRunId();
         Map<String, Object> message = EventMessages.investigationRequested(
                 incident.getId(), incident.getService(), runId, environment, configVersion,
-                priorityOf(incident), now, windowStart, windowEnd, failedEventId);
+                priorityOf(incident), now, windowStart, windowEnd, failedEventId,
+                // 重试必须问同一个问题 —— 包括带上同一份告警原文，
+                // 否则重试等于换了个更穷的问题再问一遍。
+                incident.getTitle());
 
         String eventId = String.valueOf(((Map<?, ?>) message.get("envelope")).get("event_id"));
         // 退避写进 outbox：这一行在 notBefore 之前不会被 relay 取走。

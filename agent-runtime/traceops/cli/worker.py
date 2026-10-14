@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import logging
 import os
@@ -27,7 +28,11 @@ from pathlib import Path
 
 from traceops.evidence.store import EvidenceStore
 from traceops.orchestration.graph import InvestigationRequest, RunContext
-from traceops.runtime.budget import BudgetManager
+from traceops.runtime.budget import (
+    DEFAULT_MAX_ROUNDS,
+    DEFAULT_MAX_TOKENS,
+    BudgetManager,
+)
 from traceops.runtime.deadletter import InMemoryDeadLetterSink
 from traceops.runtime.shutdown import StopSignal
 from traceops.evidence.retention import RetentionPolicy
@@ -156,16 +161,76 @@ def _describe_adapters(adapters, args) -> list[str]:
     ]
 
 
-def _build_budget(args) -> BudgetManager:
-    """生产预算：**显式**设置墙钟上限。
+def _build_budget(args, requested: dict | None = None) -> BudgetManager:
+    """生产预算：**显式**设置墙钟上限，并接受控制面按次下发的预算。
 
     为什么在工厂里显式设置而不是依赖 BudgetManager 的默认值：
     默认值在库层是为了"忘了配也不至于无限跑"，而生产入口应当把自己
     实际想要的策略写出来 —— 这样读代码的人不用去猜库的默认是什么。
+
+    为什么请求里的预算要与运维上限**取小**而不是直接覆盖：
+    控制面可以说"这次只给 10 次工具调用"（更保守），但不该能把运维设的
+    上限顶开（更激进）。前者是业务判断，后者是资源保护，两者职责不同 ——
+    取小是唯一同时尊重两者的做法。
     """
+    requested = requested or {}
+
+    def _smaller(key: str, ceiling: float) -> float:
+        value = requested.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return ceiling
+        return min(value, ceiling)
+
     return BudgetManager(
-        max_tool_calls=args.max_tool_calls,
-        deadline_seconds=args.deadline_seconds,
+        max_tool_calls=int(_smaller("max_tool_calls", args.max_tool_calls)),
+        max_rounds=int(_smaller("max_rounds", DEFAULT_MAX_ROUNDS)),
+        max_tokens=int(_smaller("max_tokens", DEFAULT_MAX_TOKENS)),
+        deadline_seconds=_smaller("deadline_seconds", args.deadline_seconds),
+    )
+
+
+def _topology_for(request: InvestigationRequest,
+                  fallback: ServiceTopology | None) -> ServiceTopology | None:
+    """本次调查用哪张拓扑图。
+
+    请求自带边表时以请求为准：那是控制面**针对这次事故**下发的、比静态
+    文件更准的视图（例如某条依赖刚刚被判定为不相关）。没有时退回
+    `--topology` 加载的静态图。
+
+    边表为空列表不等于"没有边表"：空列表是控制面明确说"这次不展开依赖"，
+    必须与"没提供"区分开，否则"只在单服务内查"这个意图会被静默改写成
+    "用全量拓扑查"。
+    """
+    edges = request.topology_edges
+    if edges is None:
+        return fallback
+    try:
+        return ServiceTopology.from_edges([(str(a), str(b)) for a, b in edges])
+    except (TopologyError, ValueError, TypeError) as exc:
+        raise TopologyError(f"request supplied invalid topology_edges: {exc}") from exc
+
+
+def build_run_context(request: InvestigationRequest, *, args, store, adapters,
+                      topology: ServiceTopology | None) -> RunContext:
+    """按**这一次请求**的配置组装 RunContext。
+
+    单独抽成模块级函数而不是留在 main() 里的闭包，是为了它能被测试直接调用。
+    留在闭包里时，`request.budget` / `request.scope_depth` / `request.topology_edges`
+    是否真的进了 RunContext，只有读代码才能知道 —— 而这正是它们之前
+    一路被丢掉却没被发现的原因。
+    """
+    gateway = ToolGateway()
+    register_builtin_tools(gateway, adapters)
+    return RunContext(
+        store=store,
+        adapters=adapters,
+        budget=_build_budget(args, request.budget),
+        gateway=gateway,
+        topology=_topology_for(request, topology),
+        model=build_model(args),
+        # 契约里的 scope_depth 决定沿下游依赖展开几层。
+        scope_depth=(request.scope_depth
+                     if request.scope_depth is not None else RunContext.scope_depth),
     )
 
 
@@ -378,17 +443,8 @@ def main(argv: list[str] | None = None) -> int:
             # 这比"空跑一次返回 0"有用得多——空跑永远绿，什么也没证明。
             source.push(_self_check_event())
 
-    def build_context(request: InvestigationRequest) -> RunContext:
-        gateway = ToolGateway()
-        register_builtin_tools(gateway, adapters)
-        return RunContext(
-            store=store,
-            adapters=adapters,
-            budget=_build_budget(args),
-            gateway=gateway,
-            topology=topology,
-            model=build_model(args),
-        )
+    build_context = functools.partial(
+        build_run_context, args=args, store=store, adapters=adapters, topology=topology)
 
     worker = InvestigationWorker(
         source=source, sink=sink, derive_request=derive_request_from_event,

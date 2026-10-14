@@ -169,7 +169,9 @@ class TestWorkerDeadLetterIntegration:
         assert len(dead.records) == 1
         record = dead.records[0]
         assert record.original_entry_id == "1-0"
-        assert record.category is FailureCategory.INVALID_REQUEST
+        # 这条消息根本没有 envelope —— 与"信封在、字段含义对不上"是两种病：
+        # 前者说明生产方没按 {envelope, payload} 写，后者说明两侧对契约理解不一致。
+        assert record.category is FailureCategory.MISSING_ENVELOPE
         # 主流仍然 ACK 掉，避免坏消息滞留 PEL
         assert source.acked == ["1-0"]
 

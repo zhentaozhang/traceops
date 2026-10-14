@@ -59,6 +59,7 @@ def requested_event(run_id: str = "run-001", incident_id: str = "inc-001") -> di
             "environment": "demo",
             "service_hint": "order-service",
             "time_range": {"start": "2026-10-30T10:00:00Z", "end": "2026-10-30T10:06:00Z"},
+            "config_version": "cfg",
             "priority": "high",
         },
     }

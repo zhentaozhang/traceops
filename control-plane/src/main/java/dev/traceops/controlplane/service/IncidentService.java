@@ -107,7 +107,9 @@ public class IncidentService {
                 incident.getId(), request.service(), runId, environment, configVersion,
                 // 优先级必须是契约枚举里的值（low|normal|high）。此前这里写的是 "manual"，
                 // 契约校验会直接判它违规 —— 人工来源由 incident.origin 表达，不该塞进 priority。
-                "normal", now, windowStart, windowEnd, null);
+                "normal", now, windowStart, windowEnd, null,
+                // 人工提单的标题就是人写的现象描述，正是 alert_summary 要装的东西
+                request.title());
         outbox.save(OutboxEvent.pending(EventMessages.newEventId(),
                 EventMessages.INVESTIGATION_REQUESTED, runId, 1L, toJson(message), now));
         incident.transitionTo(IncidentStatus.INVESTIGATING, now);
@@ -251,7 +253,9 @@ public class IncidentService {
         incident.rememberInvestigationWindow(windowStart, windowEnd);
         Map<String, Object> message = EventMessages.investigationRequested(
                 incident.getId(), alert.service(), runId, environment, configVersion,
-                priorityOf(alert), now, windowStart, windowEnd, null);
+                priorityOf(alert), now, windowStart, windowEnd, null,
+                // 告警原文：规则读不到、只有模型能用的那一维信息
+                alert.summary());
         String eventId = String.valueOf(((Map<?, ?>) message.get("envelope")).get("event_id"));
         outbox.save(OutboxEvent.pending(eventId, EventMessages.INVESTIGATION_REQUESTED, runId, 1L,
                 toJson(message), now));

@@ -15,7 +15,7 @@ import functools
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 from langchain_core.runnables import RunnableConfig
 
@@ -92,7 +92,17 @@ class InvestigationRequest(BaseModel):
     #: 这让"能否利用自然语言线索"成为可测的差异来源。
     alert_summary: str | None = None
     config_change: dict[str, Any] | None = None
-    priority: str = "P2"
+    #: 现在只有契约里的三档。这里曾经是 "P2" —— 契约写 low|normal|high、
+    #: 这里写 P2、Java 侧写过 manual，三套词汇互不相识，而运行时谁也没读它。
+    #: 一个没人读的字段用哪套词都不报错，所以这三套词并存了很久。
+    priority: Literal["low", "normal", "high"] = "normal"
+    #: 控制面下发的执行预算（契约 payload.budget）。此前 worker 从不读它，
+    #: 契约里的 budget 与 Java 侧硬编码的 50/10/100000/600 一起变成了摆设。
+    budget: dict[str, Any] | None = None
+    #: 沿下游依赖展开的层数（契约 payload.scope_depth）。
+    scope_depth: int | None = None
+    #: 本次调查可用的依赖边 [[caller, callee], ...]。
+    topology_edges: list[list[str]] | None = None
 
     @model_validator(mode="after")
     def _validate_times(self) -> InvestigationRequest:
