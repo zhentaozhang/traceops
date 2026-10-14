@@ -155,6 +155,54 @@ class RunContext:
     # refutation_gate。
     shadow_gates: frozenset[str] = frozenset()
 
+    def strategy_components(self) -> dict[str, Any]:
+        """本次调查的**决策策略**组成（阈值、权重、闸门、提示词）。
+
+        从 ctx 自己派生而不是由调用方传入：这些旋钮就长在 ctx 上，
+        让调用方另外再传一份，两份迟早不一致 —— 而不一致的表现是
+        "报告说策略没变，结论却变了"。
+        """
+        from traceops.runtime.strategy import strategy_components
+
+        return strategy_components(
+            enable_semantic_gate=self.enable_semantic_gate,
+            enable_contradiction=self.enable_contradiction,
+            shadow_gates=self.shadow_gates,
+            prompt_version=self.prompt_version(),
+        )
+
+    def strategy_digest(self) -> str:
+        from traceops.runtime.strategy import _digest
+
+        return _digest(self.strategy_components())
+
+    def prompt_version(self) -> str | None:
+        """只有真的挂了模型，这次 run 才用到了提示词。
+
+        纯规则跑记一个提示词版本是**假信息**：它会让两次"都没用模型"的
+        调查看起来像用了同一个提示词。
+        """
+        if self.model is None:
+            return None
+        from traceops.prompts import prompt_version
+
+        return prompt_version()
+
+    def run_snapshot(self, request: InvestigationRequest | None = None) -> dict[str, Any]:
+        from traceops.runtime.strategy import run_snapshot
+
+        return run_snapshot(
+            budget=self.budget,
+            scope_depth=self.scope_depth,
+            topology=self.topology,
+            prompt_version=self.prompt_version(),
+            config_version=getattr(request, "config_version", None),
+            alert_summary_present=(
+                getattr(request, "alert_summary", None) is not None
+                if request is not None
+                else None
+            ),
+        )
 
 
 @dataclass
@@ -1155,6 +1203,11 @@ def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str,
             if ctx.enable_semantic_gate or "semantic_gate" in ctx.shadow_gates else None
         ),
         shadow_gates=ctx.shadow_gates,
+        # 策略指纹进报告：两次结论不同时，先比 digest 再谈数据。
+        # 只放进 ctx 或只打日志都不够 —— 报告才是会被归档、被引用、
+        # 被拿去和上次比较的那份东西。
+        strategy_digest=ctx.strategy_digest(),
+        run_snapshot=ctx.run_snapshot(request),
     )
     return {"report": report, "status": report.diagnosis_status}
 

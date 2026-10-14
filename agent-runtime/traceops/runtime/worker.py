@@ -446,6 +446,11 @@ class InvestigationWorker:
             scope_depth=getattr(ctx, "scope_depth", 1),
             max_tool_calls=getattr(ctx.budget, "max_tool_calls", 50),
             config_version=getattr(request, "config_version", None),
+            # 策略指纹从 ctx 自己派生 —— 预算与深度进 run_snapshot，
+            # 阈值/权重/闸门/提示词进 digest。两者的差别决定了事后能问出
+            # "是策略变了还是数据变了"，所以不能混在一起。
+            strategy_digest=ctx.strategy_digest(),
+            run_snapshot=ctx.run_snapshot(request),
         )
         run = InvestigationRun.open(incident_id=request.incident_id,
                                     run_id=request.investigation_run_id,

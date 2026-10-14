@@ -73,6 +73,8 @@ def build_report(
     topology=None,
     shadow_gates: set[str] | frozenset[str] | None = None,
     rejected_proposals: list[dict] | None = None,
+    strategy_digest: str | None = None,
+    run_snapshot: dict | None = None,
 ) -> RCAReport:
     """组装并校验诊断报告。
 
@@ -234,6 +236,8 @@ def build_report(
         profile_digest=profile_digest,
         shadow_decisions=[d.to_dict() for d in shadow_decisions],
         rejected_proposals=list(rejected_proposals or []),
+        strategy_digest=strategy_digest,
+        run_snapshot=dict(run_snapshot or {}),
     )
 
     # 必须绑定本次事故：只查"ID 在 Store 里存在"会放过**引用了别处证据**的报告。

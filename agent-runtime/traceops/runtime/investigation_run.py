@@ -61,7 +61,20 @@ class IllegalRunTransition(Exception):
 
 @dataclass
 class InvestigationConfigSnapshot:
-    """可复现性快照（蓝图 §13.3）：两次跑同一事故结论不同，必须能查出差在哪。"""
+    """可复现性快照（蓝图 §13.3）：两次跑同一事故结论不同，必须能查出差在哪。
+
+    这里把**策略身份**和**本次运行输入**分成两部分（见
+    `traceops/runtime/strategy.py`）：
+
+    - `strategy_digest` / 各个 `*_version` 字段：判断标准是什么
+    - `run_snapshot`：这次跑用了多少额度、看多深
+
+    此前的写法把预算与深度拼进版本字符串
+    （`workflow_version="p0-v1;max_tool_calls=50"`、
+    `topology_version="file-declared;scope_depth=1"`），后果是
+    **同样的策略、不同的预算看起来像换了策略**，而真正换了阈值或权重
+    反而一处都没记。两个方向的错都犯过。
+    """
 
     model_provider: str = "none"
     model_name: str = "deterministic-rules"
@@ -72,15 +85,21 @@ class InvestigationConfigSnapshot:
     system_prompt_version: str | None = None
     dataset_version: str | None = None
     config_version: str | None = None
+    #: 决策策略的内容指纹（阈值/权重/闸门/提示词）。
+    strategy_digest: str | None = None
+    #: 本次运行的实际输入（预算、采集深度、拓扑指纹、提示词版本）。
+    run_snapshot: dict = field(default_factory=dict)
 
     @classmethod
     def from_runtime(cls, *, model_name: str | None, scope_depth: int,
                      max_tool_calls: int,
-                     config_version: str | None = None) -> "InvestigationConfigSnapshot":
+                     config_version: str | None = None,
+                     strategy_digest: str | None = None,
+                     run_snapshot: dict | None = None) -> "InvestigationConfigSnapshot":
         """从**实际运行配置**派生快照。
 
         为什么不能直接用默认值：默认值会让每次 run 的快照完全相同，
-        于是「两次跑同一事故结论不同，查出差在哪」这个承诺**无法兑现**。
+        于是「两次跑同一场景结论不同，查出差在哪」这个承诺**无法兑现**。
         更严重的是它会**撒谎** —— 接了模型却记成 `deterministic-rules`，
         事后复盘会得出错误结论。
 
@@ -98,17 +117,24 @@ class InvestigationConfigSnapshot:
             # 纯规则跑的 run 记一个提示词版本反而是假信息。
             prompt_version_used = prompt_version()
 
+        snapshot = dict(run_snapshot or {})
+        # 采集深度与预算属于**运行输入**，不属于策略身份：它们决定这次
+        # 看多远、跑多久，不决定"什么样的观测才算异常"。
+        snapshot.setdefault("scope_depth", scope_depth)
+        snapshot.setdefault("max_tool_calls", max_tool_calls)
+
         return cls(
             model_provider=provider,
             model_name=name,
-            # 采集深度与预算都会改变结论，因此属于可复现性信息
-            topology_version=f"file-declared;scope_depth={scope_depth}",
-            workflow_version=f"p0-v1;max_tool_calls={max_tool_calls}",
+            topology_version="file-declared",
+            workflow_version="p0-v1",
             system_prompt_version=prompt_version_used,
             config_version=config_version,
+            strategy_digest=strategy_digest,
+            run_snapshot=snapshot,
         )
 
-    def to_dict(self) -> dict[str, str | None]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "model_provider": self.model_provider,
             "model_name": self.model_name,
@@ -119,6 +145,8 @@ class InvestigationConfigSnapshot:
             "system_prompt_version": self.system_prompt_version,
             "dataset_version": self.dataset_version,
             "config_version": self.config_version,
+            "strategy_digest": self.strategy_digest,
+            "run_snapshot": self.run_snapshot,
         }
 
 

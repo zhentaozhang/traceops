@@ -268,6 +268,20 @@ class RCAReport(BaseModel):
     # 而这两件事的修法相反：前者要放宽校验，后者要改进提示词或输入。
     # 每条形如 {"candidate_service", "fault_type", "reason", "reason_text"}。
     rejected_proposals: list[dict] = Field(default_factory=list)
+    # 决策策略的内容指纹（见 `traceops/runtime/strategy.py`）。
+    #
+    # 与 `profile_digest` 的分工：`profile_digest` 是**评测剖面**的身份
+    # （消融实验比较用，由 `evaluation/investigation_profile.py` 产出）；
+    # 这里是**线上实际生效的策略**的身份，包含阈值、排序权重、闸门开关与
+    # 提示词版本。两次报告只有 `strategy_digest` 相等才可比 —— 否则
+    # "结论变了"可能只是"规则变了"。
+    strategy_digest: str | None = None
+    # 本次运行的实际输入（预算、采集深度、拓扑指纹、提示词版本等）。
+    #
+    # 与 `strategy_digest` 分开的理由：预算从 50 改成 60 不该让两次结论
+    # 变得"不可比"，而采集深度变了则必须知道 —— 两者语义不同，
+    # 曾经被塞进同一批版本字符串里，于是既看不出一致也看不出差异。
+    run_snapshot: dict = Field(default_factory=dict)
     generated_at: datetime = Field(default_factory=_utcnow)
 
     def all_evidence_ids(self) -> set[str]:

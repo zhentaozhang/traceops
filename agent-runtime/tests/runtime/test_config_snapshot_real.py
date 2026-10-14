@@ -51,12 +51,25 @@ class TestSnapshotReflectsActualModel:
         """采集深度是可复现性的一部分：深度变了结论就可能变。"""
         snapshot = InvestigationConfigSnapshot.from_runtime(
             model_name=None, scope_depth=3, max_tool_calls=40)
-        assert "3" in snapshot.topology_version, snapshot.topology_version
+        assert snapshot.run_snapshot["scope_depth"] == 3
 
     def test_snapshot_records_budget(self):
+        """预算进 run_snapshot，**不进**版本字符串。
+
+        旧实现把 `max_tool_calls` 拼进 `workflow_version`，于是把预算从
+        50 调到 99 会让两次调查看起来像换了策略 —— 而决策规则一个字没动。
+        """
         snapshot = InvestigationConfigSnapshot.from_runtime(
             model_name=None, scope_depth=1, max_tool_calls=99)
-        assert "99" in snapshot.workflow_version, snapshot.workflow_version
+        assert snapshot.run_snapshot["max_tool_calls"] == 99
+        assert "99" not in snapshot.workflow_version
+
+    def test_version_strings_do_not_smuggle_run_inputs(self):
+        """版本字符串只描述策略身份，不夹带运行输入。"""
+        snapshot = InvestigationConfigSnapshot.from_runtime(
+            model_name=None, scope_depth=3, max_tool_calls=99)
+        assert ";" not in snapshot.workflow_version
+        assert ";" not in snapshot.topology_version
 
 
 class TestWorkerUsesRealSnapshot:
