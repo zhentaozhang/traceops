@@ -22,6 +22,7 @@
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import uuid
@@ -33,6 +34,12 @@ from pathlib import Path
 from traceops.remediation.approval import ApprovalDecision
 from traceops.runtime.sqlite_config import configure_connection
 from traceops.security.access import Principal
+from traceops.security.mandate import (
+    BASIS_HUMAN_APPROVAL,
+    MANDATE_POLICY_REVISION,
+    STRENGTH_EXPLICIT,
+    Mandate,
+)
 
 
 class ApprovalRequestStatus(str, Enum):
@@ -60,9 +67,28 @@ CREATE TABLE IF NOT EXISTS approval_request (
     expires_at TEXT NOT NULL,
     approver TEXT,
     decided_at TEXT,
-    decision_reason TEXT
+    decision_reason TEXT,
+    mandate TEXT,
+    revoked_at TEXT,
+    revoked_reason TEXT
 );
 """
+
+#: 后加的列。`CREATE TABLE IF NOT EXISTS` 不会给已存在的表补列，
+#: 所以老库必须走 ALTER —— 否则升级后一读就 "no such column"。
+_ADDED_COLUMNS = {
+    "mandate": "TEXT",
+    "revoked_at": "TEXT",
+    "revoked_reason": "TEXT",
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(approval_request)")}
+    for column, ddl in _ADDED_COLUMNS.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE approval_request ADD COLUMN {column} {ddl}")
+    conn.commit()
 
 
 def _with_ttl(request: ApprovalRequest, ttl_seconds: float) -> ApprovalRequest:
@@ -94,6 +120,19 @@ class ApprovalRequest:
     approver: str | None = None
     decided_at: datetime | None = None
     decision_reason: str | None = None
+    #: 授权凭证（`traceops/security/mandate.py`）。只有 APPROVED 才有。
+    #:
+    #: 存在这里的不是"同意的意图"，而是**授权的具体内容与依据**：
+    #: 谁、按哪套规则、覆盖哪份计划的哪个动作。状态字段会被后来的人改，
+    #: 这条记录不会 —— 它只能被撤销（`revoked_at`）。
+    mandate: dict | None = None
+    revoked_at: datetime | None = None
+    revoked_reason: str | None = None
+
+    @property
+    def has_live_mandate(self) -> bool:
+        """有一份未被撤销的授权。撤销后状态仍是 APPROVED，但不再可执行。"""
+        return self.mandate is not None and self.revoked_at is None
 
     @classmethod
     def create(cls, *, plan_id: str, plan_hash: str, requested_by: str,
@@ -128,11 +167,13 @@ class ApprovalStore:
             self._conn = configure_connection(
                 sqlite3.connect(str(self._path), check_same_thread=False))
             self._conn.executescript(SCHEMA)
+            _migrate(self._conn)
             self._conn.commit()
         else:
             self._conn = configure_connection(
                 sqlite3.connect(":memory:", check_same_thread=False))
             self._conn.executescript(SCHEMA)
+            _migrate(self._conn)
             self._conn.commit()
 
     # ---- 写入 ----
@@ -197,12 +238,89 @@ class ApprovalStore:
             status = (ApprovalRequestStatus.APPROVED
                       if decision is ApprovalDecision.APPROVED
                       else ApprovalRequestStatus.REJECTED)
+            decided_at = datetime.now(UTC)
+            mandate_json: str | None = None
+            if status is ApprovalRequestStatus.APPROVED:
+                # 审批通过 = 授予一条**不可变授权**。除了状态位，还要把
+                # "谁、按哪套规则、覆盖什么" 写下来 —— 状态位会被后来的人改，
+                # 这三件事不会。
+                mandate = Mandate(
+                    strength=STRENGTH_EXPLICIT,
+                    policy_version=MANDATE_POLICY_REVISION,
+                    basis=BASIS_HUMAN_APPROVAL,
+                    # 没有身份上下文时记 None，而不是记 approver 字符串冒充
+                    # 已认证主体。审计要能看出"这次授权没有可核验的身份"。
+                    actor=principal.name if principal is not None else None,
+                    scope={
+                        "plan_id": current.plan_id,
+                        "plan_hash": current.plan_hash,
+                        "action": current.action,
+                        "target": current.target,
+                    },
+                    granted_at=decided_at,
+                )
+                mandate_json = json.dumps(mandate.to_dict(), sort_keys=True)
             self._conn.execute(
-                "UPDATE approval_request SET status=?, approver=?, decided_at=?, decision_reason=? "
-                "WHERE request_id=?", (status.value, approver.strip(), datetime.now(UTC).isoformat(),
-                                       reason.strip(), request_id))
+                "UPDATE approval_request SET status=?, approver=?, decided_at=?, "
+                "decision_reason=?, mandate=? WHERE request_id=?",
+                (status.value, approver.strip(), decided_at.isoformat(),
+                 reason.strip(), mandate_json, request_id))
             self._conn.commit()
             return self._get_locked(request_id)
+
+    def revoke(self, request_id: str, *, reason: str,
+               actor: str | None = None) -> ApprovalRequest:
+        """撤销一条已授予的授权。
+
+        第三种结局：`REJECTED` 是"没同意"，`EXPIRED` 是"没人看"，
+        撤销是"同意了、但后来不算了"（计划变了、账号被停用、事故已自愈）。
+        把撤销塞进 REJECTED 会让审计分不清"被拒绝"和"被追回" ——
+        前者要改方案，后者要查为什么批了又收回。
+
+        `actor` 记谁撤的；没传就记 None，**不冒充**。
+        """
+        if not reason or not reason.strip():
+            raise ValueError("revocation reason is required")
+        with self._lock:
+            current = self._get_locked(request_id)
+            if current is None:
+                raise KeyError(f"unknown approval request: {request_id}")
+            if current.status is not ApprovalRequestStatus.APPROVED:
+                raise IllegalApprovalTransition(
+                    f"only an APPROVED request can be revoked, "
+                    f"request {request_id} is {current.status.value}")
+            if current.revoked_at is not None:
+                raise IllegalApprovalTransition(
+                    f"request {request_id} was already revoked at "
+                    f"{current.revoked_at.isoformat()}")
+            note = reason.strip()
+            if actor:
+                note = f"{note} (revoked by {actor})"
+            self._conn.execute(
+                "UPDATE approval_request SET revoked_at=?, revoked_reason=? "
+                "WHERE request_id=?",
+                (datetime.now(UTC).isoformat(), note, request_id))
+            self._conn.commit()
+            return self._get_locked(request_id)
+
+    def require_mandate(self, request_id: str, *, plan_id: str, plan_hash: str,
+                        action: str, target: str) -> Mandate:
+        """取出授权并逐项核对范围。执行前调用它，而不是只看状态位。"""
+        request = self.get(request_id)
+        if request is None:
+            raise KeyError(f"unknown approval request: {request_id}")
+        if request.mandate is None:
+            raise MandateUnavailable(
+                f"request {request_id} carries no mandate "
+                f"(status {request.status.value})")
+        if request.revoked_at is not None:
+            raise MandateUnavailable(
+                f"mandate for request {request_id} was revoked at "
+                f"{request.revoked_at.isoformat()}: {request.revoked_reason}")
+        mandate = Mandate.from_dict(request.mandate)
+        mandate.require_covers(plan_id=plan_id, plan_hash=plan_hash,
+                               action=action, target=target)
+        return mandate
 
     def expire_overdue(self, *, now: datetime | None = None) -> int:
         """把过期未决的请求标为 EXPIRED，返回受影响条数。
@@ -248,7 +366,8 @@ class ApprovalStore:
     @staticmethod
     def _row_to_request(row: tuple) -> ApprovalRequest:
         (request_id, plan_id, plan_hash, requested_by, action, target, reason,
-         status, requested_at, expires_at, approver, decided_at, decision_reason) = row
+         status, requested_at, expires_at, approver, decided_at, decision_reason,
+         mandate, revoked_at, revoked_reason) = row
         return ApprovalRequest(
             request_id=request_id, plan_id=plan_id, plan_hash=plan_hash,
             requested_by=requested_by, action=action, target=target, reason=reason,
@@ -258,7 +377,14 @@ class ApprovalStore:
             approver=approver,
             decided_at=datetime.fromisoformat(decided_at) if decided_at else None,
             decision_reason=decision_reason,
+            mandate=json.loads(mandate) if mandate else None,
+            revoked_at=datetime.fromisoformat(revoked_at) if revoked_at else None,
+            revoked_reason=revoked_reason,
         )
+
+
+class MandateUnavailable(Exception):
+    """没有可用的授权凭证（未授予、已撤销、或范围不符）。"""
 
 
 class IllegalApprovalTransition(Exception):
