@@ -42,6 +42,8 @@ public class InvestigationResultService {
     static final String EXPECTED_PRODUCER = "agent-runtime";
 
     private final IncidentRepository incidents;
+    /** 唯一的写入口（见 {@link dev.traceops.controlplane.service.IncidentWriter}）。 */
+    private final dev.traceops.controlplane.service.IncidentWriter writer;
     private final AppliedInvestigationEventRepository appliedEvents;
     private final InvestigationFindingRepository findings;
     private final FindingHistoryRepository history;
@@ -49,12 +51,14 @@ public class InvestigationResultService {
     private final ObjectMapper mapper;
 
     public InvestigationResultService(IncidentRepository incidents,
+            dev.traceops.controlplane.service.IncidentWriter writer,
             AppliedInvestigationEventRepository appliedEvents,
             InvestigationFindingRepository findings,
             FindingHistoryRepository history,
             InvestigationRetryService retryService,
             ObjectMapper mapper) {
         this.incidents = incidents;
+        this.writer = writer;
         this.appliedEvents = appliedEvents;
         this.findings = findings;
         this.history = history;
@@ -230,7 +234,7 @@ public class InvestigationResultService {
             return advanceOrReject(incident, result, previous, List.of(IncidentStatus.FAILED), now);
         }
 
-        incidents.save(incident);
+        writer.save(incident);
         return new Applied(result.eventId(), result.investigationRunId(), result.incidentId(),
                 Applied.Outcome.RETRY_PENDING, previous, resulting, null,
                 false, true, result.reportRef(),
@@ -270,7 +274,7 @@ public class InvestigationResultService {
                         false, result.retryable(), result.reportRef(), ex.getMessage());
             }
         }
-        incidents.save(incident);
+        writer.save(incident);
         // 结论与状态机推进同事务写入：避免出现"已 DIAGNOSED 但查不到结论"
         recordFinding(incident.getId(), result);
         return new Applied(result.eventId(), result.investigationRunId(), result.incidentId(),

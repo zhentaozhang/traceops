@@ -39,6 +39,8 @@ import org.springframework.transaction.annotation.Transactional;
 public class IncidentService {
 
     private final IncidentRepository incidents;
+    /** 唯一的写入口。读仍走 repository，写一律经过它。 */
+    private final IncidentWriter writer;
     private final OutboxRepository outbox;
     private final ObjectMapper mapper;
     private final String environment;
@@ -46,11 +48,14 @@ public class IncidentService {
     /** 关联时间窗：同服务/依赖服务的告警在这个窗内视为同一次故障。可配置。 */
     private final java.time.Duration correlationWindow;
 
-    public IncidentService(IncidentRepository incidents, OutboxRepository outbox, ObjectMapper mapper,
+
+    public IncidentService(IncidentRepository incidents, IncidentWriter writer,
+            OutboxRepository outbox, ObjectMapper mapper,
             @Value("${traceops.investigation.environment:demo}") String environment,
             @Value("${traceops.investigation.config-version:cfg-local}") String configVersion,
             @Value("${traceops.correlation.window-seconds:600}") long correlationWindowSeconds) {
         this.incidents = incidents;
+        this.writer = writer;
         this.outbox = outbox;
         this.mapper = mapper;
         this.environment = environment;
@@ -96,7 +101,7 @@ public class IncidentService {
                 id, request.service(), request.title(),
                 request.severity() == null || request.severity().isBlank()
                         ? "warning" : request.severity(), now);
-        incidents.save(incident);
+        writer.save(incident);
 
         String runId = EventMessages.newRunId();
         // 记住这次调查要问的窗口：重试必须问同一个问题，否则每轮重试都在换问题。
@@ -113,7 +118,7 @@ public class IncidentService {
         outbox.save(OutboxEvent.pending(EventMessages.newEventId(),
                 EventMessages.INVESTIGATION_REQUESTED, runId, 1L, toJson(message), now));
         incident.transitionTo(IncidentStatus.INVESTIGATING, now);
-        incidents.save(incident);
+        writer.save(incident);
         return new ManualIncidentResult(incident.getId(), incident.getStatus(),
                 IncidentOrigin.MANUAL, runId);
     }
@@ -244,7 +249,7 @@ public class IncidentService {
 
         Incident incident = Incident.open(UUID.randomUUID().toString(), fingerprint,
                 alert.service(), alert.summary(), severityOf(alert), now);
-        incidents.save(incident);
+        writer.save(incident);
 
         String runId = EventMessages.newRunId();
         // 记住这次调查要问的窗口：重试必须问同一个问题，否则每轮重试都在换问题。
@@ -268,7 +273,7 @@ public class IncidentService {
         Incident incident = incidents.findById(incidentId)
                 .orElseThrow(() -> new NoSuchElementException("incident not found: " + incidentId));
         incident.transitionTo(target, Instant.now());
-        return incidents.save(incident);
+        return writer.save(incident);
     }
 
     private String toJson(Map<String, Object> message) {
