@@ -48,6 +48,10 @@ public class IncidentService {
     /** 关联时间窗：同服务/依赖服务的告警在这个窗内视为同一次故障。可配置。 */
     private final java.time.Duration correlationWindow;
 
+    /** 派发顺序权重：数值越小越先调查。 */
+    private static final int DISPATCH_RANK_HIGH = 0;
+    private static final int DISPATCH_RANK_NORMAL = 1;
+    private static final int DISPATCH_RANK_LOW = 2;
 
     public IncidentService(IncidentRepository incidents, IncidentWriter writer,
             OutboxRepository outbox, ObjectMapper mapper,
@@ -140,7 +144,8 @@ public class IncidentService {
 
         // group() 返回的是按位置分好的组；把每组的第一条作为代表去 ingest，
         // 其余成员与它共享同一事故
-        List<List<AlertCorrelation.Candidate>> groups = correlation.group(candidates);
+        List<List<AlertCorrelation.Candidate>> groups = orderForDispatch(
+                correlation.group(candidates), alerts);
         List<String> ids = new ArrayList<>();
         String firstId = null;
         IncidentStatus firstStatus = null;
@@ -176,6 +181,48 @@ public class IncidentService {
         }
 
         return new IngestResult(firstId, firstStatus, anyDedup, processed, created, ids);
+    }
+
+    /**
+     * 一批告警的处理顺序 = 严重程度顺序，而不是到达顺序。
+     *
+     * <h2>为什么顺序就是闸门</h2>
+     *
+     * <p>一个组只会产生一个调查 run，而 run 是通过 outbox 投递的：
+     * {@code OutboxRelay} 按插入顺序每次发 50 条，Python worker 串行消费。
+     * 于是**投递顺序就是处理顺序**，而它此前等于「告警到达顺序」。
+     *
+     * <p>后果是一批 50 条 warning 里夹着的那条 critical，要排在 49 条之后才被调查，
+     * 而且每一条都要跑满自己的预算与时限。告警风暴恰恰是"很多低严重度告警 +
+     * 少数致命告警"的形状，所以这不是理论问题。
+     *
+     * <p>这里只排序、不做抢占：抢占需要 worker 侧重排 PEL 里的消息，
+     * 收益不抵风险 —— 已经开始的调查本就在刷自己的 deadline。
+     *
+     * <p>{@link java.util.List#sort} 是稳定排序，同优先级的组保持到达顺序，
+     * 所以这条规则不会让"先来的先处理"在同等严重度下失效。
+     */
+    private static List<List<AlertCorrelation.Candidate>> orderForDispatch(
+            List<List<AlertCorrelation.Candidate>> groups, List<AlertWebhookRequest.Alert> alerts) {
+        List<List<AlertCorrelation.Candidate>> ordered = new ArrayList<>(groups);
+        ordered.sort(java.util.Comparator.comparingInt(
+                group -> group.stream()
+                        .mapToInt(member -> dispatchRank(findAlert(alerts, member)))
+                        .min()
+                        .orElse(DISPATCH_RANK_NORMAL)));
+        return ordered;
+    }
+
+    /** 数值越小越先处理。{@code critical → high} 排在最前，与契约的 priority 枚举一致。 */
+    private static int dispatchRank(AlertWebhookRequest.Alert alert) {
+        if (alert == null) {
+            return DISPATCH_RANK_NORMAL;
+        }
+        return switch (priorityOf(alert)) {
+            case "high" -> DISPATCH_RANK_HIGH;
+            case "low" -> DISPATCH_RANK_LOW;
+            default -> DISPATCH_RANK_NORMAL;
+        };
     }
 
     private static Set<List<String>> edgesOf(List<List<String>> dependencies) {
