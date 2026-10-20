@@ -20,6 +20,22 @@
 
 `version` 形如 `hypothesis-v1@3f2a9c1b4d5e6f70`。
 
+## 为什么拆成命名片段
+
+整段提示词做哈希只回答"变没变"，不回答"哪一变"。而提示词里混着三种
+**生命周期完全不同**的东西：
+
+- `role` / `boundaries`：定义"什么算 latency_degradation"，改它等于改判定语义，
+  必须和评测一起改；
+- `examples`：few-shot，调整它通常是为了修个例，不该让判定语义的版本一起变；
+- `abstention` / `output`：输出契约，改它影响的是解析而不是推理。
+
+混成一个哈希时，改一条 few-shot 会让"fault_type 边界定义的版本"也变，
+于是 EVALUATION 的归因就断了：看到结论变差，说不清是边界定义变了还是
+提示词变长了。所以每个片段单独哈希、单独出现在版本串里。
+
+片段顺序由 `PROMPT_PARTS` 固定 —— 顺序是提示词语义的一部分。
+
 ## 为什么不引入模板引擎
 
 提示词里没有需要运行时替换的变量 —— 所有可变输入（证据摘要、候选服务、
@@ -36,16 +52,40 @@ from pathlib import Path
 _PROMPT_ROOT = Path(__file__).resolve().parent
 
 #: 当前假设生成使用的提示词名。改名即视为新的一代提示词。
-HYPOTHESIS_PROMPT = "hypothesis-v1"
+HYPOTHESIS_PROMPT = "hypothesis-v2"
+
+#: 提示词由哪些命名片段按什么顺序拼成。
+#:
+#: 一份声明同时服务三件事：加载（拼哪些文件）、版本（哪些片段进了哈希）、
+#: 归因（改了哪一段）。散在代码里拼字符串做不到第三件。
+PROMPT_PARTS: dict[str, tuple[str, ...]] = {
+    "hypothesis-v2": ("role", "boundaries", "examples", "abstention", "output"),
+}
+
+_PARTS_ROOT = _PROMPT_ROOT / "parts"
 
 
 @dataclass(frozen=True)
-class Prompt:
-    """一份已加载的提示词。"""
+class PromptPart:
+    """提示词里的一个命名片段。"""
 
     name: str
     text: str
     digest: str
+
+    @property
+    def version(self) -> str:
+        return f"{self.name}@{self.digest}"
+
+
+@dataclass(frozen=True)
+class Prompt:
+    """一份已加载的提示词（由有序片段拼成）。"""
+
+    name: str
+    text: str
+    digest: str
+    parts: tuple[PromptPart, ...] = ()
 
     @property
     def version(self) -> str:
@@ -72,20 +112,52 @@ def load_prompt(name: str = HYPOTHESIS_PROMPT) -> Prompt:
     缓存是有意的：一个 Run 内会多次构造模型请求，重复读盘没有意义；
     而提示词文件在进程生命周期内不会变（改了就重启，版本号随之变化）。
     """
-    path = _PROMPT_ROOT / f"{name}.md"
+    parts = tuple(load_part(name, part) for part in part_order(name))
+    text = "\n\n".join(part.text for part in parts)
+    # 哈希的是**片段的版本列表**，不是拼好的文本：这样"增删片段"也会改版本，
+    # 而只改某一段时版本变化能直接对应到那一段。
+    digest = digest_of("\n".join(p.version for p in parts))
+    return Prompt(name=name, text=text, digest=digest, parts=parts)
+
+
+def part_order(name: str = HYPOTHESIS_PROMPT) -> tuple[str, ...]:
+    """这份提示词由哪些片段按什么顺序组成。未知名字直接报错。"""
+    try:
+        return PROMPT_PARTS[name]
+    except KeyError as exc:
+        raise PromptNotFound(
+            f"prompt {name!r} has no declared parts (known: "
+            + ", ".join(sorted(PROMPT_PARTS))
+            + ")"
+        ) from exc
+
+
+@lru_cache(maxsize=None)
+def load_part(name: str, part: str) -> PromptPart:
+    """加载单个片段。片段路径是 `parts/<prompt>/<part>.md`。"""
+    path = _PARTS_ROOT / name / f"{part}.md"
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
+        available = sorted(p.stem for p in (_PARTS_ROOT / name).glob("*.md"))
         raise PromptNotFound(
-            f"prompt file is missing: {path} (available: "
-            + ", ".join(sorted(p.stem for p in _PROMPT_ROOT.glob("*.md")))
+            f"prompt part is missing: {path} (available: "
+            + (", ".join(available) or "none")
             + ")"
         ) from exc
     text = raw.strip()
     if not text:
-        raise PromptNotFound(f"prompt file is empty: {path}")
-    digest = digest_of(text)
-    return Prompt(name=name, text=text, digest=digest)
+        raise PromptNotFound(f"prompt part is empty: {path}")
+    return PromptPart(name=part, text=text, digest=digest_of(text))
+
+
+def prompt_part_versions(name: str = HYPOTHESIS_PROMPT) -> tuple[str, ...]:
+    """每个片段的版本串，顺序即拼接顺序。
+
+    报告/快照里带上它，"这次的提示词是哪几个片段、各自哪一版"就能逐条回答；
+    只给一个总哈希时，看到结论变化最多只能说"提示词变了"。
+    """
+    return tuple(load_part(name, part).version for part in part_order(name))
 
 
 def prompt_version(name: str = HYPOTHESIS_PROMPT) -> str:

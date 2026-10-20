@@ -157,6 +157,20 @@ public class InvestigationProgressStore {
         return droppedSubscribers.get();
     }
 
+    /**
+     * 当前所有 run 的订阅者总数。
+     *
+     * <p>存在的理由只有一个：让逐 run 的计数有一个**聚合读点**。之前 {@code subscriberCount}
+     * 只被测试调用，等于"计数器不读就是装饰" —— 一个没人读的数字既不能报警也不能解释。
+     */
+    public int totalSubscribers() {
+        int total = 0;
+        for (CopyOnWriteArrayList<Consumer<InvestigationProgress>> list : subscribers.values()) {
+            total += list.size();
+        }
+        return total;
+    }
+
     public int subscriberCount(String runId) {
         List<Consumer<InvestigationProgress>> list = subscribers.get(runId);
         return list == null ? 0 : list.size();

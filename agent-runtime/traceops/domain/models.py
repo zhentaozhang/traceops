@@ -282,6 +282,12 @@ class RCAReport(BaseModel):
     # 变得"不可比"，而采集深度变了则必须知道 —— 两者语义不同，
     # 曾经被塞进同一批版本字符串里，于是既看不出一致也看不出差异。
     run_snapshot: dict = Field(default_factory=dict)
+    #: 被降级读取的原始数据（没能落盘、或落盘后读不回来）。
+    #:
+    #: 每一项都必须带 `read`：一条替代读取路径（怎么把全量再拿一次）。
+    #: 只说"这里被截断了"等于把问题留给下一个人自己猜 —— 而这个人
+    #: 通常是在事故复盘里、且没有当时的上下文。
+    degraded_reads: list[dict] = Field(default_factory=list)
     generated_at: datetime = Field(default_factory=_utcnow)
 
     def all_evidence_ids(self) -> set[str]:

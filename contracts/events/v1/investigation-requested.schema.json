@@ -51,6 +51,17 @@
           "type": "string",
           "description": "调查配置快照版本（模型、Prompt、策略、工具 Schema）。Run 恢复时按此版本取配置。"
         },
+        "retry_of": {
+          "type": "string",
+          "minLength": 1,
+          "description": "investigation_run_id of the attempt this request replaces. Absent on a first attempt. 重试必须说得出它在重做哪一轮，否则事件流里『同一事故的第三次尝试』与『三次互不相关的调查』无法区分。"
+        },
+        "known_unavailable": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {"type": "string", "minLength": 1},
+          "description": "上一轮够不到的数据源。新一轮必须**先查这些**：把预算花在上一轮已经成功的源上、还没轮到失败的那个就把预算耗尽，只是把同一次失败重演一遍。"
+        },
         "alert_summary": {
           "type": "string",
           "maxLength": 4000,

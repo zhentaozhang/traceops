@@ -99,6 +99,9 @@ class SpillStore:
             "digest": digest,
             "preview": encoded[:_SPILL_PREVIEW_CHARS],
             "truncated": True,
+            # 替代读取路径：截断必须自带"怎么拿到全量"，否则读的人只能猜。
+            # 落盘成功时它就是 `page`/`load` 接受的引用本身。
+            "read": f"spill:{path}",
         }
 
     # ---- 读回 ----
@@ -335,9 +338,30 @@ class ToolGateway:
                 "truncated": True,
                 "spill_failed": True,
                 "error": str(exc)[:200],
+                # 落盘失败时唯一还成立的读取路径就是"再查一次"，
+                # 而且必须说清为什么同样的查询要换参数：同参数再查一遍
+                # 还是同样大，还会再次落盘失败。
+                "read": f"requery:{tool_name} with a narrower window "
+                        f"(the {size} byte payload never reached disk)",
             }}
 
     # ---- spill read-back ----
+    @staticmethod
+    def read_path(result: Any) -> str | None:
+        """这条结果如果被截断/落盘，**怎么把全量再拿一次**。
+
+        截断本身是可接受的工程折中；不可接受的是截断之后没人知道
+        全量在哪里、或者它到底还在不在。所以引用里必须一直带着这条信息，
+        调用方（报告、审计、复盘的人）不需要理解 spill 的实现细节。
+        """
+        if not ToolGateway.is_spill_reference(result):
+            return None
+        ref = result[SPILL_REF_KEY]
+        if not isinstance(ref, dict):
+            return None
+        read = ref.get("read")
+        return str(read) if read else None
+
     @staticmethod
     def is_spill_reference(result: Any) -> bool:
         """这个返回值是"指针"还是"数据"。"""

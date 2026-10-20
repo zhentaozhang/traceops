@@ -103,6 +103,16 @@ class InvestigationRequest(BaseModel):
     scope_depth: int | None = None
     #: 本次调查可用的依赖边 [[caller, callee], ...]。
     topology_edges: list[list[str]] | None = None
+    #: 这一轮在重做哪一轮（契约 payload.retry_of）。首次尝试为 None。
+    #:
+    #: 没有它，"同一事故的第三次尝试"和"三次互不相关的调查"在事件流里
+    #: 长得一模一样 —— 事后统计重试效果时无法把 1 次成功归功于第 3 次尝试。
+    retry_of: str | None = None
+    #: 上一轮够不到的数据源（契约 payload.known_unavailable）。
+    #:
+    #: 必须影响**收集顺序**：预算按调用次数计，固定顺序下重试会把预算花在
+    #: 上一轮已经成功的源上，还没轮到失败的那个就耗尽 —— 同一次失败重演一遍。
+    known_unavailable: list[str] | None = None
 
     @model_validator(mode="after")
     def _validate_times(self) -> InvestigationRequest:
@@ -154,6 +164,18 @@ class RunContext:
     # 可用名见 `traceops/rca/shadow.py`：ambiguity_gate / semantic_gate /
     # refutation_gate。
     shadow_gates: frozenset[str] = frozenset()
+    #: 跨调查共享的数据源健康表（`runtime/datasource_health.py`）。
+    #:
+    #: 由调用方显式传入并跨 run 复用 —— "跨调查"的边界就是"同一个进程"。
+    #: 为 None 时不做聚合（单测/评测常用），报告里就是空列表。
+    health: Any = None
+    #: 跨运行共享的策略变更历史（`config/history.py`）。为 None 时不做归属记录。
+    strategy_history: Any = None
+    #: 本轮开始时观察到的策略变更（None = 与上一次观察相比没变，或没有历史）。
+    #:
+    #: 记在上下文里而不是节点里：一个 run 只能有一条"用的是哪套策略"，
+    #: 每个节点各算一次会得到互相矛盾的结论。
+    strategy_change: dict[str, Any] | None = None
 
     def strategy_components(self) -> dict[str, Any]:
         """本次调查的**决策策略**组成（阈值、权重、闸门、提示词）。
@@ -176,6 +198,27 @@ class RunContext:
 
         return _digest(self.strategy_components())
 
+    def observe_strategy(self) -> dict[str, Any] | None:
+        """每轮开始时记一次"当前策略"，返回相对上一次观察的变更。
+
+        必须每轮都调（不只是变更时）：历史表要能回答"这一轮相对上一轮变了什么"，
+        而"上一轮"就是上一次运行，不是上一次变更。
+        """
+        if self.strategy_history is None:
+            return None
+        from traceops.config.fields import current_knobs
+        from traceops.config.history import StrategyHistory
+        from traceops.runtime.strategy import STRATEGY_REVISION
+
+        history: StrategyHistory = self.strategy_history
+        change = history.observe(
+            knobs=current_knobs(),
+            digest=self.strategy_digest(),
+            revision=STRATEGY_REVISION,
+        )
+        self.strategy_change = change.to_dict() if change is not None else None
+        return self.strategy_change
+
     def prompt_version(self) -> str | None:
         """只有真的挂了模型，这次 run 才用到了提示词。
 
@@ -188,7 +231,16 @@ class RunContext:
 
         return prompt_version()
 
-    def run_snapshot(self, request: InvestigationRequest | None = None) -> dict[str, Any]:
+    def prompt_part_versions(self) -> tuple[str, ...]:
+        """本次运行所用提示词的逐片段版本（纯规则运行时为空）。"""
+        if self.model is None:
+            return ()
+        from traceops.prompts import prompt_part_versions
+
+        return prompt_part_versions()
+
+    def run_snapshot(self, request: InvestigationRequest | None = None, *,
+                     failed_sources: list[str] | None = None) -> dict[str, Any]:
         from traceops.runtime.strategy import run_snapshot
 
         return run_snapshot(
@@ -196,7 +248,15 @@ class RunContext:
             scope_depth=self.scope_depth,
             topology=self.topology,
             prompt_version=self.prompt_version(),
+            prompt_parts=self.prompt_part_versions(),
+            datasource_health=(
+                self.health.summary() if self.health is not None else None
+            ),
             config_version=getattr(request, "config_version", None),
+            retry_of=getattr(request, "retry_of", None),
+            known_unavailable=getattr(request, "known_unavailable", None),
+            failed_sources=failed_sources,
+            strategy_change=self.strategy_change,
             alert_summary_present=(
                 getattr(request, "alert_summary", None) is not None
                 if request is not None
@@ -251,6 +311,10 @@ class InvestigationState(TypedDict, total=False):
     #: 必须声明在 TypedDict 里 —— LangGraph 只合并这里列出的键，未声明的键
     #: 会被静默丢弃，表现为"节点明明 append 了、报告里永远是空列表"。
     rejected_proposals: list[dict[str, Any]]
+    #: 被降级读取的原始数据（落盘失败/读不回来），每项带替代读取路径。
+    degraded_reads: list[dict[str, Any]]
+    #: 本轮够不到的数据源 id（进终态事件给控制面，供下一轮重试先查它们）。
+    failed_sources: list[str]
 
 
 CTX_CONFIG_KEY = "traceops_ctx"
@@ -504,10 +568,29 @@ def _charged(fn):
     return wrapper
 
 
+def _prioritise_plan(plan: list[dict[str, Any]],
+                     known_unavailable: list[str] | None) -> list[dict[str, Any]]:
+    """把"上一轮够不到"的源排到最前，其余保持原顺序。
+
+    只改顺序、不改条数：它不能凭空多出证据，只能决定预算先花在哪。
+    排序必须稳定 —— 同一份 plan 重排两次得到同一结果，否则同一事故的
+    两次重试之间连"查了什么"都无法对比。
+    """
+    if not known_unavailable:
+        return list(plan)
+    unavailable = set(known_unavailable)
+    first = [item for item in plan if item.get("source_id") in unavailable]
+    if not first:
+        return list(plan)
+    rest = [item for item in plan if item.get("source_id") not in unavailable]
+    return first + rest
+
+
 @_charged
 def _plan_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
     request = state["request"]
-    return {"plan": _plan_items(request, _ctx_from(config))}
+    plan = _plan_items(request, _ctx_from(config))
+    return {"plan": _prioritise_plan(plan, request.known_unavailable)}
 
 
 @_charged
@@ -519,6 +602,8 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
     evidence_list: list[Evidence] = []
     missing = list(state.get("missing_data", []))
     no_data = list(state.get("no_data_queries", []))
+    degraded = list(state.get("degraded_reads", []))
+    failed_sources = list(state.get("failed_sources", []))
 
     for item in state["plan"]:
         # 内置工具走 Gateway（权限/限额/审计）；事件证据由控制面事件转换而来，不调工具
@@ -544,8 +629,21 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
                                    "run_id": request.investigation_run_id,
                                    "incident_id": request.incident_id},
                             exc_info=True)
+                if ctx.health is not None:
+                    # 记进**跨调查**的健康表：单次 missing_data 说不清
+                    # "这个数据源今天一直不行"，而这正是 abstention 归因的关键。
+                    ctx.health.record_failure(item["source_id"], f"{type(exc).__name__}: {exc}")
                 missing.append(f"{item['tool']}: {exc}")
+                # 手工构造的 plan 项（测试/兼容路径）可能没有 source_id：
+                # 这里用 get，宁可不记也不要因为一个可选字段把整轮调查炸掉。
+                source_id = item.get("source_id")
+                if source_id and source_id not in failed_sources:
+                    failed_sources.append(source_id)
                 continue
+            if ctx.health is not None:
+                # "查到了但没有数据"是成功：数据源是通的，这是阴性证据。
+                ctx.health.record_success(item["source_id"])
+
             # **超限结果必须先读回再归一化**。
             #
             # Gateway 对超过 max_result_bytes 的结果返回的是指针
@@ -569,6 +667,15 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
                                 exc_info=True)
                     missing.append(
                         f"{item['tool']}: result was spilled but unreadable ({exc})")
+                    # 光记"读不回来"是不够的：复盘的人需要知道数据还能怎么拿到。
+                    # `read` 是这条降级的替代读取路径，缺失时也要如实说没有。
+                    degraded.append({
+                        "kind": "spill_unreadable",
+                        "tool": item["tool"],
+                        "bytes": (spilled_ref or {}).get("bytes"),
+                        "reason": str(exc)[:200],
+                        "read": gateway.read_path(raw) or "unavailable",
+                    })
                     continue
             unwrapped = _unwrap_raw(raw, item["evidence_type"])
             observed_at = _observed_at(unwrapped, item["evidence_type"], request.window_end)
@@ -630,7 +737,9 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
         ctx.store.add(evidence)
         evidence_list.append(evidence)
 
-    return {"evidence": evidence_list, "missing_data": missing, "no_data_queries": no_data}
+    return {"evidence": evidence_list, "missing_data": missing,
+            "no_data_queries": no_data, "degraded_reads": degraded,
+            "failed_sources": failed_sources}
 
 
 @_charged
@@ -1185,6 +1294,7 @@ def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str,
         store=ctx.store,
         missing_data=missing,
         no_data=list(state.get("no_data_queries", [])),
+        degraded_reads=list(state.get("degraded_reads", [])),
         affected_services=_affected_services(state, config),
         correlation_notes=_correlation_notes(state),
         propagation_chain=_propagation_chain(state, ctx),
@@ -1207,7 +1317,8 @@ def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str,
         # 只放进 ctx 或只打日志都不够 —— 报告才是会被归档、被引用、
         # 被拿去和上次比较的那份东西。
         strategy_digest=ctx.strategy_digest(),
-        run_snapshot=ctx.run_snapshot(request),
+        run_snapshot=ctx.run_snapshot(
+            request, failed_sources=list(state.get("failed_sources", []))),
     )
     return {"report": report, "status": report.diagnosis_status}
 
@@ -1266,6 +1377,8 @@ def _initial_state(request: InvestigationRequest) -> InvestigationState:
         "errors": [],
         "missing_data": [],
         "no_data_queries": [],
+        "degraded_reads": [],
+        "failed_sources": [],
     }
 
 
@@ -1299,6 +1412,9 @@ def run_investigation(request: InvestigationRequest, ctx: RunContext, *,
     """
     if ctx.gateway is None:
         ctx.gateway = _build_gateway(ctx)
+    # 在**跑图之前**记一次策略：报告随后会带上"这一轮相对上一轮改了什么"。
+    # 放在图里的话，每个节点都会各自观察一次，同一轮会得到互相矛盾的结论。
+    ctx.observe_strategy()
     graph = build_investigation_graph(checkpointer=checkpointer)
     configurable: dict[str, Any] = {CTX_CONFIG_KEY: ctx}
     if thread_id:

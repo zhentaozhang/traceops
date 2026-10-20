@@ -20,6 +20,10 @@ from typing import Literal
 DEFAULT_MAX_TOKENS = 100_000  # 工程上限（REVISIONS-1.1 R6），不是平均预期
 DEFAULT_MAX_TOOL_CALLS = 50
 DEFAULT_MAX_ROUNDS = 10
+#: 墙钟上限默认值。**必须是模块常量**：它同时被
+#: `traceops.config.fields`（声明式旋钮的默认值来源）与文档引用，
+#: 写在构造签名里就会出现"文档写 900、代码改了没人跟"的漂移。
+DEFAULT_DEADLINE_SECONDS = 900
 
 
 class BudgetExhausted(Exception):
@@ -63,7 +67,7 @@ class BudgetManager:
         # 单轮约 3 秒、7 节点约 20 秒。900 秒给远程模型与重试留足余量，
         # 同时远小于"永远"。需要更长时可显式传更大值，或传 None 关闭
         # （关闭是显式选择，不是默认）。
-        deadline_seconds: float | None = 900,
+        deadline_seconds: float | None = DEFAULT_DEADLINE_SECONDS,
     ) -> None:
         self.max_tokens = max_tokens
         self.max_tool_calls = max_tool_calls

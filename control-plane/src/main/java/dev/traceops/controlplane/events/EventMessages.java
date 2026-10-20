@@ -29,9 +29,40 @@ public final class EventMessages {
      * 契约违约，每次调查往日志里刷 N 条虚假告警。
      */
     public static final String INVESTIGATION_UPDATED = "investigation.updated";
+
+    /**
+     * 回程结果事件（由 Python worker 产出、控制面消费）。
+     *
+     * <p>常量放在这里是因为漏斗要按事件类型计数 —— 直接写字符串字面量的话，
+     * 拼错一个字母只会让某一格静默变成 0，而不是报错。
+     */
+    public static final String INVESTIGATION_COMPLETED = "investigation.completed";
+    public static final String INVESTIGATION_FAILED = "investigation.failed";
     public static final Duration DEFAULT_WINDOW = Duration.ofMinutes(5);
 
     private EventMessages() {
+    }
+
+    /**
+     * 一次重试相对"它重做的那一轮"多带的信息。
+     *
+     * <p>为什么不塞两个 {@code String}/{@code List} 参数进去：请求组装已经有 11 个
+     * 位置参数，再加两个相邻的字符串形参，第一个调用方就会把 {@code retryOf} 和
+     * {@code alertSummary} 传反 —— 而且编译器不会拦。给它一个名字，也给它一个
+     * "首次尝试"的空值。
+     */
+    public record RetryContext(String retryOf, java.util.List<String> knownUnavailable) {
+
+        public RetryContext {
+            knownUnavailable = knownUnavailable == null
+                    ? java.util.List.of()
+                    : java.util.List.copyOf(knownUnavailable);
+        }
+
+        /** 首次尝试：不重做任何一轮，也没有"上次失败"可言。 */
+        public static RetryContext none() {
+            return new RetryContext(null, java.util.List.of());
+        }
     }
 
     public static String newEventId() {
@@ -100,6 +131,33 @@ public final class EventMessages {
             Instant windowEnd,
             String causationId,
             String alertSummary) {
+        return investigationRequested(incidentId, serviceHint, runId, environment, configVersion,
+                priority, now, windowStart, windowEnd, causationId, alertSummary,
+                RetryContext.none());
+    }
+
+    /**
+     * 组装一条**重试**请求：除了"问同一个问题"，还要说清楚它在重做哪一轮、
+     * 上一轮哪些源够不到。
+     *
+     * <p>为什么 {@code known_unavailable} 必须随请求走：Agent 的预算按调用次数
+     * 计，收集顺序决定它查得到什么。上一轮因为 loki 连不上而缺日志，重试若仍按
+     * 固定顺序先查指标与链路，很可能在轮到 loki 之前就把预算花完 —— 于是"重试"
+     * 只是把同一次失败又演了一遍，而报告会说这是一次新的、同样 INCONCLUSIVE 的调查。
+     */
+    public static Map<String, Object> investigationRequested(
+            String incidentId,
+            String serviceHint,
+            String runId,
+            String environment,
+            String configVersion,
+            String priority,
+            Instant now,
+            Instant windowStart,
+            Instant windowEnd,
+            String causationId,
+            String alertSummary,
+            RetryContext retry) {
 
         Map<String, Object> envelope = new LinkedHashMap<>();
         envelope.put("event_id", newEventId());
@@ -137,6 +195,14 @@ public final class EventMessages {
         // 和"没有线索"看起来一样。
         if (alertSummary != null && !alertSummary.isBlank()) {
             payload.put("alert_summary", alertSummary);
+        }
+        if (retry != null) {
+            if (retry.retryOf() != null && !retry.retryOf().isBlank()) {
+                payload.put("retry_of", retry.retryOf());
+            }
+            if (!retry.knownUnavailable().isEmpty()) {
+                payload.put("known_unavailable", retry.knownUnavailable());
+            }
         }
 
         Map<String, Object> message = new LinkedHashMap<>();

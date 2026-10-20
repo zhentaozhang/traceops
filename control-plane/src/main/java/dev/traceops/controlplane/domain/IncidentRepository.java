@@ -20,4 +20,32 @@ public interface IncidentRepository extends JpaRepository<Incident, String> {
     java.util.List<Incident> findByServiceOrderByCreatedAtDesc(String service);
 
     java.util.List<Incident> findAllByOrderByCreatedAtDesc();
+
+    /** 排期在未来的重试数 —— "有几个事故正在等退避"。 */
+    long countByNextRetryAtAfter(java.time.Instant now);
+
+    /**
+     * 排期已过、但事故仍停在那里的重试数。
+     *
+     * <p>这个数长期大于 0 说明"排了期但没人发出去"：relay 没跑、
+     * 事件被卡在退避分支之后，或者结果事件丢了。它是重试回路唯一的外部证据。
+     */
+    long countByNextRetryAtBefore(java.time.Instant now);
+
+    /** 时间窗内新建的事故数（漏斗用）。 */
+    long countByCreatedAtAfter(java.time.Instant since);
+
+    /** 时间窗内新建的事故数，按来源分（告警 vs 人工）。 */
+    long countByCreatedAtAfterAndOrigin(java.time.Instant since, IncidentOrigin origin);
+
+    /**
+     * 时间窗内新建的事故所折叠掉的重复告警总数。
+     *
+     * <p>口径限制（写在这里以免被当成精确值）：计数挂在**事故**上，
+     * 所以一条早就存在的事故在本窗口内新收到的重复告警不会出现在这里。
+     * 打开窗口（since 早于事故创建时间）时它是准确的。
+     */
+    @org.springframework.data.jpa.repository.Query(
+            "select coalesce(sum(i.duplicateAlerts), 0) from Incident i where i.createdAt > :since")
+    long sumDuplicateAlertsCreatedAfter(java.time.Instant since);
 }

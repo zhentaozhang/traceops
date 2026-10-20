@@ -174,8 +174,8 @@ class TestComponentsAreInspectable:
         """digest 只回答"一不一样"；要回答"差在哪"得看组成。"""
         components = strategy_components()
         assert components["revision"] == "strategy-v1"
-        assert components["thresholds"]["error_rate"] > 0
-        assert components["ranking"]["contradiction"] < 0
+        assert components["knobs"]["thresholds.error_rate"] > 0
+        assert components["knobs"]["ranking.contradiction"] < 0
         assert set(components["gates"]) == {"semantic", "contradiction", "shadow"}
 
     def test_digest_of_components_matches_strategy_digest(self):

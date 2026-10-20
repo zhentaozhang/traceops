@@ -121,22 +121,34 @@ public class InvestigationRetryService {
             windowStart = now.minus(EventMessages.DEFAULT_WINDOW);
         }
 
+        // 旧 run_id 必须在 beginRun 之前取：重试请求要能说出"我在重做哪一轮"，
+        // 否则事件流里三次尝试与三次互不相关的调查长得一模一样。
+        String previousRunId = incident.getCurrentRunId();
         String runId = EventMessages.newRunId();
+        // 事故跟着换到这一轮的 run_id：进度是按 run 存的状态，不换的话重试真的跑起来以后，
+        // 接口还在读上一轮的进度，处境判断会一直停在"已死"。
+        incident.beginRun(runId);
         Map<String, Object> message = EventMessages.investigationRequested(
                 incident.getId(), incident.getService(), runId, environment, configVersion,
                 priorityOf(incident), now, windowStart, windowEnd, failedEventId,
                 // 重试必须问同一个问题 —— 包括带上同一份告警原文，
                 // 否则重试等于换了个更穷的问题再问一遍。
-                incident.getTitle());
+                incident.getTitle(),
+                new EventMessages.RetryContext(previousRunId, incident.getUnavailableSources()));
 
         String eventId = String.valueOf(((Map<?, ?>) message.get("envelope")).get("event_id"));
         // 退避写进 outbox：这一行在 notBefore 之前不会被 relay 取走。
         Instant notBefore = now.plus(backoffFor(attempt));
         outbox.save(OutboxEvent.pendingAfter(eventId, EventMessages.INVESTIGATION_REQUESTED,
                 runId, 1L, toJson(message), now, notBefore));
+        // 同时在事故上记下这一轮什么时候会重来：outbox 行的 aggregate_id 是 run_id，
+        // 只看 outbox 无法回答"这个事故还要等多久"。调用方随后会保存这个事故。
+        incident.scheduleRetryAt(notBefore);
 
-        log.info("retry scheduled: incident={} attempt={}/{} run_id={} causation={} not_before={}",
-                incident.getId(), attempt, maxAttempts, runId, failedEventId, notBefore);
+        log.info("retry scheduled: incident={} attempt={}/{} run_id={} retry_of={} known_unavailable={} "
+                        + "causation={} not_before={}",
+                incident.getId(), attempt, maxAttempts, runId, previousRunId,
+                incident.getUnavailableSources(), failedEventId, notBefore);
         return true;
     }
 

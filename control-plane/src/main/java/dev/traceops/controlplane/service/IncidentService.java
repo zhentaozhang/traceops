@@ -105,9 +105,13 @@ public class IncidentService {
                 id, request.service(), request.title(),
                 request.severity() == null || request.severity().isBlank()
                         ? "warning" : request.severity(), now);
-        writer.save(incident);
 
         String runId = EventMessages.newRunId();
+        // 事故记住这一轮的 run_id：进度是按 run 存的状态，"此刻有没有人在跑"只有它能回答。
+        // 放在第一次保存之前，避免为了这一个字段多写一次库。
+        incident.beginRun(runId);
+        writer.save(incident);
+
         // 记住这次调查要问的窗口：重试必须问同一个问题，否则每轮重试都在换问题。
         Instant windowEnd = now;
         Instant windowStart = now.minus(EventMessages.DEFAULT_WINDOW);
@@ -291,14 +295,22 @@ public class IncidentService {
                         fingerprint, IncidentOrigin.ALERT,
                         List.of(IncidentStatus.RESOLVED, IncidentStatus.FAILED));
         if (active.isPresent()) {
-            return new IngestResult(active.get().getId(), active.get().getStatus(), true);
+            Incident existing = active.get();
+            // 命中去重时原先什么都不写：于是"这一窗收到多少告警"永远数不出来，
+            // 只有"新建了几个事故"可数。风暴的形状恰恰是后者很小、前者很大。
+            existing.recordDuplicateAlert();
+            writer.save(existing);
+            return new IngestResult(existing.getId(), existing.getStatus(), true);
         }
 
         Incident incident = Incident.open(UUID.randomUUID().toString(), fingerprint,
                 alert.service(), alert.summary(), severityOf(alert), now);
+        String runId = EventMessages.newRunId();
+        // 同上（告警路径）：run_id 落在事故上，否则"这个事故在等 worker 还是在跑"
+        // 只能靠反查 outbox 载荷才知道。
+        incident.beginRun(runId);
         writer.save(incident);
 
-        String runId = EventMessages.newRunId();
         // 记住这次调查要问的窗口：重试必须问同一个问题，否则每轮重试都在换问题。
         Instant windowEnd = now;
         Instant windowStart = now.minus(EventMessages.DEFAULT_WINDOW);

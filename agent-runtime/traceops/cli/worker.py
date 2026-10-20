@@ -33,6 +33,8 @@ from traceops.runtime.budget import (
     DEFAULT_MAX_TOKENS,
     BudgetManager,
 )
+from traceops.config.history import StrategyHistory
+from traceops.runtime.datasource_health import DatasourceHealthTracker
 from traceops.runtime.deadletter import InMemoryDeadLetterSink
 from traceops.runtime.shutdown import StopSignal
 from traceops.evidence.retention import RetentionPolicy
@@ -210,6 +212,14 @@ def _topology_for(request: InvestigationRequest,
         raise TopologyError(f"request supplied invalid topology_edges: {exc}") from exc
 
 
+#: 进程级数据源健康表。刻意不落盘：重启归零可以接受，
+#: 而落盘要处理清理、并发与 schema 迁移，收益不成比例。
+_SHARED_HEALTH = DatasourceHealthTracker()
+#: 进程级共享的策略变更历史：跨调查的边界就是"同一个进程"。
+#: 换了配置再重启是运维动作，那一次重启本身就是一条变更。
+_SHARED_STRATEGY_HISTORY = StrategyHistory()
+
+
 def build_run_context(request: InvestigationRequest, *, args, store, adapters,
                       topology: ServiceTopology | None) -> RunContext:
     """按**这一次请求**的配置组装 RunContext。
@@ -231,6 +241,12 @@ def build_run_context(request: InvestigationRequest, *, args, store, adapters,
         # 契约里的 scope_depth 决定沿下游依赖展开几层。
         scope_depth=(request.scope_depth
                      if request.scope_depth is not None else RunContext.scope_depth),
+        # 同一个进程里的所有 run 共享一张健康表：单个调查看不到
+        # "loki 已经连续失败七次"，只有跨 run 才说得出来。
+        health=_SHARED_HEALTH,
+        # 策略变更历史同样跨 run：报告要能说"这一轮的结论相对上一轮
+        # 是在换了阈值之后得出的"，而不是只有 git log 知道。
+        strategy_history=_SHARED_STRATEGY_HISTORY,
     )
 
 

@@ -42,9 +42,18 @@ public class OutboxRelay {
         int published = 0;
         for (OutboxEvent event : batch) {
             try {
+                int attemptsWhenRead = event.getAttempts();
                 publisher.publish(event.getPayload());
-                event.markPublished(Instant.now());
-                repository.save(event);
+                // 条件标记而不是 save(event)：见 markPublishedIfUntouched 的说明。
+                // 返回 0 意味着另一个实例已经发布/推进了这一行，重复投递已经发生，
+                // 但**不能**把它算成本实例的投递次数，也不能反过来记成失败。
+                int claimed = repository.markPublishedIfUntouched(
+                        event.getEventId(), Instant.now(), attemptsWhenRead);
+                if (claimed == 0) {
+                    log.warn("outbox row was already published or advanced by another relay instance, "
+                            + "dropping our claim: {}", event.getEventId());
+                    continue;
+                }
                 published++;
             } catch (Exception ex) {
                 event.markFailed();

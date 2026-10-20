@@ -64,23 +64,17 @@ def strategy_components(
     传进来的写法一定会漏（漏掉的那个旋钮就悄悄改了结论还说自己没改）。
     常量在哪定义，指纹就从哪读。
     """
-    from traceops.orchestration import detectors
-    from traceops.rca import ranking
+    from traceops.config.fields import current_knobs
+
+    # 旋钮的值**只从这里读**（`config/fields.py` 的声明）。
+    # 以前这里手抄了 8 个常量名，于是"哪个旋钮参与指纹"有两处需要维护：
+    # 新增一个阈值时忘了加进这个字典，指纹就不覆盖它 —— 换了策略却
+    # 报"策略没变"。声明式字段把这两处合并成一处。
+    knobs = current_knobs()
 
     return {
         "revision": STRATEGY_REVISION,
-        "thresholds": {
-            "error_rate": detectors.ERROR_RATE_THRESHOLD,
-            "slow_span_seconds": detectors.SLOW_SPAN_THRESHOLD_SECONDS,
-        },
-        "ranking": {
-            "demote": ranking._W_DEMOTE,
-            "anomaly_before": ranking._W_ANOMALY_BEFORE,
-            "trace_anomaly": ranking._W_TRACE_ANOMALY,
-            "config_change": ranking._W_CONFIG_CHANGE,
-            "contradiction": ranking._W_CONTRADICTION,
-            "component_specific": ranking._W_COMPONENT_SPECIFIC,
-        },
+        "knobs": knobs,
         # 闸门开关决定"结论会不会被降级"，属于策略，不属于运行输入。
         # 影子化同样改变结论（只是方向相反），所以也在里面 —— 且带名字，
         # 因为"影子 ambiguity 闸门"和"影子 semantic 闸门"是两个不同策略。
@@ -125,18 +119,39 @@ def run_snapshot(
     scope_depth: int | None = None,
     topology: Any | None = None,
     prompt_version: str | None = None,
+    prompt_parts: list[str] | tuple[str, ...] | None = None,
+    datasource_health: list[dict[str, Any]] | None = None,
     config_version: str | None = None,
     alert_summary_present: bool | None = None,
+    retry_of: str | None = None,
+    known_unavailable: list[str] | None = None,
+    failed_sources: list[str] | None = None,
+    strategy_change: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """本次运行的实际输入。这些值变了**不代表策略变了**。"""
     snapshot: dict[str, Any] = {
         "scope_depth": scope_depth,
         "topology_digest": topology_digest(topology),
         "prompt_version": prompt_version,
+        # 逐片段的版本：只给总哈希时，看到结论变化最多只能说"提示词变了"，
+        # 说不出是哪一段变的（边界定义 / few-shot / 输出契约）。
+        "prompt_parts": list(prompt_parts or ()),
+        # 数据源健康是**运行输入**（外部世界的状态），不是策略；
+        # 放在快照里是因为"这次为什么证据少"必须能从报告本身回答。
+        "datasource_health": list(datasource_health or ()),
         "config_version": config_version,
         # 只记"有没有告警原文"，不记原文本身：快照会进报告，
         # 报告会进证据库与日志，原文属于告警数据、不该复制到第三个地方。
         "alert_summary_present": alert_summary_present,
+        # 这一轮在重做哪一轮、上一轮缺了哪些源、这一轮自己又缺了哪些源。
+        # 三个值放一起才能回答"重试有没有起作用"：只记 retry_of，
+        # 会分不清"源恢复了但结论仍不足"与"同一个源仍然不通"。
+        "retry_of": retry_of,
+        "known_unavailable": list(known_unavailable or ()),
+        "failed_sources": list(failed_sources or ()),
+        # 本轮相对上一轮改了什么策略（点分路径）。结论变了而这里非空时，
+        # 第一嫌疑是"换了尺子"，不是"系统变了"。
+        "strategy_change": strategy_change,
     }
     if budget is not None:
         snapshot["budget"] = {

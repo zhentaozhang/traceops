@@ -9,8 +9,8 @@ Evidence-driven Agentic RCA Platform —— 面向微服务系统的智能故障
 
 | 平面 | 状态 | 测试 |
 |---|---|---|
-| Control Plane（Java / Spring Boot） | ✅ 告警接入、事故关联、状态机、Outbox、结果消费、**诊断结论 REST 查询**、**失败自动重试**、**契约运行时校验** | 152 passing |
-| Investigation Plane（Python / LangGraph） | ✅ 7 节点图、双层采集、传播链、重试分类、**证据读回** | 1038 passing |
+| Control Plane（Java / Spring Boot） | ✅ 告警接入、事故关联、状态机、Outbox、结果消费、**诊断结论 REST 查询**、**失败自动重试**、**契约运行时校验** | 215 passing |
+| Investigation Plane（Python / LangGraph） | ✅ 7 节点图、双层采集、传播链、重试分类、**证据读回** | 1096 passing |
 | Evidence Plane（Python） | ✅ 4 类归一化、内容寻址校验、**SQLite 持久化**、查询模板、证据图 | 同上 |
 | Evaluation Plane（Python） | ✅ 12 场景（含三服务级联 F-005、F-011 自然语言线索）+ 18 指标 + runner | 106 passing |
 | Execution Plane（受控修复） | ✅ Action Registry + Policy + Approval + Executor | 21 passing |
@@ -70,7 +70,7 @@ cd traceops
 python -m venv --system-site-packages .venv
 .venv/bin/python -m pip install -e agent-runtime --no-build-isolation
 
-# 全部测试（agent-runtime 1038 + evaluation 106 + contracts 13 = 1157）
+# 全部测试（agent-runtime 1096 + evaluation 106 + contracts 13 = 1215）
 PYTHONPATH=agent-runtime .venv/bin/python -m pytest agent-runtime/tests evaluation contracts -q
 
 # 跑评估：12 场景 + 指标
@@ -81,13 +81,23 @@ PYTHONPATH=agent-runtime .venv/bin/python -m pytest agent-runtime/tests evaluati
 
 ```bash
 cd traceops/control-plane
-mvn -s .mvn/settings.xml -B test        # 126 tests
+mvn -s .mvn/settings.xml -B test        # 215 tests
 mvn -s .mvn/settings.xml spring-boot:run # :8081
 
 curl -X POST localhost:8081/api/v1/alerts -H 'Content-Type: application/json' -d '{
   "alerts":[{"fingerprint":"fp-demo","status":"firing","service":"order-service",
              "severity":"critical","summary":"redis pool exhausted"}]}'
 ```
+
+### 运维可见性
+
+同一套数据现在有三个"不用翻日志"的入口：
+
+| 端点 | 回答什么 |
+|---|---|
+| `GET /api/v1/incidents/{id}` | 这条事故**此刻卡在谁那里**（`stage.kind` / `stage.waitingOn` / `stage.retryable`），而不只是"流程走到哪"。`INVESTIGATING` 一个词背后有四种处境：等认领、在跑、卡退避、已经死了 |
+| `GET /api/v1/status` | 三条等待读数：outbox 积压（**最老一条等了多久**，≥60s 降级）、重试（等退避 N 条 / 已过期但没发出去的 N 条）、进度存储淘汰与丢弃计数 |
+| `GET /api/v1/diagnostics/funnel?since=` | 告警 → 事故 → 调查 → 完成/失败 → 需人看，**每格由自己的来源数出来**，不靠上一步减下一步 |
 
 > `.mvn/settings.xml` 是本机环境适配（`~/.m2` 不可写 + Maven Central 直连 403，
 > 故本地仓库落工作区内、镜像到阿里云）。换机器按需删除。

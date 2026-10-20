@@ -69,6 +69,12 @@
           },
           "description": "实际消耗，用于成本统计与实验指标。"
         },
+        "failed_sources": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {"type": "string", "minLength": 1},
+          "description": "本轮够不到的数据源。必须进消息体（不能只留在报告里）：控制面要靠它决定重试先查什么，而 rca_report_ref 指向的存储控制面并不读。"
+        },
         "abstained": {
           "type": "boolean",
           "default": false,

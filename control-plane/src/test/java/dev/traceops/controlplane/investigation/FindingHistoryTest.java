@@ -59,7 +59,8 @@ class FindingHistoryTest {
                 "ref-" + runId,
                 null,
                 null,
-                new EvidenceSummary(2, 1, 1, 0, 0)),
+                new EvidenceSummary(2, 1, 1, 0, 0),
+                List.of()),
                 Instant.parse("2026-10-30T10:00:00Z"));
     }
 

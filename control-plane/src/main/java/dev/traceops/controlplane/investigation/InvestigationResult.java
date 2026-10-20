@@ -35,13 +35,22 @@ public record InvestigationResult(
         String reportRef,
         String failedNode,
         String checkpointId,
-        EvidenceSummary evidenceSummary) {
+        EvidenceSummary evidenceSummary,
+        List<String> failedSources) {
 
     public InvestigationResult {
         // 可选字段缺省时空集合/零值，避免调用方到处判 null；不做"猜值"，只补"无值"的默认。
         rootCauseCandidates = rootCauseCandidates == null ? List.of() : List.copyOf(rootCauseCandidates);
         usage = usage == null ? Usage.empty() : usage;
         evidenceSummary = evidenceSummary == null ? EvidenceSummary.empty() : evidenceSummary;
+        // 刻意**不**把 null 归一成空列表：这两种情况含义相反。
+        //   null → 这条消息根本没带 failed_sources（例如 failed 事件不带源信息）
+        //   []   → 带了，而且这一轮所有源都够得到
+        // 归一化之后，"没消息"会被读成"全都好"，于是上一轮记下的失败源
+        // 会在重试排期之前被清空 —— 重试又回到"同一次失败重演一遍"。
+        if (failedSources != null) {
+            failedSources = List.copyOf(failedSources);
+        }
     }
 
     /** 信封上的 event_type。 */
@@ -83,7 +92,8 @@ public record InvestigationResult(
                     requiredText(payload, "rca_report_ref"),
                     null,
                     null,
-                    EvidenceSummary.fromWire(payload.path("evidence_summary")));
+                    EvidenceSummary.fromWire(payload.path("evidence_summary")),
+                    textList(payload.path("failed_sources")));
             case FAILED -> new InvestigationResult(
                     eventId,
                     investigationRunId,
@@ -101,7 +111,8 @@ public record InvestigationResult(
                     null,
                     optionalText(payload, "failed_node"),
                     optionalText(payload, "checkpoint_id"),
-                    EvidenceSummary.fromWire(payload.path("evidence_summary")));
+                    EvidenceSummary.fromWire(payload.path("evidence_summary")),
+                    null);
         };
     }
 
@@ -272,6 +283,24 @@ public record InvestigationResult(
             return fromPayload.asText();
         }
         return requiredText(envelope, "correlation_id");
+    }
+
+    /** 可选字符串数组；缺失返回 null（"没带" ≠ "空"）。非数组一律拒收（不做"尽力而为"）。 */
+    private static List<String> textList(JsonNode node) {
+        if (node == null || node.isMissingNode() || node.isNull()) {
+            return null;
+        }
+        if (!node.isArray()) {
+            throw new IllegalArgumentException("expected an array, got " + node.getNodeType());
+        }
+        List<String> values = new java.util.ArrayList<>(node.size());
+        for (JsonNode element : node) {
+            if (!element.isTextual() || element.asText().isBlank()) {
+                throw new IllegalArgumentException("array element must be a non-blank string, got " + element);
+            }
+            values.add(element.asText());
+        }
+        return List.copyOf(values);
     }
 
     private static JsonNode requiredObject(JsonNode parent, String field) {        JsonNode node = parent.path(field);

@@ -194,6 +194,12 @@ def completed_event(run: InvestigationRun, report) -> dict[str, Any]:
             "duration_seconds": int((run.updated_at - run.created_at).total_seconds()),
         },
         "abstained": bool(report.abstained) if report else True,
+        # 必须进消息体：控制面靠它决定下一轮重试先查哪个源，而
+        # rca_report_ref 指向的存储控制面并不读。空列表是有效信息
+        # （这一轮所有源都够得到），不是"没填"。
+        "failed_sources": list(
+            (report.run_snapshot or {}).get("failed_sources", []) if report else []
+        ),
     }
     return _envelope("investigation.completed", payload,
                      run_id=run.run_id, incident_id=run.incident_id, version=run.aggregate_version)
@@ -655,6 +661,11 @@ def derive_request_from_event(message: dict[str, Any]) -> InvestigationRequest:
         budget=payload.get("budget"),
         scope_depth=payload.get("scope_depth"),
         topology_edges=payload.get("topology_edges"),
+        # 重试上下文：在重做哪一轮、上一轮哪些源够不到。
+        # 前一轮缺什么直接决定这一轮的**收集顺序**（见 _prioritise_plan）——
+        # 不读它的话，重试只是在同一次失败上再花一遍预算。
+        retry_of=payload.get("retry_of"),
+        known_unavailable=payload.get("known_unavailable"),
     )
 
 

@@ -23,17 +23,17 @@ import org.springframework.web.bind.annotation.RestController;
 public class OutboxDiagnostics {
 
     private final OutboxRepository repository;
-    private final OutboxRelay relay;
+    private final OutboxPassGate gate;
     private final EventPublisher publisher;
     private final ObjectProvider<OutboxRelayScheduler> scheduler;
     private final ApplicationContext context;
 
-    public OutboxDiagnostics(OutboxRepository repository, OutboxRelay relay,
+    public OutboxDiagnostics(OutboxRepository repository, OutboxPassGate gate,
                              EventPublisher publisher,
                              ObjectProvider<OutboxRelayScheduler> scheduler,
                              ApplicationContext context) {
         this.repository = repository;
-        this.relay = relay;
+        this.gate = gate;
         this.publisher = publisher;
         this.scheduler = scheduler;
         this.context = context;
@@ -81,11 +81,21 @@ public class OutboxDiagnostics {
         }
     }
 
-    /** 手动触发一次 relay —— 用来区分"没写 outbox"和"relay 没跑"。 */
+    /**
+     * 手动触发一次 relay —— 用来区分"没写 outbox"和"relay 没跑"。
+     *
+     * <p>走单飞闸门：被合并时返回 {@code started=false} 而不是假装跑过。
+     * 之前这里直接调 {@code relayOnce()}，于是操作员在调度轮次运行期间点一下，
+     * 两轮会同时取到同一批待投递事件并把它们各发一遍。
+     */
     @PostMapping("/relay")
     public Map<String, Object> relay() {
-        int published = relay.relayOnce();
-        return Map.of("published", published,
-                      "publisher", publisher.getClass().getSimpleName());
+        boolean started = gate.requestPass();
+        Map<String, Object> body = new java.util.LinkedHashMap<>();
+        body.put("published", started ? "pass-completed" : "coalesced-into-running-pass");
+        body.put("started", started);
+        body.put("coalescedPasses", gate.coalescedPasses());
+        body.put("publisher", publisher.getClass().getSimpleName());
+        return body;
     }
 }

@@ -140,6 +140,16 @@ public class InvestigationResultService {
 
     /** 按事件类型 + 诊断状态决定状态机走向；账本写入由 {@link #apply} 统一处理。 */
     private Applied drive(Incident incident, InvestigationResult result, IncidentStatus previous, Instant now) {
+        // 新一轮结果到达 ⇒ 之前排期中的那轮重试已经用掉了。不清会留下一条永久的
+        // "在等退避"：重试早已跑完、结论也落了账，接口上却还在说"还要等 15 秒"。
+        // 本轮若仍然可重试，retryOrFail 会重新排一次并写回新的时刻。
+        incident.clearRetrySchedule();
+        // 本轮够不到的源要留在事故上：下一轮重试靠它决定"先查什么"。
+        // 只在消息真的带了 failed_sources 时才覆盖 —— failed 事件通常不带，
+        // 此时若当成"全都够得到"去清空，重试就会在排期前失去唯一的线索。
+        if (result.failedSources() != null) {
+            incident.rememberUnavailableSources(result.failedSources());
+        }
         if (result.terminalStatus() == InvestigationResult.TerminalStatus.COMPLETED) {
             return driveCompleted(incident, result, previous, now);
         }
