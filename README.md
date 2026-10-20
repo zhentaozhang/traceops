@@ -9,8 +9,8 @@ Evidence-driven Agentic RCA Platform —— 面向微服务系统的智能故障
 
 | 平面 | 状态 | 测试 |
 |---|---|---|
-| Control Plane（Java / Spring Boot） | ✅ 告警接入、事故关联、状态机、Outbox、结果消费、**诊断结论 REST 查询**、**失败自动重试** | 126 passing |
-| Investigation Plane（Python / LangGraph） | ✅ 7 节点图、双层采集、传播链、重试分类 | 915 passing |
+| Control Plane（Java / Spring Boot） | ✅ 告警接入、事故关联、状态机、Outbox、结果消费、**诊断结论 REST 查询**、**失败自动重试**、**契约运行时校验** | 152 passing |
+| Investigation Plane（Python / LangGraph） | ✅ 7 节点图、双层采集、传播链、重试分类、**证据读回** | 1038 passing |
 | Evidence Plane（Python） | ✅ 4 类归一化、内容寻址校验、**SQLite 持久化**、查询模板、证据图 | 同上 |
 | Evaluation Plane（Python） | ✅ 12 场景（含三服务级联 F-005、F-011 自然语言线索）+ 18 指标 + runner | 106 passing |
 | Execution Plane（受控修复） | ✅ Action Registry + Policy + Approval + Executor | 21 passing |
@@ -70,7 +70,7 @@ cd traceops
 python -m venv --system-site-packages .venv
 .venv/bin/python -m pip install -e agent-runtime --no-build-isolation
 
-# 全部测试（agent-runtime 915 + evaluation 106 + contracts 13 = 1034）
+# 全部测试（agent-runtime 1038 + evaluation 106 + contracts 13 = 1157）
 PYTHONPATH=agent-runtime .venv/bin/python -m pytest agent-runtime/tests evaluation contracts -q
 
 # 跑评估：12 场景 + 指标
