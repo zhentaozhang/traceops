@@ -9,11 +9,11 @@ Evidence-driven Agentic RCA Platform —— 面向微服务系统的智能故障
 
 | 平面 | 状态 | 测试 |
 |---|---|---|
-| Control Plane（Java / Spring Boot） | ✅ 告警接入、事故关联、状态机、Outbox、结果消费、**诊断结论 REST 查询**、**失败自动重试**、**契约运行时校验** | 215 passing |
-| Investigation Plane（Python / LangGraph） | ✅ 8 节点图（含判别回路）、双层采集、传播链、重试分类、**证据读回**、**跨事故记忆**、**查询缓存** | 1204 passing |
+| Control Plane（Java / Spring Boot） | ✅ 告警接入、事故关联、状态机、Outbox、结果消费、**诊断结论 REST 查询**、**失败自动重试**、**契约运行时校验** | 217 passing |
+| Investigation Plane（Python / LangGraph） | ✅ 8 节点图（含判别回路）、双层采集、传播链、重试分类、**证据读回**、**跨事故记忆**、**查询缓存** | 1213 passing |
 | Evidence Plane（Python） | ✅ 4 类归一化、内容寻址校验、**SQLite 持久化**、查询模板、证据图 | 同上 |
 | Evaluation Plane（Python） | ✅ 12 场景（含三服务级联 F-005、F-011 自然语言线索）+ 18 指标 + runner | 106 passing |
-| Execution Plane（受控修复） | ✅ Action Registry + Policy + Approval + **执行后重新观测** + **不达标自动回滚** | 93 passing |
+| Execution Plane（受控修复） | ✅ Action Registry + Policy + Approval + **执行后重新观测** + **不达标自动回滚** + **CLI 入口** | 93 passing |
 | Topology（服务依赖） | ✅ 双向语义、环检测、平局裁决 | 19 passing |
 | 观测栈（docker compose） | ✅ **已拉起**：Prometheus/Loki/Tempo/Grafana + mcp-grafana | 4 服务 healthy |
 | MCP 数据源接入 | ⚠️ Prometheus/Loki 可用；Tempo `get_tempo_trace` 受 Tempo 版本限制 | 13 条形状/签名测试 |
@@ -70,7 +70,7 @@ cd traceops
 python -m venv --system-site-packages .venv
 .venv/bin/python -m pip install -e agent-runtime --no-build-isolation
 
-# 全部测试（agent-runtime 1204 + evaluation 106 + contracts 13 = 1323）
+# 全部测试（agent-runtime 1213 + evaluation 106 + contracts 13 = 1332）
 PYTHONPATH=agent-runtime .venv/bin/python -m pytest agent-runtime/tests evaluation contracts -q
 
 # 跑评估：12 场景 + 指标
@@ -81,7 +81,7 @@ PYTHONPATH=agent-runtime .venv/bin/python -m pytest agent-runtime/tests evaluati
 
 ```bash
 cd traceops/control-plane
-mvn -s .mvn/settings.xml -B test        # 215 tests
+mvn -s .mvn/settings.xml -B test        # 217 tests
 mvn -s .mvn/settings.xml spring-boot:run # :8081
 
 curl -X POST localhost:8081/api/v1/alerts -H 'Content-Type: application/json' -d '{
@@ -98,6 +98,31 @@ curl -X POST localhost:8081/api/v1/alerts -H 'Content-Type: application/json' -d
 | `GET /api/v1/incidents/{id}` | 这条事故**此刻卡在谁那里**（`stage.kind` / `stage.waitingOn` / `stage.retryable`），而不只是"流程走到哪"。`INVESTIGATING` 一个词背后有四种处境：等认领、在跑、卡退避、已经死了 |
 | `GET /api/v1/status` | 三条等待读数：outbox 积压（**最老一条等了多久**，≥60s 降级）、重试（等退避 N 条 / 已过期但没发出去的 N 条）、进度存储淘汰与丢弃计数 |
 | `GET /api/v1/diagnostics/funnel?since=` | 告警 → 事故 → 调查 → 完成/失败 → 需人看，**每格由自己的来源数出来**，不靠上一步减下一步 |
+
+### 受控修复（操作员带外执行）
+
+修复不由控制面代劳，也不由模型直接动手 —— 三步都留在终端里，每一步都过一道闸：
+
+```bash
+# 1. 提案：构造计划、过策略，落一条审批请求（打印 request_id 与 plan_hash）
+PYTHONPATH=agent-runtime .venv/bin/python -m traceops.cli.remediate --approval-db state/approvals.db \
+  plan --incident inc-1 --action scale_replicas --target order-service \
+       --parameters '{"replicas": 4}' \
+       --rollback '{"action": "scale_replicas", "parameters": {"replicas": 2}}' \
+       --reason "shed load during the incident" --error-rate-below 0.05 --as alice
+
+# 2. 审批：必须有 APPROVER 角色，且不能是自己提的（职责分离）
+... approve --request apr-... --as bob --reason "approved for this window"
+
+# 3. 执行：参数与审批时的计划逐字节比对（哈希不一致直接拒绝），执行后复验，不达标自动回滚
+... execute --request apr-... --incident inc-1 --action scale_replicas --target order-service \
+            --parameters '{"replicas": 4}' --reason "..." --error-rate-below 0.05 \
+            --as carol --executor-config deploy/executor.json
+```
+
+没有 `--executor-config` 时**拒绝真实写操作**（干跑仍可用）：动作 → argv 的映射由
+部署方声明，模型输出的字符串永远进不了命令。同样的，`--approval-db` 不给就是内存库，
+重启即失效 —— 这一点在 `运行手册` 的部署清单里。
 
 > `.mvn/settings.xml` 是本机环境适配（`~/.m2` 不可写 + Maven Central 直连 403，
 > 故本地仓库落工作区内、镜像到阿里云）。换机器按需删除。

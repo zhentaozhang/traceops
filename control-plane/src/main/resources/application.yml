@@ -10,8 +10,13 @@ spring:
     password: ${TRACEOPS_DB_PASSWORD:}
   jpa:
     hibernate:
-      ddl-auto: ${TRACEOPS_DDL_AUTO:create-drop}
+      # 默认是 validate：建表由 db/migration/*.sql 负责，Hibernate 只校验。
+      # 这里曾经是 create-drop —— 每次启动重建表、重启即丢数据，而且不会报错。
+      ddl-auto: ${TRACEOPS_DDL_AUTO:validate}
     open-in-view: false
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
   data:
     redis:
       # 必须显式配置：没有这一段时 Spring Boot **不会**创建

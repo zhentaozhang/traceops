@@ -9,6 +9,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 /**
@@ -25,8 +26,11 @@ import org.springframework.stereotype.Component;
  *   <li><b>终态清理</b>：run 结束时 {@link #clear}，否则"正在调查"永远为真</li>
  * </ul>
  *
- * <p>内存实现是刻意的：进度是短生命周期状态（秒级到分钟级），
- * 不值得进数据库。进程重启后丢失是可接受的——那时也没有正在跑的调查了。
+ * <p>"只放内存"曾经是刻意的（进度是秒级到分钟级的短命状态）。这个判断漏了一件事：
+ * <b>控制面重启时 worker 还在跑</b>。worker 有自己的 900 秒 deadline，它不会因为
+ * 控制面重启而停下；而内存一清空，派生的 stage 就从 RUNNING 退回 QUEUED，
+ * 事故在两端的说法不一致。所以现在是"内存优先 + 落库兜底"：
+ * 写走穿透（内存与表各写一次），读先看内存、miss 了查表并回填。
  *
  * <h2>为什么必须有上限</h2>
  *
@@ -71,13 +75,27 @@ public class InvestigationProgressStore {
     private final int maxSubscribersPerRun;
     private final AtomicLong evictedRuns = new AtomicLong();
     private final AtomicLong droppedSubscribers = new AtomicLong();
+    /** 落库兜底。为 null 表示纯内存模式（单元测试与"不要数据库"的用法）。 */
+    private final InvestigationProgressRepository rows;
+    /** 下一次清理库里过期行的时间点，避免每条进度都做一次 delete。 */
+    private volatile Instant nextDatabaseSweep = Instant.EPOCH;
+
+    @Autowired
+    public InvestigationProgressStore(InvestigationProgressRepository rows) {
+        this(DEFAULT_MAX_RUNS, DEFAULT_TTL, DEFAULT_MAX_SUBSCRIBERS_PER_RUN, rows);
+    }
 
     public InvestigationProgressStore() {
-        this(DEFAULT_MAX_RUNS, DEFAULT_TTL, DEFAULT_MAX_SUBSCRIBERS_PER_RUN);
+        this(DEFAULT_MAX_RUNS, DEFAULT_TTL, DEFAULT_MAX_SUBSCRIBERS_PER_RUN, null);
     }
 
     /** 供测试把上限压到很小，从而不必真的造 2000 个 run。 */
     public InvestigationProgressStore(int maxRuns, Duration ttl, int maxSubscribersPerRun) {
+        this(maxRuns, ttl, maxSubscribersPerRun, null);
+    }
+
+    public InvestigationProgressStore(int maxRuns, Duration ttl, int maxSubscribersPerRun,
+            InvestigationProgressRepository rows) {
         if (maxRuns <= 0) {
             throw new IllegalArgumentException("maxRuns must be positive");
         }
@@ -87,6 +105,7 @@ public class InvestigationProgressStore {
         this.maxRuns = maxRuns;
         this.ttl = ttl;
         this.maxSubscribersPerRun = maxSubscribersPerRun;
+        this.rows = rows;
     }
 
     /**
@@ -105,10 +124,12 @@ public class InvestigationProgressStore {
             // 注意：这里**不算**"过期"，只是不采纳 —— 但仍刷新活跃时间，
             // 否则一个只剩重复消息的 run 会被 TTL 淘汰，前端瞬间看不到它。
             latest.put(runId, new Entry(previous.progress(), now));
+            persist(runId, previous.progress(), now);
             evictIfNeeded(now);
             return;
         }
         latest.put(runId, new Entry(progress, now));
+        persist(runId, progress, now);
         // 先存再清：容量判定必须把"刚写进去的这一条"算在内，
         // 否则 cap=2 时写入第三条不会触发淘汰，上限形同虚设。
         evictIfNeeded(now);
@@ -121,7 +142,7 @@ public class InvestigationProgressStore {
         }
         Entry entry = latest.get(runId);
         if (entry == null) {
-            return Optional.empty();
+            return restore(runId);
         }
         if (isExpired(entry, Instant.now())) {
             // 惰性淘汰：读的时候顺手清掉。没有调度器也能收敛。
@@ -138,6 +159,7 @@ public class InvestigationProgressStore {
             return;
         }
         latest.remove(runId);
+        forget(runId);
         // 订阅者也一起清：run 结束了还留着 listener，等于给下一次同名 run
         // 喂过期回调（run_id 复用时会串台）。
         subscribers.remove(runId);
@@ -235,6 +257,81 @@ public class InvestigationProgressStore {
 
     private boolean isExpired(Entry entry, Instant now) {
         return entry.updatedAt().plus(ttl).isBefore(now);
+    }
+
+    /** 写穿：表是重启后唯一的记忆，写失败不该拖垮推送（推送优先）。 */
+    private void persist(String runId, InvestigationProgress progress, Instant now) {
+        if (rows == null) {
+            return;
+        }
+        try {
+            rows.findById(runId).ifPresentOrElse(
+                    row -> {
+                        if (progress.stepIndex() >= row.toProgress().stepIndex()) {
+                            row.overwrite(progress, now);
+                            rows.save(row);
+                        }
+                    },
+                    () -> rows.save(InvestigationProgressRow.of(runId, progress, now)));
+            sweepDatabase(now);
+        } catch (RuntimeException e) {
+            // 库里写不进去时，内存视图仍然正确 —— 只是重启后会丢。
+            // 这里不抛，是因为"进度推送"比"进度留档"更紧急。
+        }
+    }
+
+    /** 读穿：重启后第一次读会把行回填进内存，之后的读仍然走内存。 */
+    private Optional<InvestigationProgress> restore(String runId) {
+        if (rows == null) {
+            return Optional.empty();
+        }
+        Optional<InvestigationProgressRow> row;
+        try {
+            row = rows.findById(runId);
+        } catch (RuntimeException e) {
+            return Optional.empty();
+        }
+        if (row.isEmpty()) {
+            return Optional.empty();
+        }
+        InvestigationProgressRow entity = row.get();
+        if (entity.updatedAt().plus(ttl).isBefore(Instant.now())) {
+            forget(runId);
+            evictedRuns.incrementAndGet();
+            return Optional.empty();
+        }
+        InvestigationProgress progress = entity.toProgress();
+        latest.putIfAbsent(runId, new Entry(progress, entity.updatedAt()));
+        return Optional.of(progress);
+    }
+
+    private void forget(String runId) {
+        if (rows == null) {
+            return;
+        }
+        try {
+            rows.deleteById(runId);
+        } catch (RuntimeException e) {
+            // 同 persist：删不掉只意味着多留一行，TTL 清理会兜住。
+        }
+    }
+
+    /**
+     * 库里过期的行按分钟粒度清理。
+     *
+     * <p>每次写入都 delete 一遍会让每条进度都多一次全表扫描；而不清理则表只涨不跌。
+     * 折中是"最多每分钟一次"，与 TTL（30 分钟）相比完全够用。
+     */
+    private void sweepDatabase(Instant now) {
+        if (rows == null || now.isBefore(nextDatabaseSweep)) {
+            return;
+        }
+        nextDatabaseSweep = now.plus(Duration.ofMinutes(1));
+        try {
+            rows.deleteUpdatedBefore(now.minus(ttl));
+        } catch (RuntimeException e) {
+            // 清理失败不影响读写，下一分钟再试。
+        }
     }
 
     private void notify(String runId, InvestigationProgress progress) {

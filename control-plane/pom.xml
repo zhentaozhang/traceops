@@ -47,6 +47,11 @@
     <!-- 生产代码里用（ContractValidator 在组装事件时校验契约）。
          曾经是 test 作用域 —— 那正好对应"契约只在测试里校验"这个真实状态。 -->
     <dependency>
+      <groupId>org.flywaydb</groupId>
+      <artifactId>flyway-core</artifactId>
+    </dependency>
+
+    <dependency>
       <groupId>com.networknt</groupId>
       <artifactId>json-schema-validator</artifactId>
       <version>${json-schema-validator.version}</version>

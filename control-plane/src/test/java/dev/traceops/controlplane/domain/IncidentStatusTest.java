@@ -16,12 +16,9 @@ class IncidentStatusTest {
             "NEW,RESOLVED,false",
             "INVESTIGATING,DIAGNOSED,true",
             "INVESTIGATING,RESOLVED,false",
-            "DIAGNOSED,AWAITING_APPROVAL,true",
             "DIAGNOSED,RESOLVED,true",
+            "DIAGNOSED,FAILED,true",
             "DIAGNOSED,INVESTIGATING,false",
-            "AWAITING_APPROVAL,REMEDIATING,true",
-            "AWAITING_APPROVAL,DIAGNOSED,false",
-            "REMEDIATING,RESOLVED,true",
             "RESOLVED,NEW,false",
             "FAILED,NEW,false"
     })

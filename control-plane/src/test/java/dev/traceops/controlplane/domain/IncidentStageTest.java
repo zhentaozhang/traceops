@@ -140,13 +140,12 @@ class IncidentStageTest {
     }
 
     /**
-     * DIAGNOSED / AWAITING_APPROVAL / REMEDIATING 都在白名单里有出边，
-     * 但没有任何生产代码发出它们。派生的处境要把这件事直接说出来。
+     * DIAGNOSED 在白名单里有出边（RESOLVED / FAILED），但没有任何自动代码发出它们 ——
+     * 诊断完成不等于处理完成。派生的处境要把这件事直接说出来。
      */
     @Test
     void statesWhoseOutgoingEdgesNobodyEmitsNeedAPerson() {
-        for (IncidentStatus status : new IncidentStatus[] {
-                IncidentStatus.DIAGNOSED, IncidentStatus.AWAITING_APPROVAL, IncidentStatus.REMEDIATING}) {
+        for (IncidentStatus status : new IncidentStatus[] { IncidentStatus.DIAGNOSED }) {
             IncidentStage stage = IncidentStage.derive(signals(status, null, 0, null, 0));
 
             assertThat(stage.kind()).as(status.name()).isEqualTo(IncidentStage.Kind.NEEDS_DECISION);

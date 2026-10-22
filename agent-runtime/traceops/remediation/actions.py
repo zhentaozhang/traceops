@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -41,6 +42,18 @@ class ActionSpec:
     #: 允许的 target 正则。给"任何人都不能预先列出 target"的场景（内置动作）
     #: 留一条路：白名单仍然显式，只是粒度是"形如服务名的 DNS label"。
     allowed_target_pattern: str | None = None
+
+    def accepts_target(self, target: str) -> bool:
+        """target 是否在白名单内。
+
+        两处判定（`build_plan` 与 `PolicyEngine`）必须用同一份规则 ——
+        否则会出现"计划建不出来但策略放行"或反过来的分裂。
+        """
+        if self.allowed_targets:
+            return target in self.allowed_targets
+        if self.allowed_target_pattern is not None:
+            return re.fullmatch(self.allowed_target_pattern, target) is not None
+        return False
 
 
 class ActionRegistry:

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -70,16 +69,11 @@ def build_plan(
     """
     spec = registry.get(action)  # 未注册动作在这里就 KeyError
 
-    if spec.allowed_targets and target not in spec.allowed_targets:
+    if not spec.accepts_target(target):
         raise ValueError(
             f"target {target!r} is not allowed for action {action!r} "
-            f"(allowed: {sorted(spec.allowed_targets)})"
-        )
-    if spec.allowed_target_pattern is not None and not re.fullmatch(
-            spec.allowed_target_pattern, target):
-        raise ValueError(
-            f"target {target!r} does not match the allowed pattern for action "
-            f"{action!r} ({spec.allowed_target_pattern})"
+            f"(allowed targets: {sorted(spec.allowed_targets) or 'none'}, "
+            f"pattern: {spec.allowed_target_pattern})"
         )
 
     registry.validate_parameters(action, parameters)

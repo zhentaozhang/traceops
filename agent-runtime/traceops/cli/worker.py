@@ -24,6 +24,8 @@ import json
 import logging
 import os
 import sys
+from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 
 from traceops.evidence.store import EvidenceStore
@@ -53,7 +55,11 @@ from traceops.tools.adapters import (
     PrometheusAdapter,
     TempoAdapter,
 )
-from traceops.tools.gateway import ToolGateway, register_builtin_tools
+from traceops.tools.gateway import (
+    ToolGateway,
+    purge_spill,
+    register_builtin_tools,
+)
 from traceops.topology.graph import TopologyError, ServiceTopology
 
 
@@ -213,21 +219,27 @@ def _topology_for(request: InvestigationRequest,
         raise TopologyError(f"request supplied invalid topology_edges: {exc}") from exc
 
 
-#: 进程级数据源健康表。刻意不落盘：重启归零可以接受，
-#: 而落盘要处理清理、并发与 schema 迁移，收益不成比例。
-_SHARED_HEALTH = DatasourceHealthTracker()
-#: 进程级共享的策略变更历史：跨调查的边界就是"同一个进程"。
-#: 换了配置再重启是运维动作，那一次重启本身就是一条变更。
-_SHARED_STRATEGY_HISTORY = StrategyHistory()
-#: 跨事故记忆。默认落在内存里（进程退出即散），生产应给 `--memory-db`
-#: 指向一个文件 —— 记忆的价值恰恰在于**跨重启**（"每个月挂一次"这种模式
-#: 必然跨越很多次重启）。
-_SHARED_MEMORY = IncidentMemory()
+@dataclass
+class SharedState:
+    """跨 run 共享、但**不跨进程**的三样东西。
+
+    为什么是显式的一个对象而不是三个模块级单例：单例的边界是"import 这个模块
+    的那个 Python 进程"，于是
+      - 测试之间会互相污染（只能靠"记得传显式参数"绕开）；
+      - 部署方无法替换（想接共享存储时没有落点）；
+      - 谁在用它对读代码的人来说是隐形的。
+    做成一个从 `main()` 往下传的对象，上面三条同时消失，代价只是多一个参数。
+    """
+
+    health: DatasourceHealthTracker = field(default_factory=DatasourceHealthTracker)
+    strategy_history: StrategyHistory = field(default_factory=StrategyHistory)
+    memory: IncidentMemory = field(default_factory=IncidentMemory)
 
 
 def build_run_context(request: InvestigationRequest, *, args, store, adapters,
                       topology: ServiceTopology | None,
-                      memory: "IncidentMemory | None" = None) -> RunContext:
+                      memory: "IncidentMemory | None" = None,
+                      shared: "SharedState | None" = None) -> RunContext:
     """按**这一次请求**的配置组装 RunContext。
 
     单独抽成模块级函数而不是留在 main() 里的闭包，是为了它能被测试直接调用。
@@ -235,6 +247,7 @@ def build_run_context(request: InvestigationRequest, *, args, store, adapters,
     是否真的进了 RunContext，只有读代码才能知道 —— 而这正是它们之前
     一路被丢掉却没被发现的原因。
     """
+    shared_state = shared if shared is not None else SharedState()
     gateway = ToolGateway()
     register_builtin_tools(gateway, adapters)
     return RunContext(
@@ -249,13 +262,13 @@ def build_run_context(request: InvestigationRequest, *, args, store, adapters,
                      if request.scope_depth is not None else RunContext.scope_depth),
         # 同一个进程里的所有 run 共享一张健康表：单个调查看不到
         # "loki 已经连续失败七次"，只有跨 run 才说得出来。
-        health=_SHARED_HEALTH,
+        health=shared_state.health,
         # 策略变更历史同样跨 run：报告要能说"这一轮的结论相对上一轮
         # 是在换了阈值之后得出的"，而不是只有 git log 知道。
-        strategy_history=_SHARED_STRATEGY_HISTORY,
+        strategy_history=shared_state.strategy_history,
         # 事迹记忆：跨事故的先验。传 None 时 rank 里 R-010 不参与排序
         # （与"没有记忆"完全等价，不是"记忆里什么都没有"）。
-        memory=memory if memory is not None else _SHARED_MEMORY,
+        memory=memory if memory is not None else shared_state.memory,
     )
 
 
@@ -374,6 +387,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="SQLite path for cross-incident memory; omit for in-process only")
     parser.add_argument("--ledger-db", default=os.environ.get("TRACEOPS_LEDGER_DB"),
                         help="SQLite path for run dedup; omit for in-memory")
+    parser.add_argument("--gc-spill", action="store_true", default=False,
+                        help="purge spilled payloads older than --spill-retention-days, then exit")
+    parser.add_argument("--spill-retention-days", type=float, default=7.0,
+                        help="how long a spilled payload stays readable (default 7 days)")
     parser.add_argument("--max-tool-calls", type=int, default=int(
         os.environ.get("TRACEOPS_MAX_TOOL_CALLS", "40")))
     parser.add_argument("--once", action="store_true", help="process a single batch then exit")
@@ -470,14 +487,23 @@ def main(argv: list[str] | None = None) -> int:
             # 这比"空跑一次返回 0"有用得多——空跑永远绿，什么也没证明。
             source.push(_self_check_event())
 
-    global _SHARED_MEMORY
-    if args.memory_db:
-        # 给了路径就用磁盘上的那份：记忆只有在跨重启时才有意义
-        _SHARED_MEMORY = IncidentMemory(path=args.memory_db)
+    if args.gc_spill:
+        # 清理是**会删数据**的操作，所以只由运维显式要求时发生，而且做完就退出 ——
+        # 想清磁盘的人不该顺手启动一个消费者。
+        removed = purge_spill(retention=timedelta(days=args.spill_retention_days))
+        print(json.dumps({"spill_gc": removed, "retention_days": args.spill_retention_days},
+                         ensure_ascii=False))
+        return 0
+
+    # 跨 run 的共享状态在 main() 里造一次，然后一路传下去。
+    # 不给路径时记忆落在内存里（进程退出即散）；给了 `--memory-db` 才是
+    # 它应有的样子 —— 记忆的价值恰恰在跨重启（"每个月挂一次"必然跨越很多次重启）。
+    shared = SharedState(
+        memory=IncidentMemory(path=args.memory_db) if args.memory_db else IncidentMemory())
 
     build_context = functools.partial(
         build_run_context, args=args, store=store, adapters=adapters, topology=topology,
-        memory=_SHARED_MEMORY)
+        shared=shared)
 
     worker = InvestigationWorker(
         source=source, sink=sink, derive_request=derive_request_from_event,

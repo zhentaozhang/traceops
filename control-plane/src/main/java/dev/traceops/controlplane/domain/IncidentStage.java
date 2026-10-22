@@ -18,7 +18,7 @@ import java.time.Instant;
  *
  * <p>为什么派生而不是持久化：它是状态 + 时间 + 最近一条回程事件的函数，
  * 落库就会有两份事实来源，而第二份永远会落后于第一份（这正是
- * {@code InvestigationStatus} 里 {@code AWAITING_APPROVAL}/{@code REMEDIATING}
+ * {@code IncidentStatus} 里 {@code DIAGNOSED}
  * 变成死状态却没人发现的机制）。
  *
  * <p>规则按顺序匹配，**首个命中胜**。顺序本身是语义的一部分，见 {@link #derive}。
@@ -167,9 +167,8 @@ public record IncidentStage(Kind kind, WaitingOn waitingOn, String detail, boole
                     "waiting for a worker to claim the investigation", true);
         }
 
-        // DIAGNOSED / AWAITING_APPROVAL / REMEDIATING：状态机的白名单里有出边，
-        // 但没有任何生产代码会发出那条边。把这句话直接写进 detail，
-        // 比让人去读 ALLOWED 表之后自己得出同样结论要好。
+        // DIAGNOSED 之后没有自动出边：诊断完成不等于处理完成，下一步是人决定。
+        // 把这句话直接写进 detail，比让人去读 ALLOWED 表之后自己得出同样结论要好。
         return new IncidentStage(Kind.NEEDS_DECISION, WaitingOn.PERSON,
                 "no automatic transition leaves " + s.status() + "; a person must decide", false);
     }

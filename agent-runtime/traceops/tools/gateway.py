@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tempfile
 from pathlib import Path
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any, Callable
 
@@ -66,6 +67,57 @@ _SPILL_PREVIEW_CHARS = 2000
 _SPILL_PAGE_CHARS = 4000
 #: 单页硬上限。超过这个值的请求一律被夹住 —— 分页的意义就是不让调用方一次要太多。
 _SPILL_PAGE_MAX_CHARS = 8000
+
+
+DEFAULT_SPILL_RETENTION = timedelta(days=7)
+"""落盘载荷的保留期。
+
+证据摘要（content-addressed）长期有效，而它的全量载荷有保留期 ——
+这是刻意的取舍：完整 payload 可能几 MB，无限保留迟早撑爆磁盘。
+但**保留期必须是显式配置的**，而且清理只发生在 `purge_spill` 里，
+不由操作系统替我们决定。
+"""
+
+
+def default_spill_root() -> Path:
+    """落盘根目录。优先级：环境变量 > 用户状态目录。
+
+    用 `~/.local/state/traceops/spill` 而不是 `/tmp`：证据引用指向的路径
+    不应该在下次重启时随机消失。
+    """
+    configured = os.environ.get("TRACEOPS_SPILL_ROOT")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".local" / "state" / "traceops" / "spill"
+
+
+def purge_spill(root: Path | None = None, *,
+                retention: timedelta = DEFAULT_SPILL_RETENTION,
+                now: datetime | None = None) -> dict[str, int]:
+    """删掉超过保留期的落盘载荷，返回删了多少、留了多少。
+
+    为什么单独一个函数而不是构造时顺手清：清理是**会删数据**的操作，
+    它应该发生在运维明确要求的时候（`--gc-spill`），而不是每次启动。
+    """
+    base = Path(root) if root is not None else default_spill_root()
+    cutoff = (now or datetime.now(UTC)) - retention
+    removed = kept = 0
+    if not base.exists():
+        return {"removed": 0, "kept": 0}
+    for path in base.rglob("*.json"):
+        try:
+            modified = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+        except OSError:
+            continue
+        if modified < cutoff:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                kept += 1
+        else:
+            kept += 1
+    return {"removed": removed, "kept": kept}
 
 
 class SpillStore:
@@ -185,9 +237,14 @@ class ToolGateway:
         self._pending_cache_note: dict[str, Any] | None = None
         # 同一次调查内「同名 + 完全相同参数」的调用指纹（重复调用防护）
         self._seen_calls: set[str] = set()
-        # 超大结果的落盘根目录。None 时用临时目录（不污染工作区）。
-        self._spill_root = Path(spill_root) if spill_root is not None else (
-            Path(tempfile.gettempdir()) / "traceops-spill")
+        # 超大结果的落盘根目录。
+        #
+        # 这里曾经是 `tempfile.gettempdir()/traceops-spill` —— 于是证据的
+        # `raw_snapshot_ref` 指向一个会被系统清理的目录：摘要可寻址、全量载荷
+        # 随时消失，而报告仍然写着"完整载荷在这里"。
+        # 现在默认落到用户状态目录（可用 TRACEOPS_SPILL_ROOT 覆盖），
+        # 并由 `purge_spill` 按保留期清理 —— 消失要是有意的，不能是随机的。
+        self._spill_root = Path(spill_root) if spill_root is not None else default_spill_root()
         self._spill = SpillStore(self._spill_root)
 
     # ---- registry ----

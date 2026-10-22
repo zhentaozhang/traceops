@@ -13,17 +13,13 @@ public enum IncidentStatus {
     NEW,
     INVESTIGATING,
     DIAGNOSED,
-    AWAITING_APPROVAL,
-    REMEDIATING,
     RESOLVED,
     FAILED;
 
     private static final Map<IncidentStatus, Set<IncidentStatus>> ALLOWED = Map.of(
             NEW, Set.of(INVESTIGATING, FAILED),
             INVESTIGATING, Set.of(DIAGNOSED, FAILED),
-            DIAGNOSED, Set.of(AWAITING_APPROVAL, RESOLVED, FAILED),
-            AWAITING_APPROVAL, Set.of(REMEDIATING, RESOLVED, FAILED),
-            REMEDIATING, Set.of(RESOLVED, FAILED),
+            DIAGNOSED, Set.of(RESOLVED, FAILED),
             RESOLVED, Set.of(),
             FAILED, Set.of());
 

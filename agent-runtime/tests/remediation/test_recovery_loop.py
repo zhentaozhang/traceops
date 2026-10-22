@@ -274,7 +274,7 @@ class TestBuiltinActions:
     def test_a_target_that_is_not_a_service_name_is_refused(self):
         registry = register_builtin_actions(ActionRegistry())
 
-        with pytest.raises(ValueError, match="does not match the allowed pattern"):
+        with pytest.raises(ValueError, match="is not allowed for action"):
             build_plan(incident_id="inc-1", action="scale_replicas",
                        target="kubectl delete ns prod", parameters={"replicas": 4},
                        rationale="x", rollback=None, registry=registry)

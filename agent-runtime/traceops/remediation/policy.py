@@ -59,7 +59,7 @@ class PolicyEngine:
             )
 
         # target 白名单在 build_plan 校验过；这里防的是"绕过 build_plan 手工构造 plan"
-        if plan.target not in spec.allowed_targets:
+        if not spec.accepts_target(plan.target):
             allowed = False
             reasons.append(f"target {plan.target!r} not allowed for action {plan.action!r}")
 

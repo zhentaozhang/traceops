@@ -465,8 +465,8 @@ class InvestigationResultServiceTest {
         service.apply(completed(evt(), run(), "SUPPORTED"));
         assertThat(currentStatus()).isEqualTo(IncidentStatus.DIAGNOSED);
 
-        // 只有真到达 DIAGNOSED，下游的审批/处置边才可达；这也反证了服务没绕过状态机
-        moveTo(IncidentStatus.AWAITING_APPROVAL, IncidentStatus.REMEDIATING, IncidentStatus.RESOLVED);
+        // 只有真到达 DIAGNOSED，下游的处置边才可达；这也反证了服务没绕过状态机
+        moveTo(IncidentStatus.RESOLVED);
 
         assertThat(currentStatus()).isEqualTo(IncidentStatus.RESOLVED);
     }
