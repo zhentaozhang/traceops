@@ -100,9 +100,26 @@ def build_rollback_plan(
             f"reason: {reason}"
         ),
         rollback=_inverse_of_original(original),
-        # 刻意不继承原后置条件（见 docstring）
-        post_conditions=[],
+        # 刻意**不继承**原后置条件（见 docstring），改用"回到基线"这一条：
+        # 原动作本就没成功，沿用它的条件会让回滚永远判 NOT_VERIFIED。
+        post_conditions=_rollback_conditions(original),
+        baseline=dict(original.baseline or {}),
     )
+
+
+def _rollback_conditions(original: RemediationPlan) -> list:
+    """回滚的后置条件 = "回到执行前的基线"。
+
+    没有基线就不编条件：回滚会被判成"无法自动验证"，这比假装通过诚实。
+    容差 10%：正常抖动会让"严格低于基线"永远不成立，于是每次回滚都被判成
+    NOT_VERIFIED，而那个状态的用途是"该找人看"，不是"每次都找人看"。
+    """
+    from traceops.remediation.postconditions import PostCondition
+
+    return [
+        PostCondition.error_rate_below(service, value * 1.1)
+        for service, value in sorted((original.baseline or {}).items())
+    ]
 
 
 def _inverse_of_original(original: RemediationPlan) -> dict:

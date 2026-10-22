@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from traceops.remediation.actions import ActionRegistry, RiskLevel
+from traceops.remediation.postconditions import PostCondition
 
 
 @dataclass(frozen=True)
@@ -24,7 +26,13 @@ class RemediationPlan:
     requires_approval: bool
     rationale: str
     rollback: dict[str, Any] | None
-    post_conditions: list[str] = field(default_factory=list)
+    #: 执行后要观测到的条件。允许 `PostCondition`（可判定）与自由文本
+    #: （不可判定 —— `verify_recovery` 会把它记成"无法自动验证"，不是"通过"）。
+    post_conditions: list[PostCondition | str] = field(default_factory=list)
+    #: 构造计划时观测到的基线值（如当时的错误率）。**不进 `content_hash`**：
+    #: 它影响的是"执行后算不算变坏"，不影响"执行什么"，所以基线更新
+    #: 不应该让一份已经批准的审批失效。
+    baseline: dict[str, float] = field(default_factory=dict)
 
     def content_hash(self) -> str:
         """对影响执行结果的字段做规范 JSON 哈希（不含 plan_id，便于重放比对）。"""
@@ -53,6 +61,8 @@ def build_plan(
     rollback: dict[str, Any] | None,
     registry: ActionRegistry,
     plan_id: str | None = None,
+    post_conditions: list[PostCondition | str] | None = None,
+    baseline: dict[str, float] | None = None,
 ) -> RemediationPlan:
     """构造计划并立刻校验：动作已注册、target 在白名单、参数符合 schema。
 
@@ -60,10 +70,16 @@ def build_plan(
     """
     spec = registry.get(action)  # 未注册动作在这里就 KeyError
 
-    if target not in spec.allowed_targets:
+    if spec.allowed_targets and target not in spec.allowed_targets:
         raise ValueError(
             f"target {target!r} is not allowed for action {action!r} "
             f"(allowed: {sorted(spec.allowed_targets)})"
+        )
+    if spec.allowed_target_pattern is not None and not re.fullmatch(
+            spec.allowed_target_pattern, target):
+        raise ValueError(
+            f"target {target!r} does not match the allowed pattern for action "
+            f"{action!r} ({spec.allowed_target_pattern})"
         )
 
     registry.validate_parameters(action, parameters)
@@ -78,5 +94,7 @@ def build_plan(
         requires_approval=spec.requires_approval,
         rationale=rationale,
         rollback=rollback,
-        post_conditions=list(spec.post_conditions),
+        post_conditions=list(post_conditions) if post_conditions is not None
+        else list(spec.post_conditions),
+        baseline=dict(baseline or {}),
     )
