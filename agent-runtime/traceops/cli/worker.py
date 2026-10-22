@@ -35,6 +35,7 @@ from traceops.runtime.budget import (
 )
 from traceops.config.history import StrategyHistory
 from traceops.runtime.datasource_health import DatasourceHealthTracker
+from traceops.runtime.incident_memory import IncidentMemory
 from traceops.runtime.deadletter import InMemoryDeadLetterSink
 from traceops.runtime.shutdown import StopSignal
 from traceops.evidence.retention import RetentionPolicy
@@ -218,10 +219,15 @@ _SHARED_HEALTH = DatasourceHealthTracker()
 #: 进程级共享的策略变更历史：跨调查的边界就是"同一个进程"。
 #: 换了配置再重启是运维动作，那一次重启本身就是一条变更。
 _SHARED_STRATEGY_HISTORY = StrategyHistory()
+#: 跨事故记忆。默认落在内存里（进程退出即散），生产应给 `--memory-db`
+#: 指向一个文件 —— 记忆的价值恰恰在于**跨重启**（"每个月挂一次"这种模式
+#: 必然跨越很多次重启）。
+_SHARED_MEMORY = IncidentMemory()
 
 
 def build_run_context(request: InvestigationRequest, *, args, store, adapters,
-                      topology: ServiceTopology | None) -> RunContext:
+                      topology: ServiceTopology | None,
+                      memory: "IncidentMemory | None" = None) -> RunContext:
     """按**这一次请求**的配置组装 RunContext。
 
     单独抽成模块级函数而不是留在 main() 里的闭包，是为了它能被测试直接调用。
@@ -247,6 +253,9 @@ def build_run_context(request: InvestigationRequest, *, args, store, adapters,
         # 策略变更历史同样跨 run：报告要能说"这一轮的结论相对上一轮
         # 是在换了阈值之后得出的"，而不是只有 git log 知道。
         strategy_history=_SHARED_STRATEGY_HISTORY,
+        # 事迹记忆：跨事故的先验。传 None 时 rank 里 R-010 不参与排序
+        # （与"没有记忆"完全等价，不是"记忆里什么都没有"）。
+        memory=memory if memory is not None else _SHARED_MEMORY,
     )
 
 
@@ -361,6 +370,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="caller:callee pairs separated by ';'")
     parser.add_argument("--evidence-db", default=os.environ.get("TRACEOPS_EVIDENCE_DB"),
                         help="SQLite path; omit for in-memory evidence")
+    parser.add_argument("--memory-db", default=os.environ.get("TRACEOPS_MEMORY_DB"),
+                        help="SQLite path for cross-incident memory; omit for in-process only")
     parser.add_argument("--ledger-db", default=os.environ.get("TRACEOPS_LEDGER_DB"),
                         help="SQLite path for run dedup; omit for in-memory")
     parser.add_argument("--max-tool-calls", type=int, default=int(
@@ -459,8 +470,14 @@ def main(argv: list[str] | None = None) -> int:
             # 这比"空跑一次返回 0"有用得多——空跑永远绿，什么也没证明。
             source.push(_self_check_event())
 
+    global _SHARED_MEMORY
+    if args.memory_db:
+        # 给了路径就用磁盘上的那份：记忆只有在跨重启时才有意义
+        _SHARED_MEMORY = IncidentMemory(path=args.memory_db)
+
     build_context = functools.partial(
-        build_run_context, args=args, store=store, adapters=adapters, topology=topology)
+        build_run_context, args=args, store=store, adapters=adapters, topology=topology,
+        memory=_SHARED_MEMORY)
 
     worker = InvestigationWorker(
         source=source, sink=sink, derive_request=derive_request_from_event,

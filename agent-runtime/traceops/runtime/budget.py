@@ -132,12 +132,38 @@ class BudgetManager:
         if self._tool_calls > self.max_tool_calls:
             raise BudgetExhausted(f"tool call budget exhausted: limit {self.max_tool_calls}")
 
+    @property
+    def tool_calls_remaining(self) -> int:
+        """还能发多少次工具调用。
+
+        判别回路必须看这个数再决定要不要多问一趟 —— 否则回路会把
+        预算花在一堆判别查询上，然后连出报告的余地都没有。
+        """
+        return max(0, self.max_tool_calls - self._tool_calls)
+
     # ---- round / deadline budget ----
     def begin_round(self) -> None:
-        self._check_deadline()
+        """开始**一轮取证**。
+
+        「轮」的语义是"又跑了一趟数据源"，不是"又执行了一个节点"。
+        此前每个图节点都算一轮，于是 7 节点图一开跑就吃掉 7 轮预算；
+        加上判别回路（最多再取证两趟）后节点数会涨到 13，
+        `max_rounds=10` 就会在回路真正需要预算时先被节点计数耗尽 ——
+        上限还在，但限制的不是它想限制的东西。
+        按取证趟数计轮，`max_rounds` 才等于"最多允许问几次数据源"。
+        """
+        self.check_deadline()
         self._rounds += 1
         if self._rounds > self.max_rounds:
             raise BudgetExhausted(f"round budget exhausted: limit {self.max_rounds}")
+
+    def check_deadline(self) -> None:
+        """只检查墙钟上限，不占轮次。
+
+        给"不取证但也不该无限运行"的节点用（计划、推理、排序、出报告）：
+        它们必须受 deadline 约束，但不该消耗取证轮次。
+        """
+        self._check_deadline()
 
     def _check_deadline(self) -> None:
         if self.deadline_seconds is not None and time.monotonic() - self._started > self.deadline_seconds:

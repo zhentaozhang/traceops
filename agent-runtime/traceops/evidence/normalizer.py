@@ -383,6 +383,7 @@ def normalize(
     source_link: str | None = None,
     rendered_query: str | None = None,
     max_records: int = DEFAULT_MAX_RECORDS,
+    collected_at: datetime | None = None,
 ) -> Evidence:
     """统一入口: 类型分派适配器 → 归一化 → 组装 Evidence。"""
     if evidence_type not in _NORMALIZERS:
@@ -420,6 +421,11 @@ def normalize(
         span_id=span_id,
         source_link=source_link,
         rendered_query=rendered_query,
+        # 从缓存里拿到的数据必须带着**当初**取回它的时刻：
+        # `observed_at` 说数据描述的是哪一刻，`collected_at` 说我们什么时候拿到它。
+        # 用 now() 会让报告声称"这份日志是 10:05 抓的"，而实际是 09:50 抓的。
+        **({"collected_at": max(collected_at, observed_at)}
+           if collected_at is not None else {}),
     )
     evidence._raw_payload = raw_payload  # noqa: SLF001 — 供 Store 快照，不序列化
     return evidence

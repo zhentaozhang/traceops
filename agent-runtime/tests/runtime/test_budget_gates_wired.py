@@ -101,7 +101,29 @@ class TestGatesAreActuallyCalledDuringInvestigation:
             f"got {ctx.budget.rounds}")
 
     def test_round_budget_stops_the_investigation(self):
-        """轮数上限必须能在真实调查里触发，而不是只在单测里。"""
+        """轮数上限必须能在真实调查里触发，而不是只在单测里。
+
+        轮 = 又跑了一趟数据源，不是又执行了一个节点（见 `_charged` 的 docstring）。
+        所以 `max_rounds=0` 表示"一次取证都不许"，第一趟 collect 就该被拦下；
+        而 `max_rounds=1` 现在是**合法的最小配置**（正好一趟），不该失败 ——
+        这条区分本身就是要守的东西：如果哪天有人把节点计数改回按节点算轮，
+        `max_rounds=1` 会重新变成失败，这个测试就会红。
+        """
+        from datetime import UTC, datetime
+
+        from traceops.evidence.store import EvidenceStore
+        from traceops.orchestration.graph import RunContext, run_investigation
+
+        now = datetime.now(UTC)
+        ctx = RunContext(store=EvidenceStore(), adapters=None,
+                         budget=BudgetManager(max_tool_calls=40, max_rounds=0))
+        result = run_investigation(_make_request(now), ctx)
+        assert result.status == "FAILED" or any(
+            "round" in e.lower() or "budget" in e.lower() for e in result.errors
+        ), f"round gate did not fire: status={result.status} errors={result.errors}"
+
+    def test_one_gathering_pass_is_a_legal_round_budget(self):
+        """`max_rounds=1` 必须够跑完一趟调查 —— 否则"轮"又被按节点数算了。"""
         from datetime import UTC, datetime
 
         from traceops.evidence.store import EvidenceStore
@@ -111,10 +133,7 @@ class TestGatesAreActuallyCalledDuringInvestigation:
         ctx = RunContext(store=EvidenceStore(), adapters=None,
                          budget=BudgetManager(max_tool_calls=40, max_rounds=1))
         result = run_investigation(_make_request(now), ctx)
-        # max_rounds=1 时，7 节点图必然超限 → 要么 FAILED，要么明确记录预算耗尽
-        assert result.status == "FAILED" or any(
-            "round" in e.lower() or "budget" in e.lower() for e in result.errors
-        ), f"round gate did not fire: status={result.status} errors={result.errors}"
+        assert result.status != "FAILED", f"one pass should fit in one round: {result.errors}"
 
 
 def _make_request(now):

@@ -14,7 +14,7 @@ import logging
 import functools
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, TypedDict
 
 from langchain_core.runnables import RunnableConfig
@@ -53,6 +53,7 @@ from traceops.rca.contradiction import find_contradictions, relation_type_of
 from traceops.rca.semantic import check_all
 from traceops.rca.ranking import RankedCandidate, derive_signals, rank_hypotheses
 from traceops.rca.report import build_report
+from traceops.topology.discovery import diff_topology, discover_edges
 from traceops.runtime.budget import BudgetExhausted, BudgetManager
 from traceops.runtime.model import (
     REJECTION_REASONS,
@@ -71,6 +72,24 @@ _PLAN_TEMPLATES: list[tuple[str, str, EvidenceType, str]] = [
     ("query_service_logs", "loki", EvidenceType.LOG, "qt-error-logs-v1"),
     ("query_service_traces", "tempo", EvidenceType.TRACE, "qt-slow-traces-v1"),
 ]
+
+#: 判别阶段才查的数据源。放最前面会把每次调查都变贵，放这里只有
+#: "两个候选分不开"时才付这笔钱 —— 这正是它该被付的时候。
+_DEEPEN_TEMPLATES: list[tuple[str, str, EvidenceType, str]] = [
+    ("query_service_profile", "pyroscope", EvidenceType.PROFILE, "qt-profile-v1"),
+]
+
+#: 判别回路最多再取证几趟。两趟的理由：一趟分不开两类候选之后，
+#: 第二趟能拿到的只是同类数据的另一个切面，再问下去是在赌运气。
+DISCRIMINATION_ROUNDS = 2
+
+#: 判别轮的**聚焦窗口**半径（秒）：以最早异常为中心，前后各这么多。
+#:
+#: 为什么这件事值得再花一次调用：首轮用的是整个故障窗口，几十分钟的
+#: 正常波动和真正的起变点混在一起，两个候选看起来一样坏。把窗口收到
+#: 起变点附近，"谁先开始坏"才有分辨率 —— 而"谁先坏"是 R-009 用的判据。
+#: 换句话说，这一轮买的不是**更多**证据，是**更细的时间分辨率**。
+FOCUSED_WINDOW_SECONDS = 60
 
 
 
@@ -92,6 +111,13 @@ class InvestigationRequest(BaseModel):
     #: 这让"能否利用自然语言线索"成为可测的差异来源。
     alert_summary: str | None = None
     config_change: dict[str, Any] | None = None
+    #: 窗口附近的变更流水（部署 / 配置 / 开关 / 扩缩容）。
+    #:
+    #: 与 `config_change` 的区别：那个是**一条**"与本次故障相关的变更"，
+    #: 由调查发起方挑出来；这里是一段原始变更记录，由调查自己判断哪一条
+    #: 在时间上可能与故障有关。RCA 的常识是多数故障由变更引起，
+    #: 而只有一个可选字段的变更是过窄的输入。
+    changes: list[dict[str, Any]] | None = None
     #: 现在只有契约里的三档。这里曾经是 "P2" —— 契约写 low|normal|high、
     #: 这里写 P2、Java 侧写过 manual，三套词汇互不相识，而运行时谁也没读它。
     #: 一个没人读的字段用哪套词都不报错，所以这三套词并存了很久。
@@ -171,6 +197,16 @@ class RunContext:
     health: Any = None
     #: 跨运行共享的策略变更历史（`config/history.py`）。为 None 时不做归属记录。
     strategy_history: Any = None
+    #: 跨事故记忆（`traceops.runtime.incident_memory.IncidentMemory`）。
+    #:
+    #: 只做一件事：把"这个服务以前以这种方式坏过"变成排序里的一点先验。
+    #: 它**不产生证据**：`_link_node` 看不到它，`ranking` 里也只加 1 分。
+    memory: Any = None
+    #: 查询结果缓存（`traceops.tools.query_cache.QueryCache`）。
+    #:
+    #: 默认 None = 不缓存。缓存改变的是"多久之前抓的数据可以冒充现在这份"，
+    #: 必须是显式选择；而且命中时证据的 `collected_at` 会变成**当初**取数的时刻。
+    cache: Any = None
     #: 本轮开始时观察到的策略变更（None = 与上一次观察相比没变，或没有历史）。
     #:
     #: 记在上下文里而不是节点里：一个 run 只能有一条"用的是哪套策略"，
@@ -240,7 +276,8 @@ class RunContext:
         return prompt_part_versions()
 
     def run_snapshot(self, request: InvestigationRequest | None = None, *,
-                     failed_sources: list[str] | None = None) -> dict[str, Any]:
+                     failed_sources: list[str]
+                     | None = None) -> dict[str, Any]:
         from traceops.runtime.strategy import run_snapshot
 
         return run_snapshot(
@@ -315,6 +352,19 @@ class InvestigationState(TypedDict, total=False):
     degraded_reads: list[dict[str, Any]]
     #: 本轮够不到的数据源 id（进终态事件给控制面，供下一轮重试先查它们）。
     failed_sources: list[str]
+    cache_hits: list[dict[str, Any]]
+    #: 已经取证了几趟（判别回路的计数）。与预算的 `rounds` 同一语义：
+    #: 一次 `collect` = 一趟。没有它，回路无法知道自己该不该再问。
+    round: int
+    #: 当前计划的阶段：`probe`（首轮全量）/ `discriminate`（为分开两个候选而问）。
+    phase: str
+    #: 已经判别过哪些 `fault_type:service`，避免同一对候选被反复问。
+    discriminated: list[str]
+    #: `_rank_node` 算出的"下一趟要不要问、问什么"。路由函数读它决定
+    #: 走判别还是直接出报告 —— 路由函数拿不到 RunContext（也就看不到预算），
+    #: 所以这个判断必须在上一个节点里做完。
+    can_discriminate: bool
+    next_plan: list[dict[str, Any]]
 
 
 CTX_CONFIG_KEY = "traceops_ctx"
@@ -378,14 +428,22 @@ def _scope_services(request: InvestigationRequest, ctx: "RunContext") -> list[tu
 
 
 def _plan_items(request: InvestigationRequest, ctx: "RunContext") -> list[dict[str, Any]]:
+    """首轮（probe）计划：每个在范围内的服务查常规三类数据源。
+
+    刻意保持"全量"而不是"先只查 error_rate"：评测里确实存在只有日志里
+    才看得出根因的场景，省那两次调用换来的是一半场景直接查不到。
+    真正该省的地方是"两个候选分不开时多问一趟"（见 `_discrimination_decision`），
+    而不是"一开始就少查几类数据"。
+    """
     items: list[dict[str, Any]] = []
+    templates = list(_PLAN_TEMPLATES)
     for service, tier in _scope_services(request, ctx):
         base = {
             "service": service,
             "start": request.window_start.isoformat(),
             "end": request.window_end.isoformat(),
         }
-        for tool, source_id, evidence_type, template_id in _PLAN_TEMPLATES:
+        for tool, source_id, evidence_type, template_id in templates:
             template_params: dict[str, Any] = {
                 "service": service, "start": base["start"], "end": base["end"],
             }
@@ -412,17 +470,90 @@ def _plan_items(request: InvestigationRequest, ctx: "RunContext") -> list[dict[s
                     "rendered_query": rendered_query,
                 }
             )
+    items.extend(_change_items(request))
+    return items
+
+
+def _adapter_supports(ctx: "RunContext", capability: str) -> bool:
+    """适配器是否声明了这项能力。
+
+    不声明就不进计划：`query_service_profile` 的实现是
+    `getattr(adapters, "query_service_profile", None) or _unconfigured(...)`，
+    没有 Pyroscope 的部署每次调查都会多出一条 "profile: not configured"
+    的 missing_data —— 噪声会被当成"数据缺失"进报告，稀释真正的缺失。
+    """
+    adapters = getattr(ctx, "adapters", None)
+    declared = getattr(adapters, "capabilities", frozenset()) if adapters is not None else frozenset()
+    return capability in declared
+
+
+def _change_items(request: InvestigationRequest) -> list[dict[str, Any]]:
+    """变更流水 → 合成事件证据项（不经过数据源）。"""
+    records: list[dict[str, Any]] = []
     if request.config_change is not None:
-        changed_at = _parse_dt(request.config_change["changed_at"])
+        records.append({**dict(request.config_change), "change_kind": "config"})
+    records.extend(dict(change) for change in (request.changes or []))
+
+    items: list[dict[str, Any]] = []
+    for record in records:
+        try:
+            changed_at = _parse_dt(record["changed_at"])
+        except (KeyError, TypeError, ValueError):
+            # 一条坏记录不该让整趟调查失败：变更流水是外部输入，
+            # 而它提供的只是"可能需要看的方向"，不是证据本身。
+            continue
+        service = record.get("service")
         items.append(
             {
                 "tool": "config_change_event",
                 "params": {},
                 "source_id": "control-plane",
                 "evidence_type": EvidenceType.EVENT,
-                "query_template_id": "qt-config-change-v1",
-                "payload": dict(request.config_change),
+                "query_template_id": (
+                    "qt-deployment-v1" if record.get("change_kind") == "deployment"
+                    else "qt-config-change-v1"
+                ),
+                "service": service,
+                "payload": record,
                 "observed_at": changed_at,
+            }
+        )
+    return items
+
+
+def _profile_items(request: InvestigationRequest, ctx: "RunContext",
+                   services: list[str]) -> list[dict[str, Any]]:
+    """持续剖析（PROFILE）证据的取数项，只为**判别阶段点名的服务**构造。
+
+    为什么不做成常规模板：profile 的查询按服务数线性增加，
+    而它回答的问题（"慢在哪个函数"）只有在已有 `latency_degradation`
+    这类假设、且需要区分两个候选时才有价值。常规就查等于每次都为一个
+    大概率用不上的维度付费。
+
+    为什么要求适配器声明能力：见 `_adapter_supports`。
+    """
+    if not _adapter_supports(ctx, "profile"):
+        return []
+    tool, source_id, evidence_type, template_id = _DEEPEN_TEMPLATES[0]
+    start = request.window_start.isoformat()
+    end = request.window_end.isoformat()
+    items: list[dict[str, Any]] = []
+    for service in services:
+        if not service:
+            continue
+        items.append(
+            {
+                "tool": tool,
+                "params": {"service": service, "start": start, "end": end},
+                "source_id": source_id,
+                "evidence_type": evidence_type,
+                "query_template_id": template_id,
+                "service": service,
+                "tier": INVESTIGATION_TIER,
+                # 这条查询不走模板库的渲染路径（形状固定："某服务某窗口的火焰图"），
+                # 但 `query_template_id` 是 Evidence 的必填字段 —— 给一个稳定标签，
+                # 让审计能按它把同一类查询归到一起。
+                "rendered_query": f"pyroscope: flamegraph(service={service}, {start}..{end})",
             }
         )
     return items
@@ -435,6 +566,11 @@ def _unwrap_raw(raw: Any, evidence_type: EvidenceType) -> dict[str, Any]:
     if evidence_type is EvidenceType.METRIC:
         # Prometheus: {"status": "success", "data": {"resultType", "result"}} → {"resultType", "result"}
         if "data" in raw and isinstance(raw["data"], dict):
+            return raw["data"]
+    if evidence_type is EvidenceType.PROFILE:
+        # Pyroscope 形态：{"data": {"flamegraph": {"names","values"}}}
+        # 只在外面包了一层的时候拆掉；已经是内层形状就原样交给 Normalizer
+        if isinstance(raw.get("data"), dict) and "flamegraph" in raw["data"]:
             return raw["data"]
     if evidence_type is EvidenceType.LOG:
         # Loki: {"status": "success", "data": {"resultType": "streams", "result": [...]}}
@@ -534,23 +670,15 @@ def _observed_at_raw(raw: dict[str, Any], evidence_type: EvidenceType, fallback:
 
 # ---------------- nodes ----------------
 
-def _charged(fn):
-    """每个节点执行算一轮，并在入口检查 round / deadline 预算。
-
-    为什么在节点级别计轮：`BudgetManager.begin_round()` 此前**全仓零调用方**，
-    于是 `_rounds` 恒为 0（`worker.py` 却把 0 当真实用量上报），
-    而 `deadline_seconds` 只在 `begin_round` 里检查 —— 也就从未生效。
-    这是"闸门看起来存在、实际不存在"的问题：代码有、测试没测、生产不跑。
-
-    P0 的确定性单趟图确实只有一轮，所以此前无害；但 P1 要接 LLM 多轮循环，
-    轮数上限与截止时间就是防止无限烧钱的两道闸门 ——
-    带着"闸门是虚的"进 P1 等于没有闸门。
-    """
+def _budget_guard(fn, *, counts_a_round: bool):
     @functools.wraps(fn)
     def wrapper(state, config):
         ctx = _ctx_from(config)
         try:
-            ctx.budget.begin_round()
+            if counts_a_round:
+                ctx.budget.begin_round()
+            else:
+                ctx.budget.check_deadline()
         except BudgetExhausted as exc:
             # 预算耗尽必须是**干净失败**（返回 FAILED 结果），不是抛出异常。
             #
@@ -566,6 +694,22 @@ def _charged(fn):
         return fn(state, config)
 
     return wrapper
+
+
+def _charged(fn):
+    """**取证的**节点：执行一次算一轮，并在入口检查 round / deadline 预算。
+
+    只有真正去问数据源的节点算轮（`plan` 之后的 `collect`、判别阶段的
+    `discriminate` 带出的下一趟 `collect`）。计划、推理、排序、出报告这些
+    节点只检查 deadline —— 它们不花工具调用，把它们算进轮数会让
+    `max_rounds` 限制的变成"跑过几个节点"而不是"问过几次数据源"。
+    """
+    return _budget_guard(fn, counts_a_round=True)
+
+
+def _timed(fn):
+    """不取证但也不该无限运行的节点：只受墙钟上限约束。"""
+    return _budget_guard(fn, counts_a_round=False)
 
 
 def _prioritise_plan(plan: list[dict[str, Any]],
@@ -586,7 +730,7 @@ def _prioritise_plan(plan: list[dict[str, Any]],
     return first + rest
 
 
-@_charged
+@_timed
 def _plan_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
     request = state["request"]
     plan = _plan_items(request, _ctx_from(config))
@@ -604,17 +748,22 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
     no_data = list(state.get("no_data_queries", []))
     degraded = list(state.get("degraded_reads", []))
     failed_sources = list(state.get("failed_sources", []))
+    cache_notes = list(state.get("cache_hits", []))
 
     for item in state["plan"]:
         # 内置工具走 Gateway（权限/限额/审计）；事件证据由控制面事件转换而来，不调工具
         spilled_ref: dict[str, Any] | None = None
-        if item["tool"] == "config_change_event":
-            raw = {"event": {**item["payload"], "type": "config_change"}}
+        # 判据是"这一项自带 payload"，不是工具名 —— 变更流水里的部署/扩缩容
+        # 走的是同一个合成路径，但它们的工具名不同（见 _change_items）。
+        if "payload" in item:
+            payload = dict(item["payload"])
+            raw = {"event": {**payload, "type": payload.get("change_kind") or "config_change"}}
             observed_at = item["observed_at"]
             window = (observed_at, observed_at)
         else:
             try:
                 raw = gateway.invoke(item["tool"], item["params"], budget=ctx.budget)
+                cache_note = gateway.take_cache_note()
             except BudgetExhausted as exc:
                 errors = list(state.get("errors", [])) + [f"budget exhausted: {exc}"]
                 return {"status": "FAILED", "errors": errors, "missing_data": missing}
@@ -640,6 +789,10 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
                 if source_id and source_id not in failed_sources:
                     failed_sources.append(source_id)
                 continue
+            if cache_note is not None:
+                # 命中缓存必须留在报告里：这份证据的 `collected_at` 是**当初**
+                # 取数的时刻，读者要能看出它不是刚抓的。
+                cache_notes.append({**cache_note, "service": item.get("service")})
             if ctx.health is not None:
                 # "查到了但没有数据"是成功：数据源是通的，这是阴性证据。
                 ctx.health.record_success(item["source_id"])
@@ -691,7 +844,7 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
         #
         # 判据复用 Gateway 的 `_is_empty_result`（同一份"什么算空"的真值），
         # 不在这里另写一套形状判断 —— 两份定义必然漂移。
-        if item["tool"] != "config_change_event" and _is_empty_payload(raw):
+        if "payload" not in item and _is_empty_payload(raw):
             no_data.append(
                 f"{item['tool']}[{item.get('service', request.service_hint)}]: "
                 "query succeeded but returned no data"
@@ -721,6 +874,9 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
                 raw_payload=raw,
                 observed_at=observed_at,
                 window=window,
+                # 命中缓存时，"我们什么时候拿到这份数据"是**当初**那一刻。
+                # 明细见 tools/query_cache.py 的模块注释。
+                collected_at=_cache_fetch_time(cache_note),
             )
         except Exception as exc:  # 形状异常 → 记为缺失数据，不伪造证据
             missing.append(f"{item['tool']}: {exc}")
@@ -737,12 +893,18 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
         ctx.store.add(evidence)
         evidence_list.append(evidence)
 
-    return {"evidence": evidence_list, "missing_data": missing,
+    # **证据必须累加，不能整键替换**。
+    #
+    # LangGraph 对没有 reducer 的键是"后写覆盖"语义：判别回路里第二趟 collect
+    # 若只返回本轮新证据，第一趟的证据会凭空消失 —— 表现为"多查了一次之后
+    # 报告里原来的证据没了"，而每一步单独看都对。
+    carried = list(state.get("evidence", []))
+    return {"evidence": carried + evidence_list, "missing_data": missing,
             "no_data_queries": no_data, "degraded_reads": degraded,
-            "failed_sources": failed_sources}
+            "failed_sources": failed_sources, "cache_hits": cache_notes}
 
 
-@_charged
+@_timed
 def _hypothesize_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
     """确定性检测器 + （可选）模型提案。
 
@@ -881,6 +1043,12 @@ def _evidence_summary(evidence_list: list[Evidence]) -> dict[str, Any]:
                 for hit in hits:
                     if hit not in entry["keyword_hits"]:
                         entry["keyword_hits"].append(hit)
+        elif evidence.evidence_type is EvidenceType.PROFILE:
+            hottest = _hottest_frame(data)
+            if hottest is not None:
+                frame, self_value = hottest
+                entry["hot_function"] = frame
+                entry["hot_self_value"] = self_value
         elif evidence.evidence_type is EvidenceType.TRACE:
             slowest = _slowest_span(data)
             if slowest is not None:
@@ -904,6 +1072,37 @@ def _metric_peak(data: dict[str, Any]) -> float | None:
                 continue
             peak = value if peak is None else max(peak, value)
     return peak
+
+
+def _cache_fetch_time(note: dict[str, Any] | None) -> datetime | None:
+    """从缓存命中记录里取回原始抓取时刻（没有命中或格式坏掉时 None）。"""
+    if not note:
+        return None
+    try:
+        return datetime.fromisoformat(note["fetched_at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _hottest_frame(data: dict[str, Any]) -> tuple[str, float] | None:
+    """火焰图里自身开销最大的那一帧。
+
+    为什么给函数名而不是整份火焰图：火焰图动辄上千帧、几十 KB，
+    而模型的用途只有一个 —— "这个服务的 CPU 时间花在哪"。
+    函数名是结构化字段（不是日志自由文本），可以安全进 Prompt。
+    """
+    frames = data.get("hot_frames") or []
+    if not frames:
+        return None
+    top = frames[0]
+    name = str(top.get("frame") or "").strip()
+    if not name:
+        return None
+    try:
+        self_value = float(top.get("self_value") or 0.0)
+    except (TypeError, ValueError):
+        self_value = 0.0
+    return name, self_value
 
 
 def _log_keyword_hits(data: dict[str, Any]) -> list[str]:
@@ -930,7 +1129,7 @@ def _slowest_span(data: dict[str, Any]) -> tuple[str, int] | None:
     return best
 
 
-@_charged
+@_timed
 def _link_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
     ctx = _ctx_from(config)
     request = state["request"]
@@ -1041,7 +1240,7 @@ def _event_component(evidence: Evidence) -> str | None:
     return None
 
 
-@_charged
+@_timed
 def _correlate_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
     """证据关联（蓝图 §6.3）：构建证据图，产出时间线与关联统计。
 
@@ -1084,14 +1283,158 @@ def _correlate_node(state: InvestigationState, config: RunnableConfig) -> dict[s
     return {"evidence_graph_summary": summary, "missing_data": missing}
 
 
-@_charged
+def _ambiguous_candidates(state: InvestigationState,
+                          ranked: list[Any] | None = None) -> list[tuple[str, str]]:
+    """并列首名的候选，返回 (candidate_service, fault_type) 列表。
+
+    判据是"分数**完全相同**且落在**不同服务**上"，不是"分数差在阈值内"：
+    排序规则是离散加权的，差 1 分已经意味着"有一条证据支持 A 而 B 没有"，
+    那是可判别的差异，不该再花工具调用去问。同一服务的两种机制并列
+    也不值得再问 —— 它只影响措辞，不影响定位。
+    """
+    from traceops.domain.models import HypothesisStatus
+
+    # 显式传入刚算出的 `ranked`：在 `_rank_node` 里读 `state["ranked"]` 拿到的是
+    # **上一趟**的结果（首趟是空列表），于是"并列"永远判不出来 —— 回路形同不存在。
+    # 这个 bug 是判别回路的测试抓到的：图看起来有环，实际一次都没进去过。
+    ranked = list(ranked if ranked is not None else (state.get("ranked") or []))
+    by_id = {h.id: h for h in (state.get("hypotheses") or [])}
+    supported = [r for r in ranked if r.status is HypothesisStatus.SUPPORTED]
+    if len(supported) < 2:
+        return []
+    top_score = max(r.score for r in supported)
+    group = [r for r in supported if r.score == top_score]
+    out: list[tuple[str, str]] = []
+    services: set[str] = set()
+    for candidate in group:
+        hypothesis = by_id.get(candidate.hypothesis_id)
+        if hypothesis is None:
+            continue
+        out.append((hypothesis.candidate_service, hypothesis.fault_type))
+        services.add(hypothesis.candidate_service)
+    if len(services) < 2:
+        return []
+    return out
+
+
+def _focused_window(request: InvestigationRequest,
+                    anchor: datetime | None) -> tuple[str, str]:
+    """以最早异常为中心的窄窗口，夹在请求的原窗口内。
+
+    夹取是必需的：证据时间戳可能落在请求窗口外（数据源的最小步长、
+    或 client 报了个略早的时间），把窗口扩出去会让查询变成"查了我没被授权的
+    那段时间" —— 采集层的窗口必须始终是请求窗口的子集。
+    """
+    center = anchor or request.fault_start
+    start = max(center - timedelta(seconds=FOCUSED_WINDOW_SECONDS), request.window_start)
+    end = min(center + timedelta(seconds=FOCUSED_WINDOW_SECONDS), request.window_end)
+    if end <= start:  # 极短窗口：退回请求窗口，别发出空区间
+        return request.window_start.isoformat(), request.window_end.isoformat()
+    return start.isoformat(), end.isoformat()
+
+
+def _discrimination_items(request: InvestigationRequest, ctx: "RunContext",
+                          services: list[str], *, anchor: datetime | None,
+                          latency_services: list[str]) -> list[dict[str, Any]]:
+    """判别轮的取数项：对**并列的每个服务**问一次它自己的错误率（聚焦窗口）。
+
+    选错误率而不是更"专业"的指标：它对每个服务都存在（不需要额外部署）、
+    它就是"这个服务此刻在不在坏"，而且它的异常判定是现成的
+    （`metric_is_anomalous` 认 error-rate 模板）。
+    只对需要的服务付这次钱 —— 判别是"两个候选之间"的事情，
+    不是"把全部服务再查一遍"。
+    """
+    start, end = _focused_window(request, anchor)
+    items: list[dict[str, Any]] = []
+    for service in services:
+        if not service:
+            continue
+        items.append(
+            {
+                "tool": "query_service_error_rate",
+                "params": {"service": service, "start": start, "end": end},
+                "source_id": "prometheus",
+                "evidence_type": EvidenceType.METRIC,
+                # 名字里必须含 error-rate：检测器与语义闸门都按它识别"这是错误率"。
+                "query_template_id": "qt-error-rate-focused",
+                "service": service,
+                "tier": INVESTIGATION_TIER,
+                "rendered_query": (
+                    'sum(rate(http_requests_total{service="%s",status=~"5.."}[1m])) / '
+                    'sum(rate(http_requests_total{service="%s"}[1m]))  # focused ±%ds'
+                    % (service, service, FOCUSED_WINDOW_SECONDS)
+                ),
+            }
+        )
+    items.extend(_profile_items(request, ctx, latency_services))
+    return items
+
+
+def _discrimination_decision(state: InvestigationState,
+                            ctx: "RunContext",
+                            *,
+                            ranked: list[Any] | None = None) -> tuple[bool, list[dict[str, Any]]]:
+    """要不要再问一趟、问什么。
+
+    四件事只有这里知道，所以必须在这里一次算完：
+      - 谁跟谁并列（`_ambiguous_candidates`）；
+      - 还剩几轮（`round`）与还剩几次工具调用（`ctx.budget`）——
+        路由函数拿不到 RunContext，把判断放进去就等于让连线做决策；
+      - 每对候选已经问过什么（`discriminated`）—— 问第二遍同样的查询
+        只是烧钱，不会多出证据；
+      - 以哪个时间点为窗口中心（最早异常）。
+    """
+    if int(state.get("round", 0)) >= DISCRIMINATION_ROUNDS:
+        return False, []
+    ambiguous = _ambiguous_candidates(state, ranked)
+    if not ambiguous:
+        return False, []
+    request = state["request"]
+    already = set(state.get("discriminated", []))
+    services: list[str] = []
+    latency_services: list[str] = []
+    for service, fault_type in ambiguous:
+        if not service or service in already:
+            continue
+        if service not in services:
+            services.append(service)
+        if fault_type == "latency_degradation":
+            latency_services.append(service)
+    if not services:
+        return False, []
+    earliest = earliest_anomaly(state.get("evidence", []))
+    items = _discrimination_items(
+        request, ctx, services,
+        anchor=earliest.observed_at if earliest is not None else None,
+        latency_services=latency_services,
+    )
+    # 预算不够就只问能问的那几条：问一半也好过因为排不下而一条都不问，
+    # 而且截断发生在**构造计划时**，不是问了之后才发现超预算。
+    remaining = ctx.budget.tool_calls_remaining
+    if len(items) > remaining:
+        items = items[:remaining]
+    return bool(items), items
+
+
+@_timed
 def _rank_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
+    # 每个 return 分支都必须显式重置这两个键：它们决定 rank 之后走不走回路，
+    # 而 state 跨趟累积 —— 漏掉一个分支就会带着上一趟的 True 无限循环。
     request = state["request"]
     hypotheses = state.get("hypotheses", [])
     if not hypotheses:
-        return {"ranked": []}
+        return {"ranked": [], "can_discriminate": False, "next_plan": []}
+    # R-009 需要"全网最早异常"这个跨候选的参照点：单个候选看不到别的候选，
+    # 规则本身也只能算绝对分。这里算一次，分给每个候选自己比对。
+    earliest = earliest_anomaly(state.get("evidence", []))
+    earliest_at = earliest.observed_at if earliest is not None else None
+    memory = _ctx_from(config).memory
     signals = [
-        derive_signals(h, state.get("links", []), _ctx_from(config).store, fault_start=request.fault_start)
+        derive_signals(
+            h, state.get("links", []), _ctx_from(config).store,
+            fault_start=request.fault_start, earliest_anomaly_at=earliest_at,
+            previously_seen=_previously_seen(memory, h),
+        )
         for h in hypotheses
     ]
     ranked = rank_hypotheses(hypotheses, signals, topology=_ctx_from(config).topology)
@@ -1115,7 +1458,68 @@ def _rank_node(state: InvestigationState, config: RunnableConfig) -> dict[str, A
         ))
         for index, candidate in enumerate(ranked, start=1):
             candidate.rank = index
-    return {"ranked": ranked}
+
+    can_discriminate, next_plan = _discrimination_decision(
+        state, _ctx_from(config), ranked=ranked)
+    return {"ranked": ranked, "can_discriminate": can_discriminate, "next_plan": next_plan}
+
+
+@_timed
+def _discriminate_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
+    """把 rank 算好的判别计划变成下一趟的 plan。
+
+    为什么判别是独立节点而不是塞进 `_rank_node`：`plan` 是 collect 的输入，
+    rank 之前改它没有意义（rank 自己要看的就是本轮证据）。一个节点只做一件事，
+    也让"图长什么样"能在代码里一眼看出来 —— 判别回路的存在必须可见。
+    """
+    plan = list(state.get("next_plan") or [])
+    if not plan:
+        # 路由只在 `can_discriminate and next_plan` 时才进来，走到这里说明
+        # 两个键被写坏了。静默返回会让 collect 重跑旧计划（重复取证），
+        # 或者让图原地打转 —— 两种都比大声报错更难查。
+        raise RuntimeError("discrimination node reached without a plan")
+    attempted = list(state.get("discriminated") or [])
+    for item in plan:
+        service = item.get("service")
+        if service and service not in attempted:
+            attempted.append(service)
+    return {
+        "plan": plan,
+        "phase": "discriminate",
+        "round": int(state.get("round", 0)) + 1,
+        "discriminated": attempted,
+        "can_discriminate": False,
+        "next_plan": [],
+    }
+
+
+def _route_after_rank(state: InvestigationState) -> str:
+    """并列且还有额度 → 再问一趟；否则直接出报告（可能以 INCONCLUSIVE 收场）。"""
+    if state.get("status") == "FAILED":
+        return "report"
+    if state.get("can_discriminate") and state.get("next_plan"):
+        return "discriminate"
+    return "report"
+
+
+def _previously_seen(memory: Any, hypothesis: Any) -> bool:
+    """这个 (服务, 机制, 组件) 以前真的这样坏过吗。
+
+    只认**净值大于零**：一个候选被反复推翻时，"它又来了"不该再加分 ——
+    否则记忆会把调查锁死在同一个错误答案上（自证循环）。
+    """
+    if memory is None:
+        return False
+    try:
+        prior = memory.recall(
+            service=hypothesis.candidate_service,
+            fault_type=hypothesis.fault_type or "",
+            component=hypothesis.candidate_component,
+        )
+    except Exception:  # 记忆是辅助信号，读不出来不该拖垮调查
+        log.warning("incident memory could not be read", exc_info=True)
+        return False
+    return bool(prior is not None and prior.corroborated)
 
 
 def _affected_services(state: InvestigationState, config: RunnableConfig) -> list[str]:
@@ -1261,7 +1665,7 @@ def _correlation_notes(state: InvestigationState) -> list[str]:
     return notes
 
 
-@_charged
+@_timed
 def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str, Any]:
     request = state["request"]
     ctx = _ctx_from(config)
@@ -1284,6 +1688,7 @@ def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str,
             "services outside the investigated chain were NOT investigated "
             "(this report covers one alert's chain only): " + ", ".join(outside)
         )
+    _report_missing_topology(state, ctx, missing)
     report = build_report(
         investigation_run_id=request.investigation_run_id,
         hypotheses=state.get("hypotheses", []),
@@ -1319,12 +1724,126 @@ def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str,
         strategy_digest=ctx.strategy_digest(),
         run_snapshot=ctx.run_snapshot(
             request, failed_sources=list(state.get("failed_sources", []))),
+        priors=_priors(state, ctx),
+        topology_drift=_topology_drift(state, ctx),
+        cache_hits=list(state.get("cache_hits", [])),
     )
+    _remember_outcome(state, ctx)
     return {"report": report, "status": report.diagnosis_status}
 
 
+def _report_missing_topology(state: InvestigationState, ctx: RunContext,
+                             missing: list[str]) -> None:
+    """把拓扑缺口写进 missing_data。
+
+    为什么必须写：拓扑里没有的边，`blast_radius` 不会覆盖到，于是它
+    既不进影响范围、也不进 `_unobserved_related`（那份清单是从拓扑推的）。
+    一个"拓扑里根本不存在"的依赖导致的全链路超时，在报告里连
+    "我没查过它"都不会出现 —— 那是最糟的沉默。
+    """
+    drift = _topology_drift(state, ctx)
+    undeclared = drift.get("undeclared_edges") or []
+    if undeclared:
+        pairs = ", ".join(f"{caller}→{callee}" for caller, callee in undeclared)
+        missing.append(
+            "observed call edges are missing from the declared topology "
+            f"(the blast radius could not include them): {pairs}"
+        )
+    unobserved = drift.get("unobserved_declared_edges") or []
+    if unobserved:
+        pairs = ", ".join(f"{caller}→{callee}" for caller, callee in unobserved)
+        missing.append(
+            "declared edges were not exercised in this window "
+            f"(not evidence that they are down): {pairs}"
+        )
+
+
+def _topology_drift(state: InvestigationState, ctx: RunContext) -> dict[str, Any]:
+    """声明的拓扑与本窗口实际用到的调用关系对比。
+
+    只对"观测到但没声明"的边报缺口 —— 那是真信号（拓扑缺了这条边，
+    `blast_radius` 覆盖不到它）。反向的"声明了但没用到"只进 missing_data，
+    因为沉默不等于断裂。详见 `traceops/topology/discovery.py` 的模块注释。
+    """
+    if ctx.topology is None:
+        return {}
+    observed = discover_edges(state.get("evidence", []))
+    return diff_topology(ctx.topology, observed).to_dict()
+
+
+def _priors(state: InvestigationState, ctx: RunContext) -> list[dict[str, Any]]:
+    """把用到的先验写进报告。
+
+    不写的话，"这次结论是被历史推了一把"就只存在于代码路径里 ——
+    复盘时看到根因是 order-service，无法区分"证据指向它"和"它以前老出事"。
+    """
+    if ctx.memory is None:
+        return []
+    priors: list[dict[str, Any]] = []
+    for hypothesis in state.get("hypotheses", []) or []:
+        try:
+            prior = ctx.memory.recall(
+                service=hypothesis.candidate_service,
+                fault_type=hypothesis.fault_type or "",
+                component=hypothesis.candidate_component,
+            )
+        except Exception:
+            log.warning("incident memory could not be read while building priors", exc_info=True)
+            continue
+        if prior is None or not prior.corroborated:
+            continue
+        entry = prior.to_dict()
+        entry["hypothesis_id"] = hypothesis.id
+        priors.append(entry)
+    return priors
+
+
+def _remember_outcome(state: InvestigationState, ctx: RunContext) -> None:
+    """把本次结论记进记忆：断言为根因的记一次命中，被推翻的记一次反驳。
+
+    为什么两个都记：只记命中会让记忆变成"永远在说同一个名字"的机器。
+    反驳也是信息 —— 一个反复被推翻的候选，下次不该再因为"老熟人"加分。
+
+    为什么记的是**排序第一名**而不是所有 SUPPORTED：并列时两个都
+    SUPPORTED，把它们都记成命中等于把不确定性也写成了经验。
+    """
+    if ctx.memory is None:
+        return
+    ranked = state.get("ranked") or []
+    hypotheses = state.get("hypotheses") or []
+    if not ranked:
+        return
+    from traceops.domain.models import HypothesisStatus
+
+    by_id = {h.id: h for h in hypotheses}
+    top = ranked[0]
+    lead = by_id.get(top.hypothesis_id)
+    try:
+        if lead is not None and top.status is HypothesisStatus.SUPPORTED:
+            ctx.memory.record(
+                service=lead.candidate_service,
+                fault_type=lead.fault_type or "",
+                component=lead.candidate_component,
+            )
+        for candidate in ranked:
+            if candidate.status is not HypothesisStatus.REFUTED:
+                continue
+            loser = by_id.get(candidate.hypothesis_id)
+            if loser is None:
+                continue
+            ctx.memory.record(
+                service=loser.candidate_service,
+                fault_type=loser.fault_type or "",
+                component=loser.candidate_component,
+                refuted=True,
+            )
+    except Exception:
+        # 记不住下一次调查，不该让这一次的报告丢掉
+        log.warning("incident memory could not record the outcome", exc_info=True)
+
+
 def _build_gateway(ctx: RunContext) -> ToolGateway:
-    gateway = ToolGateway()
+    gateway = ToolGateway(cache=ctx.cache)
     register_builtin_tools(gateway, ctx.adapters)
     return gateway
 
@@ -1348,6 +1867,7 @@ def build_investigation_graph(*, checkpointer: Any | None = None,
     builder.add_node("link", _link_node)
     builder.add_node("correlate", _correlate_node)
     builder.add_node("rank", _rank_node)
+    builder.add_node("discriminate", _discriminate_node)
     builder.add_node("report", _report_node)
 
     builder.add_edge(START, "plan")
@@ -1358,7 +1878,12 @@ def build_investigation_graph(*, checkpointer: Any | None = None,
     builder.add_edge("hypothesize", "link")
     builder.add_edge("link", "correlate")
     builder.add_edge("correlate", "rank")
-    builder.add_edge("rank", "report")
+    # 唯一的回路：rank 说不清"这两个里是哪个"时，再取一趟证据回来重排。
+    # 出口由 rank 里的预算判断决定（`can_discriminate`），所以这个环有界。
+    builder.add_conditional_edges(
+        "rank", _route_after_rank, {"discriminate": "discriminate", "report": "report"}
+    )
+    builder.add_edge("discriminate", "collect")
     builder.add_edge("report", END)
     return builder.compile(checkpointer=checkpointer, interrupt_before=interrupt_before or [])
 
@@ -1379,6 +1904,13 @@ def _initial_state(request: InvestigationRequest) -> InvestigationState:
         "no_data_queries": [],
         "degraded_reads": [],
         "failed_sources": [],
+        "cache_hits": [],
+        # 判别回路的状态：走第几趟、当前阶段、已经问过哪些（防重复付费）。
+        "round": 0,
+        "phase": "probe",
+        "discriminated": [],
+        "can_discriminate": False,
+        "next_plan": [],
     }
 
 

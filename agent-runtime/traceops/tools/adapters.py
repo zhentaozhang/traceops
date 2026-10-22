@@ -559,15 +559,40 @@ class DatasourceAdapters:
         prometheus: PrometheusAdapter | None = None,
         loki: LokiAdapter | None = None,
         tempo: TempoAdapter | None = None,
+        profile: Any | None = None,
     ) -> None:
         self.prometheus = prometheus
         self.loki = loki
         self.tempo = tempo
+        # 持续剖析适配器（Pyroscope/Parca 形态）。**故意没有内置 HTTP 客户端**：
+        # 未经真实端点验证的 URL 拼法会制造"看起来接通了"的假象，比不接更糟。
+        # 这里只定义取数口（`flamegraph(service=..., start=..., end=...)`）
+        # 与能力声明，真实客户端由部署方实现。
+        self.profile = profile
 
     def _need(self, adapter: Any, name: str) -> Any:
         if adapter is None:
             raise TransportError(f"{name} adapter is not configured")
         return adapter
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        """这个聚合器**实际**能答哪些取数口。
+
+        编排层用它做能力门控：没装的源不该被写进计划 —— 计划里每一条
+        都会变成一次工具调用，而每次调用都会失败一次并写进 missing_data，
+        报告里于是出现"缺失数据"而真相是"根本没配"。
+        """
+        caps: set[str] = set()
+        if self.prometheus is not None:
+            caps |= {"metric_series", "error_rate"}
+        if self.loki is not None:
+            caps.add("logs")
+        if self.tempo is not None:
+            caps.add("traces")
+        if self.profile is not None:
+            caps.add("profile")
+        return frozenset(caps)
 
     def query_metric_series(self, service: str, metric: str, start: str, end: str) -> Any:
         prom = self._need(self.prometheus, "prometheus")
@@ -592,6 +617,16 @@ class DatasourceAdapters:
     ) -> Any:
         return self._need(self.tempo, "tempo").service_traces(
             service, start, end, min_duration_ms=min_duration_ms
+        )
+
+    def query_service_profile(self, service: str, start: str, end: str) -> Any:
+        """该服务在窗口内的火焰图。
+
+        输出必须是 `{"flamegraph": {"names": [...], "values": [...]}}`
+        —— `ProfileNormalizer` 的输入契约。适配器负责把自家格式转成这两列。
+        """
+        return self._need(self.profile, "profile").flamegraph(
+            service=service, start=start, end=end
         )
 
 

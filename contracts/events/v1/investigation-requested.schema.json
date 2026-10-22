@@ -143,6 +143,45 @@
             "changed_at",
             "component"
           ]
+        },
+        "changes": {
+          "type": "array",
+          "maxItems": 50,
+          "description": "变更清单：部署 / 配置 / 开关 / 扩缩容都可以各占一条。与单条 config_change 的区别是它能表达\"同时变了好几件东西\"，而真实事故里很少只变一件；只收单条会逼调用方挑一条，被丢掉的那条可能才是原因。",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "changed_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "change_kind": {
+                "type": "string",
+                "enum": [
+                  "deployment",
+                  "config",
+                  "feature_flag",
+                  "scale"
+                ]
+              },
+              "service": {
+                "type": "string",
+                "minLength": 1
+              },
+              "revision": {
+                "type": "string"
+              },
+              "summary": {
+                "type": "string",
+                "maxLength": 2000
+              }
+            },
+            "required": [
+              "changed_at",
+              "change_kind"
+            ]
+          }
         }
       }
     }

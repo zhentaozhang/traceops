@@ -12,10 +12,13 @@ R3 决议：加权评分公式 S(c)=wA+wT+wP+wD+wE−wX 正式移除，P0 用确
 | R-005 | 关键预测观测与假设冲突          | 降低优先级或反驳 |
 | R-006 | 没有足够证据                    | 标记为不确定   |
 | R-007 | 候选给出了具体组件              | 提高优先级（信息更具体） |
+| R-008 | 候选是症状（自己没坏、下游坏了）  | 降级为不确定   |
+| R-009 | 候选是**全网最早**出现异常的服务  | 提高优先级（时间线先坏的一般是根因） |
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from traceops.domain.models import HypothesisStatus, RootCauseHypothesis
 
@@ -26,6 +29,13 @@ _W_TRACE_ANOMALY = 2
 _W_CONFIG_CHANGE = 3
 _W_CONTRADICTION = -3
 _W_COMPONENT_SPECIFIC = 1
+_W_EARLIEST_ANOMALY = 1
+#: R-010：这是该服务历史上反复出问题的机制。
+#:
+#: 权重刻意最小：记忆是**先验**，不是证据。它只该在两个候选的其他信号
+#: 都打平时起作用 —— 如果它足以压过一条真实观测，那就变成了
+#: "上次是它，所以这次也是它"的循环论证。
+_W_HISTORY = 1
 
 
 @dataclass
@@ -47,6 +57,21 @@ class CandidateSignals:
     #: `supporting_evidence_count` 不同：后者只是条数，前者衡量
     #: "机制与证据类型对不对得上"。
     observed_markers: frozenset[str] = frozenset()
+    #: 该候选自己最早一条异常观测的时间；没有观测时为 None。
+    earliest_anomaly_at: datetime | None = None
+    #: R-009：该候选就是全网最早出现异常的那个。
+    #:
+    #: 为什么要有这条：并列时旧逻辑只能靠服务名字母序决胜（即随机）。
+    #: "谁先坏"是唯一一个**不依赖证据条数**的因果判据 ——
+    #: 症状总在下游开始受苦之后才出现。
+    #: 注意它是"调权"而不是"定论"：只加 1 分，被矛盾证据压过时仍会输。
+    is_earliest_anomaly: bool = False
+    #: R-010：这个 (服务, 机制, 组件) 以前真的这样坏过（净值 > 0）。
+    #:
+    #: 由 `traceops.runtime.incident_memory.IncidentMemory` 提供。
+    #: **它不产生 link、不产生 Evidence**，所以永远不会让一个没有观测的
+    #: 候选变成 SUPPORTED —— 结构上就做不到，不靠自觉。
+    previously_seen: bool = False
 
 
 @dataclass
@@ -99,6 +124,21 @@ def _evaluate(signals: CandidateSignals) -> tuple[int, HypothesisStatus, list[st
     if signals.has_specific_component:
         score += _W_COMPONENT_SPECIFIC
         rules.append("R-007")
+
+    # R-009 候选是全网最早出现异常的服务 → 升权。
+    # 理由：两个候选分数完全相同时，唯一还有信息量的维度是"谁先坏"。
+    # 时间线的方向是因果的方向 —— 症状服务是在根因之后才开始受苦的。
+    # 权重只有 1：它足够打破并列，但不足以让一个支持证据很弱的候选
+    # 压过一个支持证据很强的候选。
+    if signals.is_earliest_anomaly:
+        score += _W_EARLIEST_ANOMALY
+        rules.append("R-009")
+
+    # R-010 历史上反复出问题的机制 → 升权（先验，不是证据）。
+    # 只有净值 > 0 才算"以前见过"：一个被反复推翻的候选"又来了"不加分。
+    if signals.previously_seen:
+        score += _W_HISTORY
+        rules.append("R-010")
 
     # 状态分类（确定性）
     if signals.contradicting_evidence_count > signals.supporting_evidence_count:
@@ -285,13 +325,22 @@ def derive_signals(
     store,
     *,
     fault_start,
+    earliest_anomaly_at: datetime | None = None,
+    previously_seen: bool = False,
 ) -> CandidateSignals:
     """从 证据-假设 关联派生二元信号（R3: 二元特征 + 确定性规则）。
 
     语义约定（P0）:
     - SUPPORTS 关联 = 该证据被视为异常的观测（link 由规则/模型/人工创建时已判断）
     - 仅当证据服务属于候选服务时才算候选自身异常观测
-    - EVENT 证据 = 变更事件；observed_at 早于故障开始即视为"故障前变更"
+    - EVENT 证据 = 变更事件（部署/配置/开关/扩缩容都归一成这一类）；
+      "故障前变更"的判据是**早于首个异常观测**，不是早于告警里的 fault_start ——
+      见下方 `causal_cutoff` 的注释
+
+    Args:
+        earliest_anomaly_at: 全网最早一条异常观测的时间。传进来是为了让
+            "谁先坏"可以比较 —— 单个候选看不到别的候选，规则也只能算绝对分。
+            缺省 None 表示调用方不提供该信息，R-009 就不参与排序（与旧行为一致）。
     """
     from traceops.domain.models import EvidenceType, RelationType
 
@@ -330,6 +379,16 @@ def derive_signals(
         and (ev.service_id is None or ev.service_id == hypothesis.candidate_service)
     ]
     before_fault = [ev for ev in supports if ev.observed_at < fault_start]
+    own_earliest = min((ev.observed_at for ev in own_anomalies), default=None)
+    # 因果判据用"首个异常"而不是"告警里的 fault_start"。
+    #
+    # fault_start 来自告警的 startsAt，而告警通常**晚于**真正的起变点
+    # （监控要先攒够窗口、要过阈值、还要走通知链路）。拿它当因果分界线，
+    # 会把"故障开始之后、告警之前"这段时间里发生的部署判成"与故障无关"，
+    # 而这段时间恰好是部署最容易背锅的位置。
+    #
+    # 没有最早异常信息时退回 fault_start：宁可少给分，不可凭感觉给分。
+    causal_cutoff = earliest_anomaly_at or fault_start
 
     return CandidateSignals(
         hypothesis_id=hypothesis.id,
@@ -337,11 +396,21 @@ def derive_signals(
         has_anomaly_observation=bool(own_anomalies),
         anomaly_precedes_fault=bool(before_fault),
         trace_anomaly=any(ev.evidence_type == EvidenceType.TRACE for ev in supports),
+        # 字段名沿用 `config_change_*`（它是 R-003 的输入，也是 STRATEGY 字段路径），
+        # 但语义是"任何一类变更事件早于首个异常" —— 部署、配置、开关、扩缩容
+        # 在证据层都是 EVENT + change_kind，没有理由只认配置。
         config_change_precedes_fault=bool(
             [ev for ev in supports
-             if ev.evidence_type == EvidenceType.EVENT and ev.observed_at < fault_start]
+             if ev.evidence_type == EvidenceType.EVENT and ev.observed_at < causal_cutoff]
         ),
         observed_markers=frozenset(_observed_markers_for(supports, hypothesis.candidate_service)),
         contradicting_evidence_count=len(contradicts),
         supporting_evidence_count=len(supports),
+        earliest_anomaly_at=own_earliest,
+        is_earliest_anomaly=(
+            own_earliest is not None
+            and earliest_anomaly_at is not None
+            and own_earliest == earliest_anomaly_at
+        ),
+        previously_seen=previously_seen,
     )

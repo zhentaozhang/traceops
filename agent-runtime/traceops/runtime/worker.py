@@ -666,6 +666,9 @@ def derive_request_from_event(message: dict[str, Any]) -> InvestigationRequest:
         # 不读它的话，重试只是在同一次失败上再花一遍预算。
         retry_of=payload.get("retry_of"),
         known_unavailable=payload.get("known_unavailable"),
+        # 变更清单：一次发版往往同时动配置、同时扩缩容。只收单条 config_change
+        # 会逼调用方挑一条，而被丢掉的那条可能才是原因（见 _change_items）。
+        changes=payload.get("changes"),
     )
 
 

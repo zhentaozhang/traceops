@@ -76,6 +76,9 @@ def build_report(
     strategy_digest: str | None = None,
     run_snapshot: dict | None = None,
     degraded_reads: list[dict] | None = None,
+    priors: list[dict] | None = None,
+    topology_drift: dict | None = None,
+    cache_hits: list[dict] | None = None,
 ) -> RCAReport:
     """组装并校验诊断报告。
 
@@ -240,6 +243,9 @@ def build_report(
         strategy_digest=strategy_digest,
         run_snapshot=dict(run_snapshot or {}),
         degraded_reads=list(degraded_reads or []),
+        priors=list(priors or []),
+        topology_drift=dict(topology_drift or {}),
+        cache_hits=list(cache_hits or []),
     )
 
     # 必须绑定本次事故：只查"ID 在 Store 里存在"会放过**引用了别处证据**的报告。

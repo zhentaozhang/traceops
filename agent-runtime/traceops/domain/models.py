@@ -282,6 +282,20 @@ class RCAReport(BaseModel):
     # 变得"不可比"，而采集深度变了则必须知道 —— 两者语义不同，
     # 曾经被塞进同一批版本字符串里，于是既看不出一致也看不出差异。
     run_snapshot: dict = Field(default_factory=dict)
+    #: 本次结论用到的事故先验（"这个服务以前以这种方式坏过"）。
+    #:
+    #: 必须落在报告里而不是只打日志：否则复盘时无法区分
+    #: "证据指向它"和"它以前老出事，排序被推了一把"。
+    priors: list[dict] = Field(default_factory=list)
+    #: 声明的拓扑 vs 本窗口真正被调用到的关系。
+    #:
+    #: `has_drift`（存在未声明的边）时，`blast_radius` 这类推理是在一张
+    #: 缺了边的图上做的 —— 读者必须知道这一点，否则会把"没查"读成"没事"。
+    topology_drift: dict = Field(default_factory=dict)
+    #: 本次调查中来自缓存的查询（工具名 + **当初**取数时刻）。
+    #:
+    #: 不列出来等于让读者以为整份报告的证据都是"这一趟现取的"。
+    cache_hits: list[dict] = Field(default_factory=list)
     #: 被降级读取的原始数据（没能落盘、或落盘后读不回来）。
     #:
     #: 每一项都必须带 `read`：一条替代读取路径（怎么把全量再拿一次）。

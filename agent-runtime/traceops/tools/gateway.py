@@ -22,6 +22,7 @@ from jsonschema import Draft202012Validator
 from pydantic import BaseModel, ConfigDict
 
 from traceops.runtime.budget import BudgetExhausted, BudgetManager
+from traceops.tools.query_cache import QueryCache
 
 
 class ToolPermission(str, Enum):
@@ -173,9 +174,15 @@ class SpillStore:
 
 
 class ToolGateway:
-    def __init__(self, spill_root: Path | None = None) -> None:
+    def __init__(self, spill_root: Path | None = None,
+                 cache: "QueryCache | None" = None) -> None:
         self._tools: dict[str, ToolSpec] = {}
         self._audit: list[dict[str, Any]] = []
+        # 可选的查询缓存。**默认关闭**：缓存改变的是"多久之前的数据可以冒充
+        # 现在这份"，这必须是显式选择，不能是默认行为。
+        self._cache = cache
+        # 上一次 invoke 是否命中缓存（单线程顺序执行，用"取走即清"而不是队列）。
+        self._pending_cache_note: dict[str, Any] | None = None
         # 同一次调查内「同名 + 完全相同参数」的调用指纹（重复调用防护）
         self._seen_calls: set[str] = set()
         # 超大结果的落盘根目录。None 时用临时目录（不污染工作区）。
@@ -207,6 +214,8 @@ class ToolGateway:
         - 参数不合法 → jsonschema.ValidationError（原样抛出）
         - 预算耗尽 → BudgetExhausted
         """
+        self._pending_cache_note = None
+
         spec = self._tools.get(tool_name)
         if spec is None:
             self._record(tool_name, "UNKNOWN_TOOL", params, error="tool not registered")
@@ -243,6 +252,17 @@ class ToolGateway:
                 "change the parameters or the time window instead"
             )
 
+        # 缓存命中在**扣预算之前**返回：命中没有打数据源，把它算成一次
+        # 取数成本会让"复用"看起来和"重查"一样贵，于是没人愿意开着它。
+        # 命中也不算进 `_seen_calls` —— 它本来就不是一次新的取数。
+        if self._cache is not None:
+            cached = self._cache.get(tool_name, params)
+            if cached is not None:
+                self._pending_cache_note = cached.note()
+                self._record(tool_name, "CACHE_HIT", params,
+                             error=cached.fetched_at.isoformat())
+                return cached.payload
+
         try:
             budget.consume_tool_call()
         except BudgetExhausted as exc:
@@ -257,6 +277,9 @@ class ToolGateway:
             self._record(tool_name, "ERROR", params, error=repr(exc),
                          duration_ms=int((time.monotonic() - started) * 1000))
             raise
+
+        if self._cache is not None:
+            self._cache.put(tool_name, params, result)
 
         encoded = json.dumps(result, ensure_ascii=False)
         if len(encoded.encode("utf-8")) > spec.max_result_bytes:
@@ -361,6 +384,16 @@ class ToolGateway:
             return None
         read = ref.get("read")
         return str(read) if read else None
+
+    def take_cache_note(self) -> dict[str, Any] | None:
+        """取走上一次调用留下的缓存命中记录（没有则 None）。
+
+        为什么叫 take：命中的是"这份数据是 09:50 抓的"这件事，
+        它必须**恰好**被消费一次 —— 留在里面会被下一次调用误认成自己的。
+        """
+        note = self._pending_cache_note
+        self._pending_cache_note = None
+        return note
 
     @staticmethod
     def is_spill_reference(result: Any) -> bool:
@@ -495,6 +528,21 @@ def register_builtin_tools(gw: ToolGateway, adapters: Any | None = None) -> None
             },
             permission=ToolPermission.OBSERVABILITY_READ,
             implementation=getattr(adapters, "query_service_traces", None) or _unconfigured("query_service_traces"),
+        ),
+        ToolSpec(
+            name="query_service_profile",
+            description="查询指定服务在时间窗口内的持续剖析火焰图（热点函数）",
+            input_schema={
+                "type": "object",
+                "required": ["service", "start", "end"],
+                "properties": {
+                    "service": {"type": "string"},
+                    **_TIME_RANGE_PROPS,
+                },
+                "additionalProperties": False,
+            },
+            permission=ToolPermission.OBSERVABILITY_READ,
+            implementation=getattr(adapters, "query_service_profile", None) or _unconfigured("query_service_profile"),
         ),
     ]
     for tool in tools:

@@ -10,10 +10,10 @@ Evidence-driven Agentic RCA Platform —— 面向微服务系统的智能故障
 | 平面 | 状态 | 测试 |
 |---|---|---|
 | Control Plane（Java / Spring Boot） | ✅ 告警接入、事故关联、状态机、Outbox、结果消费、**诊断结论 REST 查询**、**失败自动重试**、**契约运行时校验** | 215 passing |
-| Investigation Plane（Python / LangGraph） | ✅ 7 节点图、双层采集、传播链、重试分类、**证据读回** | 1096 passing |
+| Investigation Plane（Python / LangGraph） | ✅ 8 节点图（含判别回路）、双层采集、传播链、重试分类、**证据读回**、**跨事故记忆**、**查询缓存** | 1204 passing |
 | Evidence Plane（Python） | ✅ 4 类归一化、内容寻址校验、**SQLite 持久化**、查询模板、证据图 | 同上 |
 | Evaluation Plane（Python） | ✅ 12 场景（含三服务级联 F-005、F-011 自然语言线索）+ 18 指标 + runner | 106 passing |
-| Execution Plane（受控修复） | ✅ Action Registry + Policy + Approval + Executor | 21 passing |
+| Execution Plane（受控修复） | ✅ Action Registry + Policy + Approval + **执行后重新观测** + **不达标自动回滚** | 93 passing |
 | Topology（服务依赖） | ✅ 双向语义、环检测、平局裁决 | 19 passing |
 | 观测栈（docker compose） | ✅ **已拉起**：Prometheus/Loki/Tempo/Grafana + mcp-grafana | 4 服务 healthy |
 | MCP 数据源接入 | ⚠️ Prometheus/Loki 可用；Tempo `get_tempo_trace` 受 Tempo 版本限制 | 13 条形状/签名测试 |
@@ -70,7 +70,7 @@ cd traceops
 python -m venv --system-site-packages .venv
 .venv/bin/python -m pip install -e agent-runtime --no-build-isolation
 
-# 全部测试（agent-runtime 1096 + evaluation 106 + contracts 13 = 1215）
+# 全部测试（agent-runtime 1204 + evaluation 106 + contracts 13 = 1323）
 PYTHONPATH=agent-runtime .venv/bin/python -m pytest agent-runtime/tests evaluation contracts -q
 
 # 跑评估：12 场景 + 指标
