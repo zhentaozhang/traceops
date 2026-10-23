@@ -11,6 +11,9 @@ import java.time.Instant;
  *
  * @param status 流程走到哪一步（状态机事实）
  * @param stage  此刻卡在谁那里（派生视图）；拿不到信号时为 {@code null}。
+ * @param assignee 负责人（可能为空：没有人的事故就是没有）。
+ * @param confirmation {@code ACCEPTED} / {@code REJECTED} / {@code null}（未确认）。
+ *                     "未确认"是独立的一态，不能和"拒绝"混成一个值。
  *               两者刻意分开：{@code status} 是持久事实，{@code stage} 是随时间和
  *               最近一条回程事件变化的判断，混成一个字段会让"状态变了"和"处境变了"
  *               无法区分（例如退避到期只是处境变了，状态一直是 INVESTIGATING）。
@@ -23,7 +26,11 @@ public record IncidentResponse(
         IncidentStatus status,
         IncidentOrigin origin,
         Instant createdAt,
-        IncidentStage stage) {
+        IncidentStage stage,
+        String assignee,
+        Instant acknowledgedAt,
+        String confirmation,
+        String confirmedBy) {
 
     public static IncidentResponse from(Incident incident) {
         return from(incident, null);
@@ -32,6 +39,8 @@ public record IncidentResponse(
     public static IncidentResponse from(Incident incident, IncidentStage stage) {
         return new IncidentResponse(incident.getId(), incident.getService(),
                 incident.getTitle(), incident.getSeverity(), incident.getStatus(),
-                incident.getOrigin(), incident.getCreatedAt(), stage);
+                incident.getOrigin(), incident.getCreatedAt(), stage,
+                incident.getAssignee(), incident.getAcknowledgedAt(),
+                incident.getConfirmation(), incident.getConfirmedBy());
     }
 }

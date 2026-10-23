@@ -51,8 +51,15 @@ class ScenarioOutcome:
     # 池子只有 1 个候选时，AC@3/AC@5 恒真，是伪指标。
     candidate_pool_size: int = 0
 
+    #: 本次调查的真实报告对象（不参与打分，也不进 JSON）。
+    #: 保留它是为了让 runner 能渲染人类可读的诊断 —— 一个只有分数的评测
+    #: 无法被复核，也无法回答"这条结论凭什么"。
+    report: object | None = field(default=None, compare=False, repr=False)
+
     def to_dict(self) -> dict:
-        return asdict(self)
+        payload = asdict(self)
+        payload.pop("report", None)
+        return payload
 
 
 @dataclass(frozen=True)

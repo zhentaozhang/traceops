@@ -14,10 +14,22 @@ import pytest
 from traceops.cli.worker import build_adapters, build_model, build_topology, main
 
 
-def _run_cli(args: list[str]) -> subprocess.CompletedProcess:
+def _run_cli(args: list[str], *, state_dir=None) -> subprocess.CompletedProcess:
+    """跑一次 CLI。
+
+    缺省把 `TRACEOPS_STATE_DIR` 指到一个全新的临时目录：worker 的存储
+    **缺省落盘**（`runtime/paths.py`），共享 `~/.local/state/traceops`
+    会让这里的用例互相污染 —— 前一个用例占用的 run 账本会让后一个用例
+    的调查被当成"重复消息"跳过。
+    """
+    import os
+    import tempfile
+
+    env = dict(os.environ)
+    env["TRACEOPS_STATE_DIR"] = state_dir or tempfile.mkdtemp(prefix="traceops-cli-")
     return subprocess.run(
         [sys.executable, "-m", "traceops.cli.worker", *args],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True, text=True, timeout=60, env=env,
     )
 
 
@@ -170,11 +182,12 @@ def _run_redis_cli(args: list[str]) -> subprocess.CompletedProcess:
 class TestPurgeCommand:
     """--purge 的安全行为：必须拒绝在没有明确数据库/SOP 的情况下"清理"。"""
 
-    def test_purge_without_evidence_db_refuses(self):
-        """不指定数据库就清理是不可接受的 —— 可能删错东西。"""
-        result = _run([sys.executable, "-m", "traceops.cli.worker", "--purge"])
+    def test_purge_refuses_when_the_store_is_ephemeral(self):
+        """没有持久数据库时清理是不可接受的 —— 可能删错东西。"""
+        result = _run([sys.executable, "-m", "traceops.cli.worker",
+                       "--ephemeral", "--purge"])
         assert result.returncode == 2
-        assert "requires --evidence-db" in result.stderr
+        assert "requires a persistent evidence database" in result.stderr
 
     def test_purge_dry_run_deletes_nothing(self, tmp_path):
         import os

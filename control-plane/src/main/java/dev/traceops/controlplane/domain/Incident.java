@@ -100,6 +100,32 @@ public class Incident {
     private String unavailableSources;
 
     /**
+     * 谁在负责这条事故。
+     *
+     * <p>为什么必须持久化：`IncidentStage` 会产出 {@code WaitingOn.PERSON}，
+     * 而在此之前系统里没有任何地方记录"那个人是谁" —— 一个说"在等人"却指不出
+     * 人的系统，无法分派、无法升级，也无法判断结论有没有被验证过。
+     */
+    private String assignee;
+
+    /** 有人明确"我接了"的时刻。首次承认才算，重复 ack 不改写时间。 */
+    private Instant acknowledgedAt;
+
+    /** 结论被确认的时刻。 */
+    private Instant confirmedAt;
+
+    /** 确认结论的人。 */
+    private String confirmedBy;
+
+    /**
+     * 确认结果：{@code ACCEPTED} / {@code REJECTED}（未确认时为 null）。
+     *
+     * <p>为什么存字符串而不是布尔：三态（未确认 / 接受 / 拒绝）里"未确认"是
+     * 最常见也最重要的一态，用布尔会把它和"拒绝"压成同一个值。
+     */
+    private String confirmation;
+
+    /**
      * 这条事故吞掉了多少条重复告警。
      *
      * <p>为什么事故要记这个数：去重发生在 {@code ingest} 里，命中去重时
@@ -291,6 +317,87 @@ public class Incident {
 
     public int getDuplicateAlerts() {
         return duplicateAlerts;
+    }
+
+    /**
+     * 指派负责人。
+     *
+     * <p>允许改派（人会休假、会换班），但空白名字不行：一个没有名字的负责人
+     * 与没有负责人完全一样，而它看起来像是有人的 —— 这比空着更危险。
+     */
+    public void assign(String who, Instant now) {
+        if (who == null || who.isBlank()) {
+            throw new IllegalArgumentException("assignee must not be blank");
+        }
+        this.assignee = who.trim();
+        this.updatedAt = now;
+    }
+
+    /**
+     * 有人接了这条事故。
+     *
+     * <p>两处克制：终态的事故不接受 ack（已经结束的事情没有"我来处理"），
+     * 重复 ack 不覆盖首次时间（否则"接了多久"永远显示为 0）。
+     */
+    public void acknowledge(Instant now) {
+        if (status == IncidentStatus.RESOLVED) {
+            throw new IllegalStateException(
+                    "incident " + id + " is already RESOLVED; nothing to acknowledge");
+        }
+        if (this.acknowledgedAt == null) {
+            this.acknowledgedAt = now;
+        }
+        this.updatedAt = now;
+    }
+
+    /**
+     * 确认（或拒绝）这一轮的诊断结论。
+     *
+     * <p>为什么必须要求 {@code DIAGNOSED}：确认的对象是"一条被支持的结论"。
+     * 允许在任何状态确认，等于允许给一条还不存在的结论背书 ——
+     * 而下游的记忆会把它当成"这个服务确实这样坏过"。
+     *
+     * <p>为什么不允许改写：确认是一个**决定**。允许覆盖会让"当初是谁、
+     * 按了什么"不可追溯，而追溯正是这套系统存在的理由。
+     */
+    public void confirm(String who, boolean accepted, Instant now) {
+        if (who == null || who.isBlank()) {
+            throw new IllegalArgumentException("confirmation requires a name");
+        }
+        if (status != IncidentStatus.DIAGNOSED) {
+            throw new IllegalStateException(
+                    "incident " + id + " is " + status + "; only a DIAGNOSED incident has "
+                            + "a conclusion to confirm");
+        }
+        if (this.confirmation != null) {
+            throw new IllegalStateException(
+                    "incident " + id + " was already " + confirmation + " by " + confirmedBy
+                            + "; a confirmation cannot be rewritten");
+        }
+        this.confirmation = accepted ? "ACCEPTED" : "REJECTED";
+        this.confirmedBy = who.trim();
+        this.confirmedAt = now;
+        this.updatedAt = now;
+    }
+
+    public String getAssignee() {
+        return assignee;
+    }
+
+    public Instant getAcknowledgedAt() {
+        return acknowledgedAt;
+    }
+
+    public String getConfirmation() {
+        return confirmation;
+    }
+
+    public String getConfirmedBy() {
+        return confirmedBy;
+    }
+
+    public Instant getConfirmedAt() {
+        return confirmedAt;
     }
 
     public java.util.List<String> getUnavailableSources() {

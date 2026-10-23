@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+import sqlite3
+
 import logging
 
 import functools
@@ -1399,6 +1401,13 @@ def _discrimination_decision(state: InvestigationState,
     """
     if int(state.get("round", 0)) >= DISCRIMINATION_ROUNDS:
         return False, []
+    # 判别回路要问的是 prometheus（聚焦错误率）与 pyroscope（火焰图）。
+    # 这两条路上一趟已经失败过就别再问：那不是"分不开"，是"问不到" ——
+    # 再问一遍只会把预算花在同一个已知的坏数据源上，还会在报告里多两条
+    # missing_data 噪音。
+    failed = set(state.get("failed_sources") or [])
+    if "prometheus" in failed:
+        return False, []
     ambiguous = _ambiguous_candidates(state, ranked)
     if not ambiguous:
         return False, []
@@ -1421,6 +1430,11 @@ def _discrimination_decision(state: InvestigationState,
         anchor=earliest.observed_at if earliest is not None else None,
         latency_services=latency_services,
     )
+    # 其余数据源同理：单个源挂了就只问还能问的那几条。
+    if failed:
+        items = [item for item in items if item.get("source_id") not in failed]
+        if not items:
+            return False, []
     # 预算不够就只问能问的那几条：问一半也好过因为排不下而一条都不问，
     # 而且截断发生在**构造计划时**，不是问了之后才发现超预算。
     remaining = ctx.budget.tool_calls_remaining
@@ -1529,8 +1543,11 @@ def _previously_seen(memory: Any, hypothesis: Any) -> bool:
             fault_type=hypothesis.fault_type or "",
             component=hypothesis.candidate_component,
         )
-    except Exception:  # 记忆是辅助信号，读不出来不该拖垮调查
-        log.warning("incident memory could not be read", exc_info=True)
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        # 只吞"存储/数据"类失败：记忆是辅助信号，读不出来不该拖垮调查。
+        # 但**不吞编程错误** —— 一个 TypeError/AttributeError 说明这段代码本身写错了，
+        # 把它也变成"没有先验"会让 bug 永久隐身（每次调查都少了这个信号，无人察觉）。
+        log.warning("incident memory could not be read: %s", exc, exc_info=True)
         return False
     return bool(prior is not None and prior.corroborated)
 
@@ -1800,8 +1817,10 @@ def _priors(state: InvestigationState, ctx: RunContext) -> list[dict[str, Any]]:
                 fault_type=hypothesis.fault_type or "",
                 component=hypothesis.candidate_component,
             )
-        except Exception:
-            log.warning("incident memory could not be read while building priors", exc_info=True)
+        except (sqlite3.Error, OSError, ValueError) as exc:
+            # 同 `_previously_seen`：存储失败可以降级，编程错误必须炸出来。
+            log.warning("incident memory could not be read while building priors: %s",
+                        exc, exc_info=True)
             continue
         if prior is None or not prior.corroborated:
             continue
@@ -1850,9 +1869,9 @@ def _remember_outcome(state: InvestigationState, ctx: RunContext) -> None:
                 component=loser.candidate_component,
                 refuted=True,
             )
-    except Exception:
-        # 记不住下一次调查，不该让这一次的报告丢掉
-        log.warning("incident memory could not record the outcome", exc_info=True)
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        # 记不住下一次调查，不该让这一次的报告丢掉；但编程错误不属于这一类。
+        log.warning("incident memory could not record the outcome: %s", exc, exc_info=True)
 
 
 def _build_gateway(ctx: RunContext) -> ToolGateway:

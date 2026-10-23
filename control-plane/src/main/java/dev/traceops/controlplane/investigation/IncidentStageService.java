@@ -67,7 +67,10 @@ public class IncidentStageService {
                 incident.getNextRetryAt(),
                 latestProgress.map(InvestigationProgress::currentNode).orElse(null),
                 latestProgress.map(InvestigationProgress::stepIndex).orElse(0),
-                now);
+                now,
+                incident.getAssignee(),
+                incident.getAcknowledgedAt() != null,
+                incident.getConfirmation());
         return IncidentStage.derive(signals);
     }
 }

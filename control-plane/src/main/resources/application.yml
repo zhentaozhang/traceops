@@ -45,6 +45,15 @@ traceops:
   investigation:
     environment: ${TRACEOPS_ENVIRONMENT:demo}
     config-version: ${TRACEOPS_CONFIG_VERSION:cfg-2026.10}
+  notify:
+    # 出站通知。**默认不启用**：没配置就没有出口，而不是配置一个假装成功的出口。
+    # 启用方式：设环境变量 TRACEOPS_NOTIFY_WEBHOOK_URL（relaxed binding 会自动
+    # 映射到 traceops.notify.webhook-url）。这里刻意**不**写默认空值 —— 写了就等于
+    # "属性存在但为空"，@ConditionalOnProperty 会装配该 bean 然后在启动时抛
+    # "webhook-url must not be blank"。
+    #   TRACEOPS_NOTIFY_WEBHOOK_URL=https://hooks.example.com/traceops
+    # 请求体形状见 运行手册「让人知道」。
+    timeout-ms: ${TRACEOPS_NOTIFY_TIMEOUT_MS:3000}
 
 logging:
   level:

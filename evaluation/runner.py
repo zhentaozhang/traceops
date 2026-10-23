@@ -4,11 +4,24 @@
     python -m evaluation.runner                       # 跑 scenarios/ 全部场景
     python -m evaluation.runner --scenario F-001      # 只跑一个
     python -m evaluation.runner --out reports/latest.json
+
+## 两个刻意的输出
+
+1. `reports/latest.json`：**机器**读数（指标 + 机会基线）。
+2. `reports/reports/<scenario>.md`：**人**读数（每个场景真实的诊断、证据、
+   不确定的地方）。此前报告对象在 harness 里被丢掉，于是"这个场景诊断成了
+   什么、凭什么"没有任何人能看到 —— 只有分数的评测无法被复核。
+
+## 它会说明自己跑的是哪条路
+
+`mode` 会写进 JSON：`rules-only` 或 `model:<名字>`。规则路径不需要模型，
+但它的数字**不能**被当成"agent 的诊断能力" —— 说清楚这一点比多跑几个场景重要。
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +33,45 @@ from evaluation.scenario import load_scenarios
 
 DEFAULT_SCENARIOS_DIR = Path(__file__).resolve().parent / "scenarios"
 DEFAULT_OUT = Path(__file__).resolve().parent / "reports" / "latest.json"
+DEFAULT_REPORTS_DIR = Path(__file__).resolve().parent / "reports" / "reports"
+
+
+def _build_model(args):
+    """按参数/环境变量构造模型客户端；没配就返回 None（纯规则路径）。"""
+    base_url = args.model_base_url or os.environ.get("TRACEOPS_LLM_BASE_URL")
+    model_name = args.model_name or os.environ.get("TRACEOPS_LLM_MODEL")
+    if not base_url or not model_name:
+        return None
+    from traceops.runtime.openai_client import OpenAICompatibleModel
+
+    return OpenAICompatibleModel(
+        base_url=base_url,
+        model_name=model_name,
+        api_key=args.model_api_key or os.environ.get("TRACEOPS_LLM_API_KEY"),
+    )
+
+
+def _write_human_reports(outcomes, directory: Path) -> int:
+    """每个场景写一份可读诊断。返回写了几份。"""
+    from traceops.rca.render import render_report
+
+    directory.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for outcome in outcomes:
+        report = getattr(outcome, "report", None)
+        if report is None:
+            continue
+        body = render_report(report, cost={"tool_calls": outcome.tool_calls})
+        header = f"# {outcome.scenario_id}\n\n"
+        footer = (
+            "\n---\n\n"
+            "这是合成场景的真实输出（数据是编的，编排是真的）。"
+            "指标读 `reports/latest.json`；这份文件回答的是『凭什么』。\n"
+        )
+        (directory / f"{outcome.scenario_id}.md").write_text(header + body + footer,
+                                                             encoding="utf-8")
+        written += 1
+    return written
 
 
 def _format_row(outcome) -> str:
@@ -46,6 +98,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scenarios-dir", type=Path, default=DEFAULT_SCENARIOS_DIR)
     parser.add_argument("--scenario", action="append", default=None, help="scenario id, repeatable")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    parser.add_argument("--reports-dir", type=Path, default=DEFAULT_REPORTS_DIR,
+                        help="每个场景写一份人类可读诊断到这里")
+    parser.add_argument("--no-reports", action="store_true",
+                        help="skip the human-readable per-scenario reports")
+    parser.add_argument("--model-base-url", default=None,
+                        help="OpenAI-compatible endpoint (env TRACEOPS_LLM_BASE_URL)")
+    parser.add_argument("--model-name", default=None,
+                        help="model name (env TRACEOPS_LLM_MODEL)")
+    parser.add_argument("--model-api-key", default=None,
+                        help="api key (env TRACEOPS_LLM_API_KEY)")
     args = parser.parse_args(argv)
 
     scenarios = load_scenarios(args.scenarios_dir)
@@ -56,7 +118,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no scenarios found in {args.scenarios_dir}")
         return 2
 
-    outcomes = [run_scenario(s) for s in scenarios]
+    model = _build_model(args)
+    mode = f"model:{model.name}" if model is not None else "rules-only"
+    print(f"mode={mode}")
+    if model is None:
+        print("     NOTE: 没有配置模型端点，跑的是纯规则路径。这些数字说明规则能做什么，"
+              "不说明 agent 的诊断能力。", file=sys.stderr)
+
+    outcomes = [run_scenario(s, model=model) for s in scenarios]
     agg = aggregate(outcomes)
     chance = compute_chance_metrics(outcomes)
 
@@ -99,6 +168,7 @@ def main(argv: list[str] | None = None) -> int:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "generated_at": datetime.now(UTC).isoformat(),
+        "mode": mode,
         "scenarios": [o.to_dict() for o in outcomes],
         "aggregate": agg.to_dict(),
         "chance_baseline": chance.to_dict(),
@@ -106,6 +176,10 @@ def main(argv: list[str] | None = None) -> int:
     }
     args.out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"written {args.out}")
+
+    if not args.no_reports:
+        written = _write_human_reports(outcomes, args.reports_dir)
+        print(f"written {written} human-readable reports to {args.reports_dir}")
     return 0
 
 

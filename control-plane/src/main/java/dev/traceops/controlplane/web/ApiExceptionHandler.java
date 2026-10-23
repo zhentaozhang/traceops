@@ -21,6 +21,17 @@ public class ApiExceptionHandler {
         return detail;
     }
 
+    /**
+     * 状态不允许这个动作（例如给一条 NEW 事故确认结论、或重复确认）。
+     *
+     * <p>映射成 409 而不是 400：请求本身是合法的，是**当前状态**不接受它。
+     * 这两者让客户端做的事完全不同（改参数 vs 重新读状态）。
+     */
+    @ExceptionHandler(IllegalStateException.class)
+    public ProblemDetail illegalState(IllegalStateException ex) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, ex.getMessage());
+    }
+
     @ExceptionHandler(IllegalArgumentException.class)
     public ProblemDetail badRequest(IllegalArgumentException ex) {
         return ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, ex.getMessage());

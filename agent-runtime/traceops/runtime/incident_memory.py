@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS memories (
     component TEXT NOT NULL DEFAULT '',
     hits INTEGER NOT NULL DEFAULT 0,
     refuted INTEGER NOT NULL DEFAULT 0,
+    confirmed INTEGER NOT NULL DEFAULT 0,
     last_seen TEXT NOT NULL,
     PRIMARY KEY (service, fault_type, component)
 )
@@ -61,6 +62,7 @@ class Prior:
     hits: int
     refuted: int
     last_seen: datetime
+    confirmed: int = 0
 
     @property
     def net(self) -> int:
@@ -71,6 +73,15 @@ class Prior:
         """以前确实这样坏过（而不是以前被推翻过）。"""
         return self.net > 0
 
+    @property
+    def verified(self) -> bool:
+        """这条先验被**人**确认过，而不只是被规则断言过。
+
+        差别不是修辞：一个没人确认过的先验，在复盘时无法区分
+        "系统猜对了"和"系统猜错了但碰巧排在前面"。
+        """
+        return self.confirmed > 0
+
     def to_dict(self) -> dict[str, object]:
         return {
             "service": self.service,
@@ -78,6 +89,7 @@ class Prior:
             "component": self.component or None,
             "hits": self.hits,
             "refuted": self.refuted,
+            "confirmed": self.confirmed,
             "last_seen": self.last_seen.isoformat(),
         }
 
@@ -102,6 +114,19 @@ class IncidentMemory:
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """把上一版建的表补齐。
+
+        `CREATE TABLE IF NOT EXISTS` 不会给已存在的表加列 —— 而这个文件在磁盘上
+        可能已经有一份旧 schema。少了这一步，升级后第一次调查就抛
+        `no such column: confirmed`，而那是**记忆库**的错，看起来像调查代码坏了。
+        """
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(memories)")}
+        if "confirmed" not in columns:
+            self._conn.execute(
+                "ALTER TABLE memories ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0")
         self._conn.commit()
 
     # ---------- 读 ----------
@@ -118,7 +143,7 @@ class IncidentMemory:
             return None
         if component:
             row = self._conn.execute(
-                "SELECT service, fault_type, component, hits, refuted, last_seen "
+                "SELECT service, fault_type, component, hits, refuted, confirmed, last_seen "
                 "FROM memories WHERE service = ? AND fault_type = ? AND component = ?",
                 (service, fault_type, component),
             ).fetchone()
@@ -128,7 +153,8 @@ class IncidentMemory:
 
         row = self._conn.execute(
             "SELECT service, fault_type, '' AS component, "
-            "SUM(hits) AS hits, SUM(refuted) AS refuted, MAX(last_seen) AS last_seen "
+            "SUM(hits) AS hits, SUM(refuted) AS refuted, SUM(confirmed) AS confirmed, "
+            "MAX(last_seen) AS last_seen "
             "FROM memories WHERE service = ? AND fault_type = ?",
             (service, fault_type),
         ).fetchone()
@@ -138,7 +164,7 @@ class IncidentMemory:
 
     def summary(self, limit: int = 10) -> list[dict[str, object]]:
         rows = self._conn.execute(
-            "SELECT service, fault_type, component, hits, refuted, last_seen "
+            "SELECT service, fault_type, component, hits, refuted, confirmed, last_seen "
             "FROM memories ORDER BY (hits - refuted) DESC, last_seen DESC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -147,29 +173,50 @@ class IncidentMemory:
     # ---------- 写 ----------
 
     def record(self, *, service: str, fault_type: str, component: str | None = None,
-               refuted: bool = False, at: datetime | None = None) -> Prior:
-        """记一次结局。`refuted=True` 记的是"这个候选被推翻了"。"""
+               refuted: bool = False, at: datetime | None = None,
+               confirmed: bool = False) -> Prior:
+        """记一次结局。
+
+        `refuted=True` 记的是"这个候选被推翻了"；`confirmed=True` 记的是
+        "有人确认过这条结论"（同一个计数同时算作一次命中 —— 确认过的一定发生过）。
+        """
         if not service or not fault_type:
             raise ValueError("memory record needs both service and fault_type")
+        if refuted and confirmed:
+            raise ValueError("a rejected conclusion cannot also be confirmed")
         moment = at or datetime.now(UTC)
         key = (service, fault_type, component or "")
         column = "refuted" if refuted else "hits"
+        confirm_column = ", confirmed = confirmed + 1" if confirmed else ""
         self._conn.execute(
             f"""
-            INSERT INTO memories (service, fault_type, component, hits, refuted, last_seen)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO memories
+                (service, fault_type, component, hits, refuted, confirmed, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(service, fault_type, component) DO UPDATE SET
-                {column} = {column} + 1,
+                {column} = {column} + 1{confirm_column},
                 last_seen = excluded.last_seen
             """,
             (key[0], key[1], key[2], 0 if refuted else 1, 1 if refuted else 0,
-             moment.isoformat()),
+             1 if confirmed else 0, moment.isoformat()),
         )
         self._evict_if_needed()
         self._conn.commit()
         prior = self.recall(service=service, fault_type=fault_type, component=component)
         assert prior is not None  # 刚写进去的行必须能读回来
         return prior
+
+    def record_confirmation(self, *, service: str, fault_type: str,
+                            component: str | None = None, accepted: bool,
+                            at: datetime | None = None) -> Prior:
+        """把一次**人的确认**记进记忆。
+
+        接受 → 记一次命中并标记"经人确认"；拒绝 → 记一次反驳。
+        为什么拒绝也要记：被拒绝的结论如果仍然因为"老熟人"加分，
+        记忆就成了自证循环 —— 而拒绝是唯一能打破它的信号。
+        """
+        return self.record(service=service, fault_type=fault_type, component=component,
+                           refuted=not accepted, confirmed=accepted, at=at)
 
     def forget(self, *, service: str, fault_type: str, component: str | None = None) -> None:
         self._conn.execute(
@@ -206,4 +253,5 @@ def _to_prior(row: sqlite3.Row) -> Prior:
         hits=int(row["hits"] or 0),
         refuted=int(row["refuted"] or 0),
         last_seen=datetime.fromisoformat(row["last_seen"]),
+        confirmed=int(row["confirmed"] or 0),
     )

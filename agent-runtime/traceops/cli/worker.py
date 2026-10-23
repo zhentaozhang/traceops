@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import uuid
 import functools
 import json
 import logging
@@ -38,6 +39,7 @@ from traceops.runtime.budget import (
 from traceops.config.history import StrategyHistory
 from traceops.runtime.datasource_health import DatasourceHealthTracker
 from traceops.runtime.incident_memory import IncidentMemory
+from traceops.runtime.paths import default_db_path
 from traceops.runtime.deadletter import InMemoryDeadLetterSink
 from traceops.runtime.shutdown import StopSignal
 from traceops.evidence.retention import RetentionPolicy
@@ -63,25 +65,32 @@ from traceops.tools.gateway import (
 from traceops.topology.graph import TopologyError, ServiceTopology
 
 
-def _self_check_event() -> dict:
-    """与 control-plane EventMessages 产出一致的形状（含 Redis entry 摊平）。"""
+def _self_check_event(suffix: str | None = None) -> dict:
+    """与 control-plane EventMessages 产出一致的形状（含 Redis entry 摊平）。
+
+    每次都换一批 id：自检是一条**可以反复跑**的冒烟命令，而 run 账本现在
+    缺省落盘（`runtime/paths.py`）。沿用固定 id 的后果是第二次自检被判成
+    "重复消息"跳过 —— 一条永远返回 skipped=1 的冒烟命令比没有更容易误导。
+    """
+    # 事件 id 有强制的 UUID 形状（契约里的 pattern），所以整段用 uuid4 的字符串形式。
+    suffix = suffix or str(uuid.uuid4())
     return {
-        "id": "selfcheck-1",
+        "id": f"selfcheck-{suffix}",
         "payload": {
             "envelope": {
-                "event_id": "evt-11111111-2222-3333-4444-555555555555",
+                "event_id": f"evt-{suffix}",
                 "event_type": "investigation.requested",
                 "schema_version": "1.0",
                 "occurred_at": "2026-10-30T10:06:00Z",
-                "correlation_id": "inc-selfcheck",
+                "correlation_id": f"inc-selfcheck-{suffix}",
                 "causation_id": None,
-                "aggregate_id": "run-selfcheck",
+                "aggregate_id": f"run-selfcheck-{suffix}",
                 "aggregate_version": 1,
                 "producer": "control-plane",
             },
             "payload": {
-                "investigation_run_id": "run-selfcheck",
-                "incident_id": "inc-selfcheck",
+                "investigation_run_id": f"run-selfcheck-{suffix}",
+                "incident_id": f"inc-selfcheck-{suffix}",
                 "service_hint": "order-service",
                 "environment": "demo",
                 "time_range": {"start": "2026-10-30T10:00:00Z", "end": "2026-10-30T10:06:00Z"},
@@ -234,6 +243,23 @@ class SharedState:
     health: DatasourceHealthTracker = field(default_factory=DatasourceHealthTracker)
     strategy_history: StrategyHistory = field(default_factory=StrategyHistory)
     memory: IncidentMemory = field(default_factory=IncidentMemory)
+
+
+def _resolve_store_paths(args) -> dict[str, Path | None]:
+    """把三个 `--*-db` 参数解析成最终路径（None = 内存）。
+
+    `--ephemeral` 是唯一能让它们变成 None 的开关：缺省值必须是**会留下来**的
+    路径，否则"重启后证据消失"发生在默认配置上，而默认配置就是大多数人跑的那个。
+    显式传路径优先于 --ephemeral 之外的一切（env 已在 argparse 里解析）。
+    """
+    if getattr(args, "ephemeral", False):
+        return {"evidence": None, "ledger": None, "memory": None}
+    return {
+        "evidence": Path(args.evidence_db) if args.evidence_db
+        else default_db_path("evidence.db"),
+        "ledger": Path(args.ledger_db) if args.ledger_db else default_db_path("ledger.db"),
+        "memory": Path(args.memory_db) if args.memory_db else default_db_path("memory.db"),
+    }
 
 
 def _conventions(args) -> TelemetryConventions | None:
@@ -393,11 +419,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--topology", default=os.environ.get("TRACEOPS_TOPOLOGY", ""),
                         help="caller:callee pairs separated by ';'")
     parser.add_argument("--evidence-db", default=os.environ.get("TRACEOPS_EVIDENCE_DB"),
-                        help="SQLite path; omit for in-memory evidence")
+                        help="SQLite path for evidence; defaults to "
+                             "$TRACEOPS_STATE_DIR/evidence.db (see --ephemeral)")
     parser.add_argument("--memory-db", default=os.environ.get("TRACEOPS_MEMORY_DB"),
-                        help="SQLite path for cross-incident memory; omit for in-process only")
+                        help="SQLite path for cross-incident memory; defaults to "
+                             "$TRACEOPS_STATE_DIR/memory.db")
     parser.add_argument("--ledger-db", default=os.environ.get("TRACEOPS_LEDGER_DB"),
-                        help="SQLite path for run dedup; omit for in-memory")
+                        help="SQLite path for run dedup; defaults to "
+                             "$TRACEOPS_STATE_DIR/ledger.db")
+    parser.add_argument("--ephemeral", action="store_true", default=False,
+                        help="keep every store in memory and lose it on exit; "
+                             "this is an explicit choice, not the default")
     parser.add_argument("--telemetry-conventions",
                         default=os.environ.get("TRACEOPS_TELEMETRY_CONVENTIONS"),
                         help="JSON file declaring this cluster's metric/label names "
@@ -436,20 +468,22 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     _configure_logging(getattr(args, "log_level", "INFO"))
 
-    store = EvidenceStore(path=Path(args.evidence_db) if args.evidence_db else None)
+    paths = _resolve_store_paths(args)
+    store = EvidenceStore(path=paths["evidence"])
     adapters = build_adapters(args)
     topology = build_topology(args)
     dead_letters = InMemoryDeadLetterSink()
     # 账本必须持久化：否则重启后未 ACK 的消息会被重复调查
-    ledger = RunLedger(path=Path(args.ledger_db) if args.ledger_db else None)
+    ledger = RunLedger(path=paths["ledger"])
     # 内存 sink 只是**默认**；--mode redis 会换成真正写 Redis 的那个。
     # 此前无论什么模式都用内存 sink：redis 模式下产出的结论只进了
     # 内存列表然后打到 stdout，控制面那边**一条终态事件都收不到**。
     sink = InMemoryEventSink()
 
     if args.purge:
-        if args.evidence_db is None:
-            print("--purge requires --evidence-db (refusing to guess a database)", file=sys.stderr)
+        if paths["evidence"] is None:
+            print("--purge requires a persistent evidence database "
+                  "(drop --ephemeral, or pass --evidence-db)", file=sys.stderr)
             return 2
         closed = {i.strip() for i in args.closed_incidents.split(",") if i.strip()}
         if not closed:
@@ -511,10 +545,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # 跨 run 的共享状态在 main() 里造一次，然后一路传下去。
-    # 不给路径时记忆落在内存里（进程退出即散）；给了 `--memory-db` 才是
-    # 它应有的样子 —— 记忆的价值恰恰在跨重启（"每个月挂一次"必然跨越很多次重启）。
-    shared = SharedState(
-        memory=IncidentMemory(path=args.memory_db) if args.memory_db else IncidentMemory())
+    # 记忆的价值恰恰在跨重启（"每个月挂一次"必然跨越很多次重启），所以缺省
+    # 落盘；只有显式 --ephemeral 才进内存。
+    shared = SharedState(memory=IncidentMemory(path=paths["memory"]))
 
     build_context = functools.partial(
         build_run_context, args=args, store=store, adapters=adapters, topology=topology,

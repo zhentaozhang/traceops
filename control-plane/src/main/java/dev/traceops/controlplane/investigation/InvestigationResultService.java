@@ -6,11 +6,14 @@ import dev.traceops.controlplane.domain.IllegalTransitionException;
 import dev.traceops.controlplane.domain.Incident;
 import dev.traceops.controlplane.domain.IncidentRepository;
 import dev.traceops.controlplane.domain.IncidentStatus;
+import dev.traceops.controlplane.notify.IncidentAppliedEvent;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -49,6 +52,19 @@ public class InvestigationResultService {
     private final FindingHistoryRepository history;
     private final InvestigationRetryService retryService;
     private final ObjectMapper mapper;
+
+    /**
+     * 出站通知的事件出口。
+     *
+     * <p>默认是空实现而不是 {@code null}：直接 new 出来的测试实例不该因为
+     * "没注入事件总线"而 NPE。容器里会被 {@link #setEvents} 覆盖成真实 publisher。
+     */
+    private ApplicationEventPublisher events = event -> { };
+
+    @Autowired
+    void setEvents(ApplicationEventPublisher events) {
+        this.events = events;
+    }
 
     public InvestigationResultService(IncidentRepository incidents,
             dev.traceops.controlplane.service.IncidentWriter writer,
@@ -134,6 +150,14 @@ public class InvestigationResultService {
         appliedEvents.save(AppliedInvestigationEvent.of(result.eventId(), result.investigationRunId(),
                 result.eventType(), result.incidentId(), outcome.outcome().name(),
                 previous.name(), incident.getStatus().name(), outcome.reason(), now));
+
+        // 结算完才谈通知：事务还没提交就发消息，回滚后那条"事故已诊断"会变成谎言。
+        // 监听方是 AFTER_COMMIT（见 IncidentNotifier），这里只负责把事实抛出去。
+        events.publishEvent(new IncidentAppliedEvent(
+                incident.getId(), incident.getService(), incident.getSeverity(),
+                incident.getOrigin() == null ? null : incident.getOrigin().name(),
+                incident.getStatus() == null ? null : incident.getStatus().name(),
+                outcome.outcome().name(), outcome.reason(), result.reportRef(), now));
 
         return outcome;
     }

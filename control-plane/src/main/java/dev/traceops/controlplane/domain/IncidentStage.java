@@ -73,6 +73,9 @@ public record IncidentStage(Kind kind, WaitingOn waitingOn, String detail, boole
      * @param progressNode      当前 run 的最新节点名；没有进度为 {@code null}
      * @param progressStep      当前 run 的最新步骤序号；没有进度为 0
      * @param now               判定基准时刻（显式传入，测试才能覆盖时间边界）
+     * @param assignee          负责人的名字；没有人为 {@code null}
+     * @param acknowledged      是否已经有人明确"我接了"
+     * @param confirmation      {@code ACCEPTED} / {@code REJECTED} / {@code null}
      */
     public record Signals(
             IncidentStatus status,
@@ -82,7 +85,18 @@ public record IncidentStage(Kind kind, WaitingOn waitingOn, String detail, boole
             Instant nextRetryAt,
             String progressNode,
             int progressStep,
-            Instant now) {
+            Instant now,
+            String assignee,
+            boolean acknowledged,
+            String confirmation) {
+
+        /** 旧调用点（无人的那个世界）的便捷构造：三个"人"的信号都取缺省值。 */
+        public Signals(IncidentStatus status, String lastOutcome, int retryAttempts,
+                int maxRetryAttempts, Instant nextRetryAt, String progressNode,
+                int progressStep, Instant now) {
+            this(status, lastOutcome, retryAttempts, maxRetryAttempts, nextRetryAt,
+                    progressNode, progressStep, now, null, false, null);
+        }
 
         public Signals {
             if (status == null) {
@@ -126,12 +140,18 @@ public record IncidentStage(Kind kind, WaitingOn waitingOn, String detail, boole
      */
     public static IncidentStage derive(Signals s) {
         if (s.status() == IncidentStatus.RESOLVED) {
-            return new IncidentStage(Kind.DONE, WaitingOn.NOBODY, "resolved", false);
+            // 结论被谁确认过，是"已解决"里唯一值得多说一句的信息：
+            // 没有人确认过的解决，与有人确认过的解决，事后价值完全不同。
+            String detail = s.confirmation() == null
+                    ? "resolved (the diagnosis was never confirmed)"
+                    : "resolved; diagnosis " + s.confirmation().toLowerCase(java.util.Locale.ROOT);
+            return new IncidentStage(Kind.DONE, WaitingOn.NOBODY, detail, false);
         }
 
         if (OUTCOME_NEEDS_HUMAN_REVIEW.equals(s.lastOutcome())) {
             return new IncidentStage(Kind.NEEDS_DECISION, WaitingOn.PERSON,
-                    "last run ended without a decisive diagnosis; no automatic path advances this",
+                    "last run ended without a decisive diagnosis; no automatic path advances this"
+                            + whoSuffix(s),
                     false);
         }
 
@@ -170,7 +190,24 @@ public record IncidentStage(Kind kind, WaitingOn waitingOn, String detail, boole
         // DIAGNOSED 之后没有自动出边：诊断完成不等于处理完成，下一步是人决定。
         // 把这句话直接写进 detail，比让人去读 ALLOWED 表之后自己得出同样结论要好。
         return new IncidentStage(Kind.NEEDS_DECISION, WaitingOn.PERSON,
-                "no automatic transition leaves " + s.status() + "; a person must decide", false);
+                "no automatic transition leaves " + s.status() + "; a person must decide"
+                        + whoSuffix(s), false);
+    }
+
+    /**
+     * "等一个人"时，把那个人是谁说出来。
+     *
+     * <p>在此之前 {@code stage} 只能说 `waiting for a person` —— 而系统里没有任何地方
+     * 记录这个人是谁，于是这条读数无法被任何人接手使用。三种状态各自可读：
+     * 没人认领、已指派但没人接、已接。
+     */
+    private static String whoSuffix(Signals s) {
+        if (s.assignee() == null || s.assignee().isBlank()) {
+            return "; nobody is assigned";
+        }
+        return s.acknowledged()
+                ? "; assigned to " + s.assignee() + " who has acknowledged it"
+                : "; assigned to " + s.assignee() + " who has not acknowledged it yet";
     }
 
     private static IncidentStage retryBackoff(Signals s) {

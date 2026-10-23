@@ -9,10 +9,10 @@ Evidence-driven Agentic RCA Platform —— 面向微服务系统的智能故障
 
 | 平面 | 状态 | 测试 |
 |---|---|---|
-| Control Plane（Java / Spring Boot） | ✅ 告警接入、事故关联、状态机、Outbox、结果消费、**诊断结论 REST 查询**、**失败自动重试**、**契约运行时校验** | 217 passing |
-| Investigation Plane（Python / LangGraph） | ✅ 8 节点图（含判别回路）、双层采集、传播链、重试分类、**证据读回**、**跨事故记忆**、**查询缓存** | 1213 passing |
+| Control Plane（Java / Spring Boot） | ✅ 告警接入、事故关联、状态机、Outbox、结果消费、**诊断结论 REST 查询**、**失败自动重试**、**契约运行时校验**、**负责人 / 认领 / 结论确认**、**出站通知** | **237 passing** |
+| Investigation Plane（Python / LangGraph） | ✅ 8 节点图（含判别回路）、双层采集、传播链、重试分类、**证据读回**、**跨事故记忆**、**查询缓存** | **1275 passing** |
 | Evidence Plane（Python） | ✅ 4 类归一化、内容寻址校验、**SQLite 持久化**、查询模板、证据图 | 同上 |
-| Evaluation Plane（Python） | ✅ 12 场景（含三服务级联 F-005、F-011 自然语言线索）+ 18 指标 + runner | 106 passing |
+| Evaluation Plane（Python） | ✅ 12 场景（含三服务级联 F-005、F-011 自然语言线索）+ 18 指标 + runner | **115 passing** |
 | Execution Plane（受控修复） | ✅ Action Registry + Policy + Approval + **执行后重新观测** + **不达标自动回滚** + **CLI 入口** | 93 passing |
 | Topology（服务依赖） | ✅ 双向语义、环检测、平局裁决 | 19 passing |
 | 观测栈（docker compose） | ✅ **已拉起**：Prometheus/Loki/Tempo/Grafana + mcp-grafana | 4 服务 healthy |
@@ -20,11 +20,15 @@ Evidence-driven Agentic RCA Platform —— 面向微服务系统的智能故障
 
 **P0 没有 LLM 参与**：这一版全部是确定性代码，目的是把"证据 → 假设 → 排序 → 报告"
 这条数据流先做实，再做模型。E1–E5 消融实验因此还跑不了，见 `评测口径` §4。
+想确认"真模型那条路"到底通不通，跑 `python -m evaluation.model_check` ——
+没有配置端点时它会明确返回 `UNVERIFIED`，而不是假装成功。
 
 ## 文档
 
 | 文档 | 内容 | 状态 |
 |---|---|---|
+
+
 
 
 
@@ -67,9 +71,8 @@ PYTHONPATH=agent-runtime .venv/bin/python -m traceops.cli.demo
 
 ### 接入前提：你的遥测必须长成这样
 
-查询模板里写着具体的 PromQL / LogQL / Tempo 条件，它们**假设**了下面这些约定。
-不符合就必须先改 `agent-runtime/traceops/evidence/templates.py`（模板目前不可配置，
-这是已知缺口，不是"支持任意命名"）：
+查询模板里的名字是**可声明的**：下面这些是默认值（= 仓库自带演示栈），
+换一套采集配置不需要改代码，写一个 JSON 文件即可（见下面的例子）：
 
 | 数据源 | 假设 | 用在哪 |
 |---|---|---|
@@ -78,6 +81,29 @@ PYTHONPATH=agent-runtime .venv/bin/python -m traceops.cli.demo
 | Loki | 标签 `service`、`level`，错误日志 `level="error"` | 日志证据 |
 | Tempo | `service.name` 标签，`duration > Nms` 过滤 | 慢追踪证据 |
 | 通用 | 服务名与拓扑里的名字**逐字符一致** | 归因、爆炸半径 |
+
+把自己的约定写进一个文件，然后交给 worker：
+
+```json
+{
+  "requests_total": "http_server_requests_count",
+  "service_label": "app",
+  "status_label": "status",
+  "error_status_regex": "5[0-9][0-9]",
+  "log_service_label": "app",
+  "log_level_label": "severity",
+  "log_error_value": "ERROR",
+  "trace_service_label": "service.name"
+}
+```
+
+```bash
+python -m traceops.cli.worker --telemetry-conventions ./conventions.json ...
+# 或 TRACEOPS_TELEMETRY_CONVENTIONS=./conventions.json
+```
+
+拼错字段名会被拒绝并列出可用字段（`unknown convention field(s): ...`）——
+静默沿用默认值会让"约定不匹配"伪装成"系统很健康"。
 
 `scripts/verify_stack_config` 只能校验仓库自带的演示栈配置（`demo-environment/observability`）；
 **你自己的集群要自己核这几条** —— 核完再谈诊断质量，否则查回来的每一份数据都会被判成
@@ -104,18 +130,21 @@ cd traceops
 python -m venv --system-site-packages .venv
 .venv/bin/python -m pip install -e agent-runtime --no-build-isolation
 
-# 全部测试（agent-runtime 1213 + evaluation 106 + contracts 13 = 1332）
+# 全部测试（agent-runtime 1275 + evaluation 115 + contracts 13 = 1403）
 PYTHONPATH=agent-runtime .venv/bin/python -m pytest agent-runtime/tests evaluation contracts -q
 
-# 跑评估：12 场景 + 指标
+# 跑评估：12 场景 + 指标 + 每个场景一份可读诊断（reports/reports/<id>.md）
 .venv/bin/python -m evaluation.runner
+
+# 确认"真模型那条路"通不通（没有端点时明确返回 UNVERIFIED，退出码 2）
+.venv/bin/python -m evaluation.model_check
 ```
 
 ### Java 侧（Control Plane）
 
 ```bash
 cd traceops/control-plane
-mvn -s .mvn/settings.xml -B test        # 217 tests
+mvn -s .mvn/settings.xml -B test        # 237 tests
 mvn -s .mvn/settings.xml spring-boot:run # :8081
 
 curl -X POST localhost:8081/api/v1/alerts -H 'Content-Type: application/json' -d '{

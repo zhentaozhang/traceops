@@ -10,6 +10,7 @@ missing_data，结论可以是 INCONCLUSIVE —— 这正是要评估的行为�
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -263,4 +264,8 @@ def run_scenario(scenario: Scenario, *, model=None, profile=None) -> ScenarioOut
     # 要能回答"是策略变了还是数据变了"。
     if result.report is not None:
         result.report.profile_digest = effective.digest()
-    return score_scenario(scenario, result)
+    outcome = score_scenario(scenario, result)
+    # 报告本身也要带出来。此前它在这里被丢掉：评测只留指标，于是
+    # "这个场景到底诊断成了什么、引用了哪几条证据、哪里不确定"没有任何人能看到 ——
+    # 一个只有分数的评测无法被复核，也无法被拿去和人类专家对比。
+    return replace(outcome, report=result.report) if result.report is not None else outcome
