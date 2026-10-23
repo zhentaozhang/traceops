@@ -236,6 +236,13 @@ class SharedState:
     memory: IncidentMemory = field(default_factory=IncidentMemory)
 
 
+def _conventions(args) -> TelemetryConventions | None:
+    path = getattr(args, "telemetry_conventions", None)
+    if not path:
+        return None
+    return load_conventions(path)
+
+
 def build_run_context(request: InvestigationRequest, *, args, store, adapters,
                       topology: ServiceTopology | None,
                       memory: "IncidentMemory | None" = None,
@@ -269,6 +276,10 @@ def build_run_context(request: InvestigationRequest, *, args, store, adapters,
         # 事迹记忆：跨事故的先验。传 None 时 rank 里 R-010 不参与排序
         # （与"没有记忆"完全等价，不是"记忆里什么都没有"）。
         memory=memory if memory is not None else shared_state.memory,
+        # 遥测约定：--telemetry-conventions 指定时用它，否则沿用演示栈约定。
+        # 名字对不上时查询会返回空，而空结果会被判成"阴性观测" —— 所以
+        # 这件事必须是可声明的，不能指望部署方改源码。
+        conventions=_conventions(args),
     )
 
 
@@ -387,6 +398,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="SQLite path for cross-incident memory; omit for in-process only")
     parser.add_argument("--ledger-db", default=os.environ.get("TRACEOPS_LEDGER_DB"),
                         help="SQLite path for run dedup; omit for in-memory")
+    parser.add_argument("--telemetry-conventions",
+                        default=os.environ.get("TRACEOPS_TELEMETRY_CONVENTIONS"),
+                        help="JSON file declaring this cluster's metric/label names "
+                             "; omit for the demo stack conventions")
     parser.add_argument("--gc-spill", action="store_true", default=False,
                         help="purge spilled payloads older than --spill-retention-days, then exit")
     parser.add_argument("--spill-retention-days", type=float, default=7.0,

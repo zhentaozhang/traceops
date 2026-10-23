@@ -53,6 +53,40 @@ traceops/
 
 ## 快速开始
 
+### 30 秒：看到一次诊断（不需要 Redis / Docker / 模型）
+
+```bash
+cd traceops
+PYTHONPATH=agent-runtime .venv/bin/python -m traceops.cli.demo
+```
+
+用合成遥测跑完整编排，打印"结论 / 为什么信 / 下一步 / 不确定的地方"四段，
+并把 JSON 报告写到 `--json <path>`。**不想跑也能看**：
+[诊断示例] 是一次真实输出的存档。
+数据是合成的，编排与报告是真的 —— 边界写在那个文件的第一段。
+
+### 接入前提：你的遥测必须长成这样
+
+查询模板里写着具体的 PromQL / LogQL / Tempo 条件，它们**假设**了下面这些约定。
+不符合就必须先改 `agent-runtime/traceops/evidence/templates.py`（模板目前不可配置，
+这是已知缺口，不是"支持任意命名"）：
+
+| 数据源 | 假设 | 用在哪 |
+|---|---|---|
+| Prometheus | 指标名 `http_requests_total`，标签 `service`、`status` | 错误率、聚焦窗口判别 |
+| Prometheus | 任一指标 `metric{service="X"}` 可查（`qt-metric-series-v1`） | 判别回路 |
+| Loki | 标签 `service`、`level`，错误日志 `level="error"` | 日志证据 |
+| Tempo | `service.name` 标签，`duration > Nms` 过滤 | 慢追踪证据 |
+| 通用 | 服务名与拓扑里的名字**逐字符一致** | 归因、爆炸半径 |
+
+`scripts/verify_stack_config` 只能校验仓库自带的演示栈配置（`demo-environment/observability`）；
+**你自己的集群要自己核这几条** —— 核完再谈诊断质量，否则查回来的每一份数据都会被判成
+"空结果"，而报告只能说"查了但没有"。
+
+```bash
+PYTHONPATH=agent-runtime .venv/bin/python -m scripts.verify_stack_config   # 仅演示栈
+```
+
 ### 一条命令验证闭环
 
 ```bash

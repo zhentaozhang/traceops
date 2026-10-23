@@ -28,6 +28,8 @@
 from __future__ import annotations
 
 import sqlite3
+
+from traceops.runtime.sqlite_config import configure_connection
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -90,7 +92,14 @@ class IncidentMemory:
         self._path = Path(path) if path is not None else None
         if self._path is not None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self._path) if self._path else ":memory:")
+        # 第四处 SQLite。sqlite_config 的 docstring 写过"新增第四个库时必然漏"，
+        # 这里就是那次遗漏：默认 pragma 下读阻塞写、拿不到锁立刻抛
+        # `database is locked`，而记忆的写入发生在每次调查结束 —— 正好与
+        # 下一次调查的读取重叠。
+        self._conn = configure_connection(
+            sqlite3.connect(str(self._path) if self._path else ":memory:",
+                            check_same_thread=False)
+        )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(_SCHEMA)
         self._conn.commit()

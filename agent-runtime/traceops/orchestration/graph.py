@@ -37,7 +37,12 @@ from traceops.evidence.graph import (
     ordering_violations,
     promote_relations,
 )
-from traceops.evidence.templates import QueryTemplateError, default_registry
+from traceops.evidence.templates import (
+    QueryTemplateError,
+    TelemetryConventions,
+    default_registry,
+    render_error_rate,
+)
 from traceops.evidence.normalizer import _trace_batches, coerce_epoch, normalize
 from traceops.evidence.store import EvidenceStore
 from traceops.orchestration.detectors import (
@@ -195,6 +200,11 @@ class RunContext:
     #: 由调用方显式传入并跨 run 复用 —— "跨调查"的边界就是"同一个进程"。
     #: 为 None 时不做聚合（单测/评测常用），报告里就是空列表。
     health: Any = None
+    #: 部署方声明的遥测约定（指标名/标签名，`traceops.evidence.templates`）。
+    #:
+    #: 为 None 时用演示栈约定。换成别人的集群只需换这一个值：模板里的名字
+    #: 不是事实，是某套采集配置的产物。
+    conventions: TelemetryConventions | None = None
     #: 跨运行共享的策略变更历史（`config/history.py`）。为 None 时不做归属记录。
     strategy_history: Any = None
     #: 跨事故记忆（`traceops.runtime.incident_memory.IncidentMemory`）。
@@ -451,7 +461,9 @@ def _plan_items(request: InvestigationRequest, ctx: "RunContext") -> list[dict[s
                 template_params["min_duration_ms"] = SLOW_SPAN_THRESHOLD_MS
             # 模板渲染失败 = 计划非法：宁可少查一个数据源，也不发出未校验的查询
             try:
-                rendered_query = default_registry().build(template_id, template_params)
+                rendered_query = default_registry(ctx.conventions).build(
+                    template_id, template_params
+                )
             except QueryTemplateError as exc:
                 raise ValueError(
                     f"cannot build query for {service}/{template_id}: {exc}"
@@ -1359,11 +1371,12 @@ def _discrimination_items(request: InvestigationRequest, ctx: "RunContext",
                 "query_template_id": "qt-error-rate-focused",
                 "service": service,
                 "tier": INVESTIGATION_TIER,
-                "rendered_query": (
-                    'sum(rate(http_requests_total{service="%s",status=~"5.."}[1m])) / '
-                    'sum(rate(http_requests_total{service="%s"}[1m]))  # focused ±%ds'
-                    % (service, service, FOCUSED_WINDOW_SECONDS)
-                ),
+                # 与 qt-error-rate-v1 共用同一个渲染函数：这里的 PromQL 曾经是
+                # 手抄的第二份，改约定时会漏掉它，于是"首轮查得到、判别轮查不到"。
+                "rendered_query": render_error_rate(
+                    service, ctx.conventions or TelemetryConventions()
+                )
+                + f"  # focused ±{FOCUSED_WINDOW_SECONDS}s",
             }
         )
     items.extend(_profile_items(request, ctx, latency_services))
