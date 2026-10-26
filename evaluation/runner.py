@@ -26,6 +26,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+from evaluation.decomposition import baseline_comparison
 from evaluation.harness import run_scenario
 from evaluation.chance import compute_chance_metrics
 from evaluation.metrics import aggregate
@@ -156,6 +157,26 @@ def main(argv: list[str] | None = None) -> int:
         f"lift@1={_fmt_lift(chance.lift_at_1)} "
         f"lift@3={_fmt_lift(chance.lift_at_3)} lift@5={_fmt_lift(chance.lift_at_5)}"
     )
+    # 漏斗：把"答错了"拆成"没看见 / 没进候选 / 排错了"三种，修法完全不同
+    print(
+        f"     漏斗：观测到 {agg.observed_rate:.2f} → 进入候选 {agg.candidate_coverage:.2f} "
+        f"→ 排第一 {agg.ac_at_1:.2f}"
+    )
+    # 朴素基线：neither 看时间、拓扑，也不看日志 —— 我们必须赢过它们，
+    # 否则"逐跳证据推理"这件事没有体现在结果上。
+    print(
+        f"     朴素基线 AC@1：峰值最高 {agg.peak_heuristic_at_1:.2f}"
+        f"（表态 {agg.peak_heuristic_cases}/{len([o for o in outcomes if o.fault_injected])}）"
+        f" ｜ 最早异常 {agg.earliest_heuristic_at_1:.2f}"
+        f"（表态 {agg.earliest_heuristic_cases}/{len([o for o in outcomes if o.fault_injected])}）"
+    )
+    # 同分母对照：基线弃权的场景不算它输，我们也不能拿它撑分
+    comparison = baseline_comparison(outcomes)
+    for name, row in comparison.items():
+        print(
+            f"     同分母对照 {name}：我们 {row['ours_at_1']:.2f} vs 基线 "
+            f"{row['theirs_at_1']:.2f}（{row['decided']} 个场景，基线弃权 {row['abstained']}）"
+        )
     if chance.candidate_pool_size <= 5:
         print(
             f"     NOTE: candidate pool is only {chance.candidate_pool_size}; "
@@ -172,6 +193,12 @@ def main(argv: list[str] | None = None) -> int:
         "scenarios": [o.to_dict() for o in outcomes],
         "aggregate": agg.to_dict(),
         "chance_baseline": chance.to_dict(),
+        "funnel": {
+            "observed": agg.observed_rate,
+            "in_candidates": agg.candidate_coverage,
+            "top1": agg.ac_at_1,
+        },
+        "naive_baselines": baseline_comparison(outcomes),
         "note": "synthetic scenarios; not a real-world accuracy claim",
     }
     args.out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

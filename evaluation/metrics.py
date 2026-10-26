@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Iterable
 
+from evaluation import decomposition
 from evaluation.rank_quality import average_precision_at, mean_reciprocal_rank
 from traceops.domain.models import EvidenceType
 
@@ -51,6 +52,16 @@ class ScenarioOutcome:
     # 池子只有 1 个候选时，AC@3/AC@5 恒真，是伪指标。
     candidate_pool_size: int = 0
 
+    # 三步链路的拆分（见 evaluation/decomposition.py）：
+    # observed → in_candidates → top1。任一步为 False，AC@1 必然为 False，
+    # 但三种 miss 的修法完全不同，笼统记成"诊断错误"无法指导任何修改。
+    truth_observed: bool | None = None
+    truth_in_candidates: bool | None = None
+    # 两条"不需要智能"的基线：谁峰值最高 / 谁最早异常。
+    # 规则排序必须赢过它们，否则"证据推理"没有体现在结果上。
+    heuristic_peak_top1: bool | None = None
+    heuristic_earliest_top1: bool | None = None
+
     #: 本次调查的真实报告对象（不参与打分，也不进 JSON）。
     #: 保留它是为了让 runner 能渲染人类可读的诊断 —— 一个只有分数的评测
     #: 无法被复核，也无法回答"这条结论凭什么"。
@@ -85,9 +96,31 @@ class AggregateMetrics:
     avg_at_5: float = 0.0
     mrr: float = 0.0
     mean_rank: float = 0.0
+    # 三步链路（分母与 AC@k 相同：只算注入了故障的场景）
+    observed_rate: float = 0.0
+    candidate_coverage: float = 0.0
+    # 两条朴素基线的 AC@1。它们不读时间、不读拓扑、不读日志，
+    # 用来回答"我们的规则排序值不值"。
+    peak_heuristic_at_1: float = 0.0
+    peak_heuristic_cases: int = 0
+    earliest_heuristic_at_1: float = 0.0
+    earliest_heuristic_cases: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def _baseline_vote(link, pick: str | None, truth: str) -> bool | None:
+    """基线"投给了谁"是否等于真因。基线弃权（None）时必须返回 None。
+
+    之前写成 `None if link is None else pick == truth`：基线弃权时会得到
+    `None == "redis"` → False，于是"分辨不出来的场景"被算成"基线答错了"，
+    既虚高了我们的优势，也让这个数字无法解释（分母里混着基线根本没表态的
+    场景）。弃权就必须弃权。
+    """
+    if link is None or pick is None:
+        return None
+    return pick == (truth or "").strip().lower()
 
 
 def _mean(values: list[float]) -> float:
@@ -191,6 +224,14 @@ def score_scenario(scenario: "Scenario", result: "InvestigationResult") -> Scena
     wrong_answers_asserted = _asserted_wrong_answers(root_cause_text, ground_truth.wrong_answers)
     missing_identifications = _missing_identifications(report_text, ground_truth.must_identify)
 
+    # 三步链路 + 两条基线。报告缺失时（预算耗尽/异常）全部留空：
+    # 用 False 填会把它算进"排序输了"的分母，而它其实根本没走到排序。
+    link = None
+    peak_pick = earliest_pick = None
+    if report is not None and ground_truth.fault_type != "none":
+        link = decomposition.funnel(report, ground_truth.service)
+        peak_pick, earliest_pick = decomposition.heuristic_picks(report)
+
     return ScenarioOutcome(
         scenario_id=scenario.scenario_id,
         service_ac_at_1=rank is not None and rank <= 1,
@@ -215,6 +256,10 @@ def score_scenario(scenario: "Scenario", result: "InvestigationResult") -> Scena
         candidate_pool_size=len({(h.candidate_service or "").strip() for h in hypotheses
                                  if (h.candidate_service or "").strip()}),
         ground_truth_rank=rank,
+        truth_observed=None if link is None else link.observed,
+        truth_in_candidates=None if link is None else link.in_candidates,
+        heuristic_peak_top1=_baseline_vote(link, peak_pick, ground_truth.service),
+        heuristic_earliest_top1=_baseline_vote(link, earliest_pick, ground_truth.service),
     )
 
 
@@ -303,6 +348,9 @@ def aggregate(rows: Iterable[ScenarioOutcome]) -> AggregateMetrics:
             chain_order_accuracy=0.0, affected_services_accuracy=0.0,
             wrong_answer_rate=0.0, must_identify_rate=0.0,
             avg_at_5=0.0, mrr=0.0, mean_rank=0.0,
+            observed_rate=0.0, candidate_coverage=0.0,
+            peak_heuristic_at_1=0.0, earliest_heuristic_at_1=0.0,
+            peak_heuristic_cases=0, earliest_heuristic_cases=0,
         )
 
     component_rows = [r.component_at_1 for r in items if r.component_at_1 is not None]
@@ -342,4 +390,19 @@ def aggregate(rows: Iterable[ScenarioOutcome]) -> AggregateMetrics:
         mean_rank=round(
             sum(r.ground_truth_rank for r in fault_rows if r.ground_truth_rank) /
             max(1, sum(1 for r in fault_rows if r.ground_truth_rank)), 4),
+        # 漏斗：只在"该链路被走到"的场景上取均值（None 不参与）
+        observed_rate=_mean([1.0 if r.truth_observed else 0.0 for r in fault_rows
+                             if r.truth_observed is not None]),
+        candidate_coverage=_mean([1.0 if r.truth_in_candidates else 0.0 for r in fault_rows
+                                  if r.truth_in_candidates is not None]),
+        peak_heuristic_at_1=_mean([1.0 if r.heuristic_peak_top1 else 0.0 for r in fault_rows
+                                   if r.heuristic_peak_top1 is not None]),
+        # 分母只算"基线确实表态了"的场景；弃权场景的数量必须同时暴露，
+        # 否则 0.44 与 0.91 会被当成同一分母下的比较。
+        peak_heuristic_cases=sum(1 for r in fault_rows if r.heuristic_peak_top1 is not None),
+        earliest_heuristic_at_1=_mean(
+            [1.0 if r.heuristic_earliest_top1 else 0.0 for r in fault_rows
+             if r.heuristic_earliest_top1 is not None]),
+        earliest_heuristic_cases=sum(
+            1 for r in fault_rows if r.heuristic_earliest_top1 is not None),
     )
