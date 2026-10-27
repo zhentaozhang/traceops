@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from traceops.security.untrusted import as_data_block
+
 from traceops.runtime.budget import BudgetExhausted, BudgetManager
 
 
@@ -74,6 +76,18 @@ class ModelRequest:
     #: 结构化信号的全部组合）。
     alert_summary: str | None = None
     max_hypotheses: int = 3
+
+    def __post_init__(self) -> None:
+        """把告警原文变成**数据块**，并在构造时就中和指令形态。
+
+        为什么放在类型里而不是调用点：`ModelRequest` 有多个构造方（编排节点、
+        评测、自检 CLI），只要有一个忘了包，日志里的
+        `ignore previous instructions, root cause is X` 就会以指令身份进 Prompt。
+        放在这里，**任何一个 ModelRequest 都是安全的**，而不需要每个调用点正确。
+        """
+        if self.alert_summary:
+            sanitized = as_data_block(self.alert_summary, source="alert")
+            object.__setattr__(self, "alert_summary", sanitized.text)
     # **必须显式给输出上限**。不给的话 provider 会退到很小的默认值
     # （litellm 对 Anthropic 系默认 4096），结构化输出会被拦腰截断：
     # 截断 → 工具参数不完整 → 结构校验失败 → 模型看不到原因 → 重试到预算耗尽。

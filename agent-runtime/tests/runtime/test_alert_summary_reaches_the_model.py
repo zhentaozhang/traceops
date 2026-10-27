@@ -135,9 +135,18 @@ class TestTheModelActuallySeesIt:
         return model
 
     def test_the_model_request_carries_the_alert_text(self):
+        """原文必须到达模型，但**包在数据块里**（见 `security/untrusted.py`）。
+
+        直接比较相等会锁死"原文进 Prompt"这个更差的性质：告警文本是外部输入，
+        里面可以写 `ignore previous instructions`。所以这里断言两件事：
+        线索逐字保留、外层有数据块标记。
+        """
         model = self._run(alert_summary=SUMMARY)
         assert model.calls, "模型没有被调用，这个测试就没证明任何事"
-        assert model.calls[0].alert_summary == SUMMARY
+        seen = model.calls[0].alert_summary or ""
+        assert SUMMARY in seen
+        assert seen.startswith("<untrusted-data")
+        assert seen.endswith("</untrusted-data>")
 
     def test_without_a_summary_the_model_is_told_nothing(self):
         model = self._run(alert_summary=None)
