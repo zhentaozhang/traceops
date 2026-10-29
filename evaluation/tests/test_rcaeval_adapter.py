@@ -174,3 +174,31 @@ class TestAdapterDrivesRealInvestigation:
         assert investigation.report is not None
         # 证据数量要能被报告引用（不是空跑）
         assert investigation.report.evidence or investigation.report.missing_data
+
+
+class TestInjectTimeTimezone:
+    """RCAEval 的时间戳没有时区标注，官方 FAQ 说明按 UTC+8 记录。
+
+    为什么这条值得单独测：`datetime.fromisoformat(naive).astimezone(UTC)`
+    会按**本机时区**解释。在 TZ=UTC 的容器里它静默变成 UTC（错 8 小时），
+    在开发机（Asia/Shanghai）上又恰好对 —— 于是"在我机器上是对的"。
+    而根因发生时间是我们答案三元组的一部分。
+    """
+
+    def test_naive_iso_time_is_utc_plus_8(self, tmp_path):
+        from datetime import UTC, datetime
+
+        from evaluation.adapters.rcaeval_adapter import _parse_inject_time
+
+        path = tmp_path / "inject_time.txt"
+        path.write_text("2026-11-02T08:10:00", encoding="utf-8")
+        assert _parse_inject_time(path) == datetime(2026, 11, 2, 0, 10, tzinfo=UTC)
+
+    def test_iso_time_with_an_offset_is_trusted(self, tmp_path):
+        from datetime import UTC, datetime
+
+        from evaluation.adapters.rcaeval_adapter import _parse_inject_time
+
+        path = tmp_path / "inject_time.txt"
+        path.write_text("2026-11-02T00:10:00Z", encoding="utf-8")
+        assert _parse_inject_time(path) == datetime(2026, 11, 2, 0, 10, tzinfo=UTC)

@@ -35,9 +35,8 @@ data/{dataset}/{service}_{metric}/{case}/
 from __future__ import annotations
 
 import csv
-import json
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -93,8 +92,20 @@ class RcaEvalCase:
         }
 
 
+#: RCAEval 官方 FAQ：**所有时间戳按 UTC+8 记录**。
+#:
+#: 为什么要在代码里写死：`datetime.fromisoformat("2026-03-12T14:32:00").astimezone(UTC)`
+#: 对**无时区**的时间会按**本机时区**解释。在 TZ=UTC 的容器里它静默变成 UTC，
+#: 在开发机（Asia/Shanghai）上又恰好对 —— 于是"在我机器上是对的"。
+#: 我们的答案三元组含"根因发生时间"，错 8 小时就是答案错。
+RCAEVAL_UTC_OFFSET = timedelta(hours=8)
+
+
 def _parse_inject_time(path: Path) -> datetime | None:
-    """`inject_time.txt` 里是一个 unix 秒或 ISO 时间。读不出时返回 None。"""
+    """`inject_time.txt` 里是一个 unix 秒或 ISO 时间。读不出时返回 None。
+
+    无时区的 ISO 时间按 RCAEval 的约定解释为 UTC+8，再转成 UTC。
+    """
     if not path.exists():
         return None
     raw = path.read_text(encoding="utf-8").strip()
@@ -105,9 +116,12 @@ def _parse_inject_time(path: Path) -> datetime | None:
     except ValueError:
         pass
     try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(UTC)
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone(RCAEVAL_UTC_OFFSET)).astimezone(UTC)
+    return parsed.astimezone(UTC)
 
 
 def _read_metric_rows(data_csv: Path) -> tuple[list[float], dict[str, list[float | None]]]:
