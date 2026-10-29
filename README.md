@@ -106,6 +106,27 @@ python -m traceops.cli.worker --telemetry-conventions ./conventions.json ...
 拼错字段名会被拒绝并列出可用字段（`unknown convention field(s): ...`）——
 静默沿用默认值会让"约定不匹配"伪装成"系统很健康"。
 
+**约定管"怎么查"，清单管"能查什么"。** 只接了 Prometheus 的部署应当声明清单，
+否则计划里照样有日志与 trace 两项，每次调查多两条"查了但失败"，看起来像数据缺失：
+
+```json
+{
+  "sources": {
+    "prometheus": {"capability": "metric", "when_absent": "指标源缺失：错误率无法观测"},
+    "loki": {"capability": "log", "when_absent": "日志源缺失：连接池这类机制无法确认"}
+  }
+}
+```
+
+```bash
+python -m traceops.cli.worker --datasource-manifest ./sources.json ...
+# 或 TRACEOPS_DATASOURCE_MANIFEST=./sources.json
+```
+
+报告里因此会出现三种互不相同的"没有数据"：`datasource_gaps`（声明了但没接，属配置漂移）、
+`missing_data` 里的"这个部署没有日志源"（部署事实）、`no_data_queries`（查了、确实是空的，
+可以拿来反驳假设）。细节见 `架构说明` §24 与 `运行手册` §3.5。
+
 `scripts/verify_stack_config` 只能校验仓库自带的演示栈配置（`demo-environment/observability`）；
 **你自己的集群要自己核这几条** —— 核完再谈诊断质量，否则查回来的每一份数据都会被判成
 "空结果"，而报告只能说"查了但没有"。

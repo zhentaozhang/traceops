@@ -520,8 +520,25 @@ _TIME_RANGE_PROPS = {
 }
 
 
-def register_builtin_tools(gw: ToolGateway, adapters: Any | None = None) -> None:
-    """注册 P0 内置工具。adapters 未提供时实现抛 ToolNotConfigured。"""
+#: 内置工具 → 它属于哪一类证据。清单按这一列决定"这个工具该不该注册"。
+_TOOL_CAPABILITY: dict[str, str] = {
+    "query_metric_series": "metric",
+    "query_service_error_rate": "metric",
+    "query_service_logs": "log",
+    "query_service_traces": "trace",
+    "query_service_profile": "profile",
+}
+
+
+def register_builtin_tools(gw: ToolGateway, adapters: Any | None = None,
+                           manifest: Any | None = None) -> None:
+    """注册 P0 内置工具。adapters 未提供时实现抛 ToolNotConfigured。
+
+    `manifest` 给定时只注册清单里声明过的能力：注册一个本部署永远查不到的源，
+    等于让每次调查都多一条 `missing_data` —— 报告会说"数据缺失"，而真相是
+    "这个部署没有这个源"。为 None 时注册全部（与改动前完全一致）。
+    """
+    allowed = None if manifest is None else set(manifest.capabilities_in_use())
     tools = [
         ToolSpec(
             name="query_metric_series",
@@ -603,4 +620,6 @@ def register_builtin_tools(gw: ToolGateway, adapters: Any | None = None) -> None
         ),
     ]
     for tool in tools:
+        if allowed is not None and _TOOL_CAPABILITY.get(tool.name) not in allowed:
+            continue
         gw.register(tool)

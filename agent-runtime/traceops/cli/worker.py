@@ -62,6 +62,7 @@ from traceops.tools.gateway import (
     purge_spill,
     register_builtin_tools,
 )
+from traceops.tools.manifest import DatasourceManifest, load_manifest
 from traceops.topology.graph import TopologyError, ServiceTopology
 
 
@@ -269,6 +270,14 @@ def _conventions(args) -> TelemetryConventions | None:
     return load_conventions(path)
 
 
+def _datasources(args) -> "DatasourceManifest | None":
+    """数据源清单。不给就用演示栈清单（三类必备 + 剖析可选）。"""
+    path = getattr(args, "datasource_manifest", None)
+    if not path:
+        return None
+    return load_manifest(path)
+
+
 def build_run_context(request: InvestigationRequest, *, args, store, adapters,
                       topology: ServiceTopology | None,
                       memory: "IncidentMemory | None" = None,
@@ -306,6 +315,9 @@ def build_run_context(request: InvestigationRequest, *, args, store, adapters,
         # 名字对不上时查询会返回空，而空结果会被判成"阴性观测" —— 所以
         # 这件事必须是可声明的，不能指望部署方改源码。
         conventions=_conventions(args),
+        # 数据源清单：--datasource-manifest 指定时按它决定"查哪几类证据"，
+        # 并在报告里说清"这个部署缺哪个源"。不给 = 演示栈清单。
+        manifest=_datasources(args),
         # 会话记录：给目录就落 `<run_id>.jsonl`（不落文件名是因为 run id
         # 只在 request 里，见 `graph._open_session`）。
         session=getattr(args, "session_log_dir", None) or None,
@@ -437,6 +449,11 @@ def main(argv: list[str] | None = None) -> int:
                         default=os.environ.get("TRACEOPS_TELEMETRY_CONVENTIONS"),
                         help="JSON file declaring this cluster's metric/label names "
                              "; omit for the demo stack conventions")
+    parser.add_argument("--datasource-manifest",
+                        default=os.environ.get("TRACEOPS_DATASOURCE_MANIFEST"),
+                        help="JSON file declaring which data sources this deployment has "
+                             "and what the report should claim when one is missing "
+                             "; omit for the demo stack manifest")
     parser.add_argument("--session-log-dir",
                         default=os.environ.get("TRACEOPS_SESSION_LOG_DIR"),
                         help="write one <run_id>.jsonl per investigation here (tool calls, "

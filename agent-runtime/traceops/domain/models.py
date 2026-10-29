@@ -307,6 +307,12 @@ class RCAReport(BaseModel):
     #: 为什么报告要指它：报告回答"结论是什么"，会话回答"怎么走到这里的"。
     #: 没有这个指针，复盘时只能在进程日志里翻 —— 而进程日志重启即丢。
     session_ref: str | None = None
+    #: 数据源缺口：清单里声明了、本部署却没有的源。
+    #:
+    #: 与 `missing_data` 的区别：`missing_data` 是"这次查的时候缺了什么"，
+    #: 这里是"这个部署根本查不了什么"。混在一起会让"没有日志源"看起来像
+    #: "这次日志查询失败了"，而前者等下一条告警也不会变好。
+    datasource_gaps: list[dict] = Field(default_factory=list)
     generated_at: datetime = Field(default_factory=_utcnow)
 
     def all_evidence_ids(self) -> set[str]:

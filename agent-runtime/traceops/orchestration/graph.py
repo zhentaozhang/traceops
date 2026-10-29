@@ -230,6 +230,12 @@ class RunContext:
     #: 记在上下文里而不是节点里：一个 run 只能有一条"用的是哪套策略"，
     #: 每个节点各算一次会得到互相矛盾的结论。
     strategy_change: dict[str, Any] | None = None
+    #: 数据源清单（`traceops.tools.manifest.DatasourceManifest`）。
+    #:
+    #: 默认 None = 演示栈清单：指标/日志/trace 三类必备、剖析可选。
+    #: 它决定"查哪几类证据"以及"缺了某类证据时报告该怎么说"；
+    #: 与 `conventions` 是两个问题（那份管"怎么查"，这份管"能查什么"）。
+    manifest: Any = None
 
     def strategy_components(self) -> dict[str, Any]:
         """本次调查的**决策策略**组成（阈值、权重、闸门、提示词）。
@@ -454,7 +460,9 @@ def _plan_items(request: InvestigationRequest, ctx: "RunContext") -> list[dict[s
     而不是"一开始就少查几类数据"。
     """
     items: list[dict[str, Any]] = []
-    templates = list(_PLAN_TEMPLATES)
+    templates = [(tool, source_id, evidence_type, template_id)
+                 for tool, source_id, evidence_type, template_id in _PLAN_TEMPLATES
+                 if _capability_planned(ctx, _PLAN_TEMPLATE_CAPABILITY[tool])]
     for service, tier in _scope_services(request, ctx):
         base = {
             "service": service,
@@ -507,6 +515,40 @@ def _adapter_supports(ctx: "RunContext", capability: str) -> bool:
     return capability in declared
 
 
+#: 计划模板 → 它属于哪一类证据（与 `tools/manifest.py` 的能力词一致）。
+_PLAN_TEMPLATE_CAPABILITY: dict[str, str] = {
+    "query_service_error_rate": "metric",
+    "query_service_logs": "log",
+    "query_service_traces": "trace",
+}
+
+
+def _active_manifest(ctx: "RunContext") -> Any:
+    """本次调查的数据源清单。None → 演示栈清单（三类必备 + 剖析可选）。"""
+    from traceops.tools.manifest import default_manifest
+
+    manifest = getattr(ctx, "manifest", None)
+    return manifest if manifest is not None else default_manifest()
+
+
+def _capability_planned(ctx: "RunContext", capability: str) -> bool:
+    """这一类证据该不该进计划。
+
+    两个条件同时成立才查：**部署方声明了它**（清单）且**运行时确实能查它**
+    （适配器没有显式否认）。缺任一条就跳过 —— 跳过时报告会通过
+    `datasource_gaps` 说清"没查是因为这个部署没有这个源"，而不是记一条
+    "查了没结果"。后者会被当成阴性证据用来支持 `REFUTED`，而"这个集群
+    根本不产这类数据"什么也证明不了。
+    """
+    from traceops.tools.manifest import present_capabilities
+
+    if not _active_manifest(ctx).supports(capability):
+        return False
+    available = present_capabilities(getattr(ctx, "adapters", None))
+    # 适配器没声明能力表（测试替身、老代码）：不否认即视为能查。
+    return available is None or capability in available
+
+
 def _change_items(request: InvestigationRequest) -> list[dict[str, Any]]:
     """变更流水 → 合成事件证据项（不经过数据源）。"""
     records: list[dict[str, Any]] = []
@@ -552,7 +594,7 @@ def _profile_items(request: InvestigationRequest, ctx: "RunContext",
 
     为什么要求适配器声明能力：见 `_adapter_supports`。
     """
-    if not _adapter_supports(ctx, "profile"):
+    if not _capability_planned(ctx, "profile") or not _adapter_supports(ctx, "profile"):
         return []
     tool, source_id, evidence_type, template_id = _DEEPEN_TEMPLATES[0]
     start = request.window_start.isoformat()
@@ -1765,6 +1807,7 @@ def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str,
             "(this report covers one alert's chain only): " + ", ".join(outside)
         )
     _report_missing_topology(state, ctx, missing)
+    _report_missing_sources(ctx, missing)
     report = build_report(
         investigation_run_id=request.investigation_run_id,
         hypotheses=state.get("hypotheses", []),
@@ -1804,6 +1847,7 @@ def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str,
         topology_drift=_topology_drift(state, ctx),
         cache_hits=list(state.get("cache_hits", [])),
         session_ref=_session_ref(ctx),
+        datasource_gaps=_datasource_gaps(ctx),
     )
     _remember_outcome(state, ctx)
     return {"report": report, "status": report.diagnosis_status}
@@ -1833,6 +1877,38 @@ def _report_missing_topology(state: InvestigationState, ctx: RunContext,
             "declared edges were not exercised in this window "
             f"(not evidence that they are down): {pairs}"
         )
+
+
+def _datasource_gaps(ctx: RunContext) -> list[dict[str, Any]]:
+    """清单里声明了、运行时却没有的源。
+
+    与"查了没结果"是两件事：前者说明这一整类证据在本部署里不存在，
+    后者说明看过而且没东西。分辨不出来的时候，报告会把缺源读成阴性证据。
+    """
+    from traceops.tools.manifest import present_capabilities
+
+    return _active_manifest(ctx).gaps(present_capabilities(getattr(ctx, "adapters", None)))
+
+
+def _report_missing_sources(ctx: RunContext, missing: list[str]) -> None:
+    """把缺源写进 missing_data（只写 `required` 的）。
+
+    可选源（例如剖析）缺失不影响结论成立与否，写进 missing_data 只会稀释
+    真正重要的缺失；但它们仍然出现在报告的 `datasource_gaps` 里 —— 想知道
+    "还能查什么"的人该看见全部缺口，想知道"这份结论少看了什么"的人
+    只该看见必需的。
+    """
+    for gap in _datasource_gaps(ctx):
+        if not gap.get("required"):
+            continue
+        missing.append(
+            f"data source '{gap['source']}' is declared but unavailable: {gap['when_absent']}")
+    # 没声明的基线证据类别也要说：读者默认"报告没提就是查过没事"，
+    # 而这个部署里这类证据根本不可能存在（不是这次没查到）。
+    for capability in _active_manifest(ctx).absent_baseline_capabilities():
+        missing.append(
+            f"this deployment declares no {capability} source, so {capability} evidence "
+            f"cannot appear in this report (a deployment fact, not a finding)")
 
 
 def _topology_drift(state: InvestigationState, ctx: RunContext) -> dict[str, Any]:
@@ -1923,7 +1999,7 @@ def _remember_outcome(state: InvestigationState, ctx: RunContext) -> None:
 
 def _build_gateway(ctx: RunContext) -> ToolGateway:
     gateway = ToolGateway(cache=ctx.cache)
-    register_builtin_tools(gateway, ctx.adapters)
+    register_builtin_tools(gateway, ctx.adapters, _active_manifest(ctx))
     return gateway
 
 
