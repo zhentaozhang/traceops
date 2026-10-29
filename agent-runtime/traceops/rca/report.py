@@ -79,6 +79,7 @@ def build_report(
     priors: list[dict] | None = None,
     topology_drift: dict | None = None,
     cache_hits: list[dict] | None = None,
+    session_ref: str | None = None,
 ) -> RCAReport:
     """组装并校验诊断报告。
 
@@ -246,6 +247,7 @@ def build_report(
         priors=list(priors or []),
         topology_drift=dict(topology_drift or {}),
         cache_hits=list(cache_hits or []),
+        session_ref=session_ref,
     )
 
     # 必须绑定本次事故：只查"ID 在 Store 里存在"会放过**引用了别处证据**的报告。

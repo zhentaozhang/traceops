@@ -302,6 +302,11 @@ class RCAReport(BaseModel):
     #: 只说"这里被截断了"等于把问题留给下一个人自己猜 —— 而这个人
     #: 通常是在事故复盘里、且没有当时的上下文。
     degraded_reads: list[dict] = Field(default_factory=list)
+    #: 本次调查的会话记录文件（`session.jsonl`）。None = 没有开启记录。
+    #:
+    #: 为什么报告要指它：报告回答"结论是什么"，会话回答"怎么走到这里的"。
+    #: 没有这个指针，复盘时只能在进程日志里翻 —— 而进程日志重启即丢。
+    session_ref: str | None = None
     generated_at: datetime = Field(default_factory=_utcnow)
 
     def all_evidence_ids(self) -> set[str]:

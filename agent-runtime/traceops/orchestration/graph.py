@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import logging
@@ -219,6 +220,11 @@ class RunContext:
     #: 默认 None = 不缓存。缓存改变的是"多久之前抓的数据可以冒充现在这份"，
     #: 必须是显式选择；而且命中时证据的 `collected_at` 会变成**当初**取数的时刻。
     cache: Any = None
+    #: 调查会话记录（`traceops/runtime/session.py` 的 `SessionRecorder`）。
+    #:
+    #: 默认 None = 不记录：报告只写结论，写不写"怎么走到结论的"应该由部署方决定。
+    #: 给定时每次调查落一份 `<run_id>.jsonl`，并在报告里留 `session_ref`。
+    session: Any = None
     #: 本轮开始时观察到的策略变更（None = 与上一次观察相比没变，或没有历史）。
     #:
     #: 记在上下文里而不是节点里：一个 run 只能有一条"用的是哪套策略"，
@@ -792,6 +798,11 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
                                    "run_id": request.investigation_run_id,
                                    "incident_id": request.incident_id},
                             exc_info=True)
+                _session_record(
+                    ctx, "tool_call", tool=item["tool"], params=item["params"], ok=False,
+                    payload_bytes=None, cache_hit=False,
+                    error=f"{type(exc).__name__}: {str(exc)[:300]}",
+                )
                 if ctx.health is not None:
                     # 记进**跨调查**的健康表：单次 missing_data 说不清
                     # "这个数据源今天一直不行"，而这正是 abstention 归因的关键。
@@ -803,6 +814,11 @@ def _collect_node(state: InvestigationState, config: RunnableConfig) -> dict[str
                 if source_id and source_id not in failed_sources:
                     failed_sources.append(source_id)
                 continue
+            _session_record(
+                ctx, "tool_call", tool=item["tool"], params=item["params"], ok=True,
+                payload_bytes=_payload_size(raw),
+                cache_hit=cache_note is not None, error=None,
+            )
             if cache_note is not None:
                 # 命中缓存必须留在报告里：这份证据的 `collected_at` 是**当初**
                 # 取数的时刻，读者要能看出它不是刚抓的。
@@ -1073,6 +1089,36 @@ def _evidence_summary(evidence_list: list[Evidence]) -> dict[str, Any]:
                         entry["slowest_operations"].append(name)
                 entry["max_duration_ms"] = max(entry.get("max_duration_ms", 0), duration_ms)
     return summary
+
+
+def _payload_size(payload: Any) -> int | None:
+    """返回体字节数（只记大小，不记内容：载荷可能有几百 KB）。"""
+    if payload is None:
+        return None
+    try:
+        return len(json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _session_ref(ctx: Any) -> str | None:
+    """报告里指回会话文件的路径（没开会话记录时为 None）。"""
+    session = getattr(ctx, "session", None)
+    if session is None or not getattr(session, "enabled", False):
+        return None
+    path = getattr(session, "path", None)
+    return str(path) if path is not None else None
+
+
+def _session_record(ctx: Any, kind: str, **fields: Any) -> None:
+    """记一条会话事件。**永不抛异常** —— 记录失败不该让调查失败。"""
+    session = getattr(ctx, "session", None)
+    if session is None:
+        return
+    try:
+        session.record(kind, **fields)
+    except Exception as exc:  # noqa: BLE001 - 记录失败是外部问题，不是调查问题
+        log.warning("session record failed", extra={"kind": kind, "reason": str(exc)})
 
 
 def _metric_peak(data: dict[str, Any]) -> float | None:
@@ -1757,6 +1803,7 @@ def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str,
         priors=_priors(state, ctx),
         topology_drift=_topology_drift(state, ctx),
         cache_hits=list(state.get("cache_hits", [])),
+        session_ref=_session_ref(ctx),
     )
     _remember_outcome(state, ctx)
     return {"report": report, "status": report.diagnosis_status}
@@ -1976,6 +2023,72 @@ def run_investigation(request: InvestigationRequest, ctx: RunContext, *,
     """
     if ctx.gateway is None:
         ctx.gateway = _build_gateway(ctx)
+    session = _open_session(ctx, request.investigation_run_id)
+    try:
+        return _run_recording(request, ctx, session, thread_id=thread_id,
+                              checkpointer=checkpointer, on_node=on_node)
+    finally:
+        _close_session(session)
+
+
+def _open_session(ctx: RunContext, run_id: str) -> Any:
+    """把 `ctx.session` 变成一份真的会话记录（目录或已构造的 recorder 都接受）。
+
+    允许传目录而不是文件：run id 只有在 request 里才有，而调用方（worker CLI）
+    在构造 RunContext 时还不知道它 —— 让它去猜文件名只会制造两套命名规则。
+    """
+    from traceops.runtime.session import SessionRecorder, recorder_for
+
+    session = getattr(ctx, "session", None)
+    if session is None or isinstance(session, SessionRecorder):
+        if session is not None:
+            session.run_id = session.run_id or run_id
+            session.__enter__()
+        return session
+    recorder = recorder_for(run_id, directory=session)
+    ctx.session = recorder
+    recorder.__enter__()
+    return recorder
+
+
+def _close_session(session: Any) -> None:
+    if session is not None and getattr(session, "enabled", False):
+        session.__exit__(None, None, None)
+
+
+def _run_recording(request: InvestigationRequest, ctx: RunContext, session: Any, *,
+                   thread_id: str | None, checkpointer: Any | None, on_node: Any) -> InvestigationResult:
+    if session is not None:
+        _session_record(
+            ctx, "investigation.start",
+            incident_id=request.incident_id,
+            service_hint=request.service_hint,
+            window_start=request.window_start.isoformat(),
+            window_end=request.window_end.isoformat(),
+            priority=getattr(request, "priority", None),
+            alert_summary_present=getattr(request, "alert_summary", None) is not None,
+            max_tool_calls=ctx.budget.max_tool_calls,
+        )
+    result = _run_graph(request, ctx, thread_id=thread_id, checkpointer=checkpointer, on_node=on_node)
+    if session is not None:
+        report = result.report
+        _session_record(
+            ctx, "investigation.end",
+            status=result.status,
+            diagnosis=report.diagnosis_status if report is not None else None,
+            evidence=len(report.evidence) if report is not None else 0,
+            tool_calls=result.tool_calls,
+            tokens_used=result.tokens_used,
+            # +1：这一行本身还没写出去（`record` 先取字段再落盘），
+            # 报的数必须等于文件里的行数，否则对不上就会被当成"丢了日志"。
+            events_written=getattr(session, "written", 0) + 1,
+            session_ref=_session_ref(ctx),
+        )
+    return result
+
+
+def _run_graph(request: InvestigationRequest, ctx: RunContext, *, thread_id: str | None,
+               checkpointer: Any | None, on_node: Any) -> InvestigationResult:
     # 在**跑图之前**记一次策略：报告随后会带上"这一轮相对上一轮改了什么"。
     # 放在图里的话，每个节点都会各自观察一次，同一轮会得到互相矛盾的结论。
     ctx.observe_strategy()
