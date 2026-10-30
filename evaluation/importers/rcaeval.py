@@ -29,6 +29,20 @@ data/{dataset}/{service}_{metric}/{case}/
 * 未观测处是 NaN，官方明确**不 forward-fill**；
 * 官方 FAQ 明确：**所有时间戳按 UTC+8 记录**。
 
+## 两种布局
+
+| 布局 | 形状 | 来源 |
+| --- | --- | --- |
+| `csv` | `{service}_{metric}/{case}/data.csv`，每个 (service, metric) 一个目录 | Zenodo / figshare 的原始数据 |
+| `parquet` | 一个案例一个目录，目录内 `metrics.parquet`（`time` + 每列 `{service}_{metric}`） | HuggingFace `phamquiluan/RCAEval`（zstd 压缩版，33MB 起步而非 38GB） |
+
+两种布局都用同一套 `_resample` / `_normalise` / `column_target`，所以分数可比；
+差别只在"从哪个文件读列"和"真因标签从目录名怎么解析"。
+
+parquet 读取用**惰性导入的 pyarrow**：仓库其余部分刻意只依赖标准库 + pydantic
++ jsonschema，为了一个可选的数据集格式把 pyarrow 变成硬依赖不值得。没装时
+抛 `RcaEvalDataMissing` 并明说要装什么。
+
 ## 三处必须说明的转换（不说明就等于偷偷改题）
 
 1. **时间**：`inject_time.txt` 里若是无时区的字符串，按 UTC+8 解释再转 UTC。
@@ -93,14 +107,47 @@ class ImportedCase:
     notes: tuple[str, ...]
 
 
-def _read_columns(data_csv: Path) -> tuple[list[float], dict[str, list[float | None]]]:
-    """读宽表。**故意复用适配器那份**，不另写一个解析器。
+def _read_columns(path: Path) -> tuple[list[float], dict[str, list[float | None]]]:
+    """读宽表（`data.csv` 或 `metrics.parquet`）。
 
-    理由：这一层存在的意义是"真实数据走与被信任数字相同的路径"，
-    如果这里用另一套解析规则（比如把 NaN 读成 0），同一份 CSV 在
-    "忠实值"与"可比分数"两条路上就会给出不同的观测 —— 那正好毁掉可比性。
+    CSV 路径**故意复用适配器那份**，不另写一个解析器：这一层存在的意义是
+    "真实数据走与被信任数字相同的路径"，如果这里用另一套解析规则（比如把
+    NaN 读成 0），同一份数据在"忠实值"与"可比分数"两条路上就会给出不同的
+    观测 —— 那正好毁掉可比性。
     """
-    return _read_metric_rows(data_csv)
+    if path.suffix == ".parquet":
+        return _read_parquet(path)
+    return _read_metric_rows(path)
+
+
+def _read_parquet(path: Path) -> tuple[list[float], dict[str, list[float | None]]]:
+    """读 HuggingFace 布局的 `metrics.parquet`：`time` 列 + 每指标一列。
+
+    pyarrow 惰性导入（见模块 docstring）：只读列、不转 pandas —— 这里要的是
+    与 CSV 路径相同的 `(times, columns)` 形状，不是 DataFrame。
+    """
+    try:
+        from pyarrow import parquet as arrow_parquet
+    except ImportError as exc:  # pragma: no cover - 取决于本地环境
+        raise RcaEvalDataMissing(
+            f"reading {path} needs pyarrow (pip install pyarrow); "
+            f"or point the importer at the CSV layout instead") from exc
+
+    table = arrow_parquet.read_table(path)
+    names = [name for name in table.column_names if name != "time"]
+    raw_times = table.column("time").to_pylist()
+    raw_columns = {name: table.column(name).to_pylist() for name in names}
+    times: list[float] = []
+    columns: dict[str, list[float | None]] = {name: [] for name in names}
+    for index, moment in enumerate(raw_times):
+        if moment is None:
+            continue
+        times.append(float(moment))
+        for name in names:
+            value = raw_columns[name][index]
+            # NaN 与 null 都表示"这一刻没观测"，不是 0。
+            columns[name].append(None if value is None or value != value else float(value))
+    return times, columns
 
 
 def _column_of(columns: dict[str, list[float | None]], service: str) -> list[float | None] | None:
@@ -132,13 +179,42 @@ def column_target(column: str, *, dir_service: str, dir_metric: str) -> tuple[st
     return None
 
 
-def _deviation(values: Iterable[float | None]) -> float:
-    """相对正常水平的偏离（用中位数当正常水平，抗偶发尖峰）。"""
-    present = [v for v in values if v is not None]
-    if len(present) < 3:
+#: 阶跃分数的两个窗口（分钟）：注入前 30 分钟当基线，注入后 10 分钟当"故障中"。
+STEP_BEFORE_MINUTES = 30
+STEP_AFTER_MINUTES = 10
+#: MAD → 标准差的经验系数（正态假设下 1.4826·MAD ≈ σ）。
+_MAD_TO_SIGMA = 1.4826
+
+
+def _step_score(times: list[float], values: list[float | None], *,
+                anchor: float,
+                before_minutes: int = STEP_BEFORE_MINUTES,
+                after_minutes: int = STEP_AFTER_MINUTES) -> float:
+    """注入前后两个窗口的中位数差，用基线 MAD 归一（负向同样算异常）。
+
+    第一版用的是"相对全窗口中位数的最大绝对偏离"，在真实数据上立刻失效：
+    内存类指标（`*_mem`）在 70 分钟里单调爬升，最大偏离比真因的 cpu 阶跃还大
+    两个数量级，于是"哪个指标更异常"这个问题被噪声接管，每个服务都被选中
+    `*_mem`，真因指标反而落选（实测 `adservice_mem=5.6e6` vs `adservice_cpu` 的
+    `1.4e3`）。阶跃分数只比较注入前后两个窗口，趋势在两边都存在、相减即消；
+    再用基线的 MAD 归一，量纲不同的指标才能互相比较（cpu 用毫核、延迟用毫秒、
+    内存用字节）。
+
+    **取绝对值**：`loss` 类故障会让指标**下降**，方向不明时"绝对变化"才是异常，
+    "变大"只是其中一种。
+    """
+    pairs = [(t, v) for t, v in zip(times, values) if v is not None]
+    base = [v for t, v in pairs if anchor - before_minutes * 60 <= t < anchor]
+    step = [v for t, v in pairs if anchor <= t <= anchor + after_minutes * 60]
+    # 两个窗口都至少要有一点数据；少于这个量时不敢说"变了"。
+    if len(base) < 2 or not step:
         return 0.0
-    median = statistics.median(present)
-    return max(abs(v - median) for v in present)
+    median_before = statistics.median(base)
+    median_after = statistics.median(step)
+    mad = statistics.median([abs(v - median_before) for v in base]) * _MAD_TO_SIGMA
+    # 基线完全平的时刻 MAD=0；用一个相对量级兜底，避免除零把任何抖动放大成无穷。
+    scale = mad if mad > 1e-9 else max(abs(median_before) * 0.01, 1e-9)
+    return abs(median_after - median_before) / scale
 
 
 def _resample(times: list[float], values: list[float | None],
@@ -165,36 +241,102 @@ def _resample(times: list[float], values: list[float | None],
     return out
 
 
-def _normalise(series: list[float], *, own: float, truth: float) -> list[float]:
-    """把一条真实序列按"相对真因的偏离"缩放到我们的错误率量纲。
+def _normalise(series: list[float], *, own: float, scale_to: float) -> list[float]:
+    """把一条真实序列按"相对本案例最大阶跃"缩放到我们的错误率量纲。
 
-    规则只有一条：`PEAK * own_deviation / truth_deviation`。于是
-    "谁更异常"完全来自真实数据，被改变的只有绝对量纲。
+    规则只有一条：`PEAK * own_step / case_max_step`。于是"谁更异常"完全来自
+    真实数据，被改变的只有绝对量纲。
+
+    **除数必须是本案例的最大阶跃，不能是真因自己的阶跃**：拿真因当分母时，
+    真因的曲线恒等于 `PEAK`，任何"峰值最高"的朴素基线都必然选中真因 ——
+    那不是基线强，那是转换里把答案写进了幅度（实测这一版峰值基线 0.99）。
+    用同一案例的统一除数，幅度排序才重新是一项**待判断**的证据。
     """
     if not series:
         return []
-    if truth <= 0:
+    if scale_to <= 0:
         return [0.0 for _ in series]
-    scale = PEAK * (own / truth) if own > 0 else 0.0
+    scale = PEAK * (own / scale_to) if own > 0 else 0.0
     median = statistics.median(series)
     spread = max(abs(v - median) for v in series) or 1.0
     return [round(max(0.0, min(0.9, scale * abs(v - median) / spread)), 6) for v in series]
 
 
+#: HuggingFace 目录名的 suite 前缀：`{suite}{system}_{service}_{fault}_{rep}`。
+_SUITE_PREFIXES = ("re1ob", "re1ss", "re1tt", "re2ob", "re2ss", "re2tt",
+                   "re3ob", "re3ss", "re3tt")
+
+#: RCAEval 的故障名 → 我们的 fault_type。`delay` 是网络延迟注入，属于延迟劣化；
+#: 其余（cpu/mem/disk/loss/socket）都表现成可用性受损。不在表里的交给适配器的
+#: 弱映射，那里已经声明了"未知一律 availability_degradation"。
+_FAULT_TO_TYPE = {
+    "delay": "latency_degradation",
+    "cpu": "availability_degradation",
+    "mem": "availability_degradation",
+    "disk": "availability_degradation",
+    "loss": "availability_degradation",
+    "socket": "availability_degradation",
+}
+
+
+def _fault_type(metric: str) -> str:
+    return _FAULT_TO_TYPE.get(metric) or fault_type_for(metric)
+
+
+def _layout_of(case_dir: Path) -> str | None:
+    """`csv` / `parquet` / None（这个目录不是案例）。"""
+    if (case_dir / "data.csv").exists():
+        return "csv"
+    if (case_dir / "metrics.parquet").exists():
+        return "parquet"
+    return None
+
+
+def _truth_from_case_name(name: str) -> tuple[str, str]:
+    """扁平布局的目录名 → (service, fault)。
+
+    `re1ob_adservice_cpu_1` → `("adservice", "cpu")`；
+    `re2tt_ts-order-service_cpu_1` → `("ts-order-service", "cpu")`。
+    服务名里可以有 `-`，但**不含 `_`**（RCAEval 的命名约定），所以从右切两个
+    下划线就能稳定拆出 (service, fault, repetition)。
+    """
+    for prefix in _SUITE_PREFIXES:
+        if name.startswith(prefix + "_"):
+            parts = name[len(prefix) + 1:].rsplit("_", 2)
+            if len(parts) == 3 and parts[0] and parts[2].isdigit():
+                return parts[0], parts[1]
+            break
+    raise ValueError(
+        f"cannot derive (service, fault) from flat case directory {name!r}; "
+        f"expected '{{suite}}_{{service}}_{{fault}}_{{repetition}}' "
+        f"(suite one of {', '.join(_SUITE_PREFIXES)})")
+
+
 def _case_groups(dataset_dir: Path) -> dict[str, list[Path]]:
-    """按案例名分组：同一个 case 名下每个 (service_metric) 是一个目录。"""
+    """按案例名分组。
+
+    * CSV 布局：同一 case 名下每个 `{service}_{metric}` 目录一组（多个目录）；
+    * parquet 布局：一个案例一个目录，组里只有一个元素。
+    """
     if not dataset_dir.exists():
         raise RcaEvalDataMissing(
             f"RCAEval dataset directory not found: {dataset_dir} "
-            f"(the dataset is ~50GB and is not vendored; download it separately)")
+            f"(the telemetry is not vendored; download it separately)")
     groups: dict[str, list[Path]] = {}
-    for data_csv in dataset_dir.glob("**/data.csv"):
-        case_dir = data_csv.parent
-        groups.setdefault(case_dir.name, []).append(case_dir)
+    candidates = list(dataset_dir.glob("**/data.csv")) + list(
+        dataset_dir.glob("**/metrics.parquet"))
+    for path in candidates:
+        case_dir = path.parent
+        if _layout_of(case_dir) is None:
+            continue
+        bucket = groups.setdefault(case_dir.name, [])
+        if case_dir not in bucket:
+            bucket.append(case_dir)
     if not groups:
         raise RcaEvalDataMissing(
-            f"no '<service>_<metric>/<case>/data.csv' under {dataset_dir}; "
-            f"expected the RCAEval layout")
+            f"no case directories under {dataset_dir}; expected either "
+            f"'<service>_<metric>/<case>/data.csv' (Zenodo layout) or "
+            f"'<case>/metrics.parquet' (HuggingFace layout)")
     return groups
 
 
@@ -204,6 +346,20 @@ def _split_dir_name(name: str) -> tuple[str, str]:
             f"cannot derive (service, metric) from {name!r}; "
             f"expected the RCAEval layout '{{service}}_{{metric}}'")
     return tuple(name.rsplit("_", 1))  # type: ignore[return-value]
+
+
+def _star_edges(hint: str, services) -> list[tuple[str, str]]:
+    """以告警服务为中心的星形拓扑（每个别的服务与它一条边）。
+
+    RCAEval 不随数据集发布调用图，而调查的**范围**是由拓扑决定的：
+    拓扑为空时 `_scope_services` 只查告警服务本身，于是"排序"这件事从来
+    不会发生（实测：候选池恒为 1，AC@1 与朴素基线同时为 1.00，数字没有
+    任何信息量）。这里显式声明一个中性星形，让所有被观测到的服务都进入
+    取证范围，谁是真因交给排序而不是交给拓扑。
+
+    这条声明写进 `Scenario.description`，并且对基线一视同仁（基线不看拓扑）。
+    """
+    return [(hint, other) for other in sorted(services) if other != hint]
 
 
 def import_case(case_dirs: list[Path], *, dataset: str) -> ImportedCase:
@@ -217,9 +373,16 @@ def import_case(case_dirs: list[Path], *, dataset: str) -> ImportedCase:
     """
     readings: list[tuple[str, str, Path, list[float], dict[str, list[float | None]]]] = []
     inject_time: datetime | None = None
+    layouts: set[str] = set()
     for case_dir in case_dirs:
-        service, metric = _split_dir_name(case_dir.parent.name)
-        times, columns = _read_columns(case_dir / "data.csv")
+        layout = _layout_of(case_dir) or "csv"
+        if layout == "csv":
+            service, metric = _split_dir_name(case_dir.parent.name)
+            times, columns = _read_columns(case_dir / "data.csv")
+        else:
+            service, metric = _truth_from_case_name(case_dir.name)
+            times, columns = _read_columns(case_dir / "metrics.parquet")
+        layouts.add(layout)
         if not times:
             continue
         if inject_time is None:
@@ -243,8 +406,16 @@ def import_case(case_dirs: list[Path], *, dataset: str) -> ImportedCase:
     if not readings_by_target:
         raise RcaEvalDataMissing(f"case {case_dirs[0].name!r} has no usable columns")
 
+    # 锚点（注入时刻）要在算分数之前定下来：阶跃分数以它为界切两个窗口。
+    anchor_epoch = (inject_time.timestamp() if inject_time
+                    else max(max(times) for _s, _m, _d, times, _c in readings))
+
     deviations = {
-        target: max((_deviation(values) for _owned, _times, values in entries), default=0.0)
+        target: max(
+            (_step_score(times, values, anchor=anchor_epoch)
+             for _owned, times, values in entries),
+            default=0.0,
+        )
         for target, entries in readings_by_target.items()
     }
 
@@ -254,10 +425,8 @@ def import_case(case_dirs: list[Path], *, dataset: str) -> ImportedCase:
         truth_key = (readings[0][0], readings[0][1])
     else:
         truth_key = max(deviations, key=lambda key: deviations[key])
-    truth_deviation = deviations.get(truth_key) or 1.0
-
-    anchor_epoch = (inject_time.timestamp() if inject_time
-                    else max(max(times) for _s, _m, _d, times, _c in readings))
+    # 本案例的统一除数：所有服务除以同一个数，幅度才有可比性。
+    case_scale = max(deviations.values(), default=0.0) or 1.0
 
     per_service: dict[str, ServiceSignals] = {}
     strengths: dict[str, float] = {}
@@ -269,10 +438,10 @@ def import_case(case_dirs: list[Path], *, dataset: str) -> ImportedCase:
         if not series:
             continue
         own = max(deviations[(service, metric)], max(
-            (_deviation(v) for _o, _t, v in entries), default=0.0))
+            (_step_score(t, v, anchor=anchor_epoch) for _o, t, v in entries), default=0.0))
         strengths[service] = max(strengths.get(service, 0.0), own)
         candidate = ServiceSignals(
-            error_rate_series=_normalise(series, own=own, truth=truth_deviation))
+            error_rate_series=_normalise(series, own=own, scale_to=case_scale))
         existing = per_service.get(service)
         # 同一服务多条指标时，留"更异常"的那条：我们的错误率只有一条曲线。
         if existing is None or max(candidate.error_rate_series) > max(existing.error_rate_series):
@@ -307,10 +476,14 @@ def import_case(case_dirs: list[Path], *, dataset: str) -> ImportedCase:
 
     notes = [
         f"source: RCAEval {dataset}/{truth_service}_{truth_metric}/{case_dirs[0].name}",
-        "magnitude: rescaled so the truth's peak is "
-        f"{PEAK} (relative strength comes from the raw data; units are not preserved)",
+        f"layout: {'+'.join(sorted(layouts))}",
+        f"magnitude: the case's largest step maps to {PEAK} "
+        "(one divisor per case, so relative strength comes from the raw data; "
+        "units are not preserved)",
         "timestamps: naive RCAEval times are interpreted as UTC+8 per their FAQ",
         "grid: resampled to the harness grid by nearest neighbour, no interpolation",
+        "topology: RCAEval ships no call graph, so a neutral star around the "
+        "alerting service is declared to put every observed service in scope",
     ]
     if inject_time is None:
         notes.append("inject_time.txt missing: fault_start taken from the end of the data")
@@ -329,10 +502,10 @@ def import_case(case_dirs: list[Path], *, dataset: str) -> ImportedCase:
         ground_truth=GroundTruth(
             service=truth_service,
             component=None,
-            fault_type=fault_type_for(truth_metric),
+            fault_type=_fault_type(truth_metric),
             expected_diagnosis="SUPPORTED",
         ),
-        topology_edges=[],
+        topology_edges=_star_edges(truth_service, per_service),
         scope_depth=1,
     )
     return ImportedCase(

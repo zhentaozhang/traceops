@@ -208,6 +208,8 @@ class RunContext:
     #: 为 None 时用演示栈约定。换成别人的集群只需换这一个值：模板里的名字
     #: 不是事实，是某套采集配置的产物。
     conventions: TelemetryConventions | None = None
+    #: 首轮因查询预算被截掉的服务数（由 `_plan_items` 写，报告读）。
+    skipped_by_budget: int = 0
     #: 跨运行共享的策略变更历史（`config/history.py`）。为 None 时不做归属记录。
     strategy_history: Any = None
     #: 跨事故记忆（`traceops.runtime.incident_memory.IncidentMemory`）。
@@ -463,7 +465,16 @@ def _plan_items(request: InvestigationRequest, ctx: "RunContext") -> list[dict[s
     templates = [(tool, source_id, evidence_type, template_id)
                  for tool, source_id, evidence_type, template_id in _PLAN_TEMPLATES
                  if _capability_planned(ctx, _PLAN_TEMPLATE_CAPABILITY[tool])]
-    for service, tier in _scope_services(request, ctx):
+    scoped = _scope_services(request, ctx)
+    # 计划的开销是「服务数 × 数据源数」，而预算是常数。真实集群里上百个服务
+    # 会让首轮取证一条都跑不完就耗尽预算（实测 13 个服务 × 3 类 = 39 次 > 40
+    # 的默认上限，调查直接 FAILED）—— 那不是"数据查不到"，是"根本没开始"。
+    # 于是按作用域顺序（先自身、再下游、最后影响面）截断，并把被截掉的数量
+    # 交给报告，而不是静默少查。
+    wanted = max(1, ctx.budget.tool_calls_remaining // max(1, len(templates)))
+    kept = scoped[:wanted]
+    ctx.skipped_by_budget = max(0, len(scoped) - len(kept))
+    for service, tier in kept:
         base = {
             "service": service,
             "start": request.window_start.isoformat(),
@@ -1808,6 +1819,13 @@ def _report_node(state: InvestigationState, config: RunnableConfig) -> dict[str,
         )
     _report_missing_topology(state, ctx, missing)
     _report_missing_sources(ctx, missing)
+    skipped = getattr(ctx, "skipped_by_budget", 0)
+    if skipped:
+        missing.append(
+            f"{skipped} service(s) in the blast radius were not queried at all: "
+            f"the first pass spends one query per service per data source and the "
+            f"tool-call budget ran out first (raise max_tool_calls or narrow scope_depth)"
+        )
     report = build_report(
         investigation_run_id=request.investigation_run_id,
         hypotheses=state.get("hypotheses", []),

@@ -175,6 +175,12 @@ def load_scenario(path: str | Path) -> Scenario:
     return Scenario.model_validate_json(Path(path).read_text(encoding="utf-8"))
 
 
-def load_scenarios(directory: str | Path) -> list[Scenario]:
-    paths = sorted(p for p in Path(directory).glob("F-*.json"))
+def load_scenarios(directory: str | Path, *, pattern: str = "*.json") -> list[Scenario]:
+    """读一个目录下的全部场景文件。
+
+    默认 `*.json` 而不是 `F-*.json`：导入的真实案例（RCAEval）文件名是
+    `rcaeval-*`，写死前缀会让"换个数据源"这件事静默变成"没有场景"——
+    而那正是最容易被误读成"数据集空的"的症状。坏文件直接抛，不跳过。
+    """
+    paths = sorted(p for p in Path(directory).glob(pattern))
     return [load_scenario(p) for p in paths]

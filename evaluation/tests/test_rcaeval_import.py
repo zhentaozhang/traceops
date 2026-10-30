@@ -134,7 +134,7 @@ class TestConversionIsFaithful:
         """三处转换（时间/网格/量纲）必须跟着场景走，不能只写在文档里。"""
         description = import_dataset(dataset, dataset="re2-ob")[0].scenario.description
         assert "UTC+8" in description
-        assert "rescaled" in description
+        assert "largest step maps to" in description
         assert "nearest neighbour" in description
 
 
@@ -249,3 +249,138 @@ class TestOneCaseCanIncludeSeveralDirectories:
         case = import_case(sorted(dataset.glob("**/case-001")), dataset="re2-ob")
         services = set(case.scenario.signals.per_service)
         assert {"order-service", "redis", "billing-api"} <= services
+
+
+class TestStepScore:
+    """阶跃分数：真实数据逼出来的三条性质。
+
+    第一版用"相对全窗口中位数的最大绝对偏离"，在真实案例上把内存漂移
+    （70 分钟单调爬升）当成最异常信号，真因的 cpu 阶跃反而落选。
+    """
+
+    def test_a_monotonic_trend_does_not_beat_a_step(self):
+        from evaluation.importers.rcaeval import _step_score
+
+        anchor = INJECT_EPOCH
+        times = [anchor - 60 * 60 + i * 60 for i in range(90)]
+        # 内存：全程匀速爬升（注入前后斜率一样）→ 阶跃分数应当很小。
+        trend = [100.0 + i * 10.0 for i in range(90)]
+        # cpu：注入那一刻跳到 50 倍，前后都平。
+        step = [5.0 if t < anchor else 250.0 for t in times]
+        trend_score = _step_score(times, trend, anchor=anchor)
+        step_score = _step_score(times, step, anchor=anchor)
+        assert step_score > 10
+        # 趋势不是零分（线性爬升的两个窗口中位数当然不同），但必须比阶跃
+        # 小两个数量级以上，否则"谁更异常"就由漂移决定。
+        assert trend_score < step_score / 20
+
+    def test_a_drop_counts_as_an_anomaly_too(self):
+        from evaluation.importers.rcaeval import _step_score
+
+        anchor = INJECT_EPOCH
+        times = [anchor - 30 * 60 + i * 60 for i in range(50)]
+        values = [400.0 if t < anchor else 40.0 for t in times]
+        assert _step_score(times, values, anchor=anchor) > 5
+
+    def test_one_divisor_per_case(self):
+        """真因不再恒等于 PEAK —— 幅度是待判断的证据，不是答案。"""
+        from evaluation.importers.rcaeval import PEAK
+
+        root = Path(__file__).resolve().parent / "_unused"
+        assert root  # 只为说明这个类不依赖文件系统
+        # 真因阶跃 100，干扰项阶跃 200：真因的峰值必须**小于** PEAK。
+        scenario = _two_service_case(truth_step=100.0, other_step=200.0)
+        per_service = scenario.signals.per_service
+        assert max(per_service["order-service"].error_rate_series) < PEAK
+        assert max(per_service["redis"].error_rate_series) <= PEAK
+
+
+def _two_service_case(*, truth_step: float, other_step: float) -> Scenario:
+    """构造一个"真因阶跃 / 干扰阶跃"可控的最小案例（不需要文件）。"""
+    from evaluation.importers.rcaeval import (
+        _normalise,
+        _resample,
+        _step_score,
+    )
+
+    anchor = INJECT_EPOCH
+    times = [anchor - 30 * 60 + i * 60 for i in range(60)]
+    truth = [1.0 if t < anchor else 1.0 + truth_step for t in times]
+    other = [1.0 if t < anchor else 1.0 + other_step for t in times]
+    steps = {
+        "order-service": _step_score(times, truth, anchor=anchor),
+        "redis": _step_score(times, other, anchor=anchor),
+    }
+    case_scale = max(steps.values())
+    from evaluation.scenario import ServiceSignals, Signals
+
+    return Scenario(
+        scenario_id="synthetic-two-service",
+        name="two services",
+        description="step-score fixture",
+        service_hint="order-service",
+        fault_start=datetime.fromtimestamp(anchor, tz=UTC),
+        window_start=datetime.fromtimestamp(anchor - 40 * 60, tz=UTC),
+        window_end=datetime.fromtimestamp(anchor + 10 * 60, tz=UTC),
+        signals=Signals(per_service={
+            "order-service": ServiceSignals(error_rate_series=_normalise(
+                _resample(times, truth, anchor=anchor), own=steps["order-service"],
+                scale_to=case_scale)),
+            "redis": ServiceSignals(error_rate_series=_normalise(
+                _resample(times, other, anchor=anchor), own=steps["redis"],
+                scale_to=case_scale)),
+        }),
+        ground_truth={"service": "order-service", "fault_type": "availability_degradation",
+                      "expected_diagnosis": "SUPPORTED"},
+    )
+
+
+class TestHuggingFaceParquetLayout:
+    """HuggingFace 版数据集是一个案例一个目录 + metrics.parquet。"""
+
+    def _write_case(self, root: Path, name: str, *, inject=INJECT_EPOCH) -> Path:
+        pyarrow = pytest.importorskip("pyarrow")
+        import pyarrow.parquet as pq
+
+        case = root / name
+        case.mkdir(parents=True)
+        times = [inject - 30 * 60 + i * 60 for i in range(60)]
+        values = {
+            "adservice_cpu": [1.0 if t < inject else 80.0 for t in times],
+            "frontend_latency": [30.0 if t < inject else 32.0 for t in times],
+        }
+        table = pyarrow.table({"time": times, **values})
+        pq.write_table(table, case / "metrics.parquet")
+        (case / "inject_time.txt").write_text(str(inject), encoding="utf-8")
+        return case
+
+    def test_parquet_case_is_imported_with_its_label(self, tmp_path):
+        self._write_case(tmp_path, "re1ob_adservice_cpu_1")
+        imported = import_dataset(tmp_path, dataset="re1-ob")
+        assert len(imported) == 1
+        case = imported[0]
+        assert case.service == "adservice"
+        assert case.metric == "cpu"
+        assert case.scenario.ground_truth.fault_type == "availability_degradation"
+        assert "layout: parquet" in case.notes
+
+    def test_a_delay_fault_maps_to_latency_degradation(self, tmp_path):
+        self._write_case(tmp_path, "re1ob_adservice_delay_1")
+        imported = import_dataset(tmp_path, dataset="re1-ob")
+        assert imported[0].scenario.ground_truth.fault_type == "latency_degradation"
+
+    def test_case_name_without_a_suite_prefix_is_refused(self, tmp_path):
+        self._write_case(tmp_path, "adservice_cpu")
+        with pytest.raises(RcaEvalDataMissing):
+            import_dataset(tmp_path, dataset="re1-ob")
+
+
+class TestScenarioLoader:
+    def test_imported_scenarios_are_not_silently_invisible(self, tmp_path):
+        from evaluation.scenario import load_scenarios
+
+        scenario = _two_service_case(truth_step=100.0, other_step=10.0)
+        (tmp_path / "rcaeval-re1-ob-x-cpu-case-001.json").write_text(
+            scenario.model_dump_json(indent=2), encoding="utf-8")
+        loaded = load_scenarios(tmp_path)
+        assert [s.scenario_id for s in loaded] == ["synthetic-two-service"]
