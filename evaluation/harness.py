@@ -223,6 +223,9 @@ def build_request(scenario: Scenario) -> InvestigationRequest:
         # 用了一套词汇，于是"评测里能跑通"并不代表"生产契约能接受"。
         priority="high",
         alert_summary=scenario.alert_summary,
+        # 范围与方向分开：拓扑为空时仍要让所有被观测到的服务进入取证范围，
+        # 否则候选池恒为 1，"排序"从未发生（见 Scenario.scope_services）。
+        scope_services=list(scenario.scope_services) or None,
     )
 
 

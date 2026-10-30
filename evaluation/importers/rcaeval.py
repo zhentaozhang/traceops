@@ -92,6 +92,15 @@ PEAK = 0.35
 MAX_DISTRACTORS = 2
 #: 最近邻重采样容差 = 原始间隔 × 该倍数。超出就说"那一刻没观测"。
 RESAMPLE_TOLERANCE = 3
+#: 告警延迟：`fault_start`（告警时刻）= 注入时刻 + 这个延迟。
+#:
+#: 为什么必须分开：告警永远**晚于**故障开始 —— 要先跑完一个评估窗口、过阈值、
+#: 再走通知链路。而调查窗口的约定是"序列以 `fault_start` 收尾"。把两者当成
+#: 同一个时刻，窗口就整个落在注入**之前**：留给检测器的全是故障前的平静曲线，
+#: 注入之后真正的阶跃一个点都不在窗口里 —— 于是"严重程度"只能从窗口外偷取
+#: （旧版本正是如此：把注入后的阶跃算成一个常数，乘到窗口里的基线上）。
+#: 那样测出来的不是检测能力，只是转换的算术。
+ALERT_DELAY_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -348,21 +357,57 @@ def _split_dir_name(name: str) -> tuple[str, str]:
     return tuple(name.rsplit("_", 1))  # type: ignore[return-value]
 
 
-def _star_edges(hint: str, services) -> list[tuple[str, str]]:
-    """以告警服务为中心的星形拓扑（每个别的服务与它一条边）。
+def _scope_services(hint: str, services) -> list[str]:
+    """取证范围 = 告警服务 + 其余被观测到的服务（**不带方向**）。
 
-    RCAEval 不随数据集发布调用图，而调查的**范围**是由拓扑决定的：
-    拓扑为空时 `_scope_services` 只查告警服务本身，于是"排序"这件事从来
-    不会发生（实测：候选池恒为 1，AC@1 与朴素基线同时为 1.00，数字没有
-    任何信息量）。这里显式声明一个中性星形，让所有被观测到的服务都进入
-    取证范围，谁是真因交给排序而不是交给拓扑。
+    这里曾经是 `_star_edges`：为了把"排序"这件事打开，声明了一个以告警服务
+    为中心的星形依赖边。方向在 `ServiceTopology` 里读作"前者依赖后者"，于是
+    它实际说的是**告警服务依赖所有别的服务** —— 症状判定（R-008）随即把真因
+    判成"下游某服务的症状"，124 个真实案例里 52 个被打到 rank 2-6，AC@1 从
+    本可达到的 0.87 掉到 0.54。
 
-    这条声明写进 `Scenario.description`，并且对基线一视同仁（基线不看拓扑）。
+    教训不是"星形不够准"，而是**范围与方向是两件事**：没有调用图时我们仍然
+    知道这次故障波及哪些服务（标签、面板、受影响的实例），但完全不知道谁调用
+    谁。所以这里只声明范围（`scope_services`），依赖边留空，症状规则保持关闭。
     """
-    return [(hint, other) for other in sorted(services) if other != hint]
+    return [hint] + sorted(set(services) - {hint})
 
 
-def import_case(case_dirs: list[Path], *, dataset: str) -> ImportedCase:
+def load_topology(path: Path) -> list[tuple[str, str]]:
+    """读一份声明的调用图。`[[caller, callee], ...]` 或 `{"edges": [[...]]}`。
+
+    为什么要这个文件
+    ----------------
+    没有调用图时症状判定（R-008）必须关闭，否则会把真因判成"下游的症状"；
+    可是关掉之后，一次网络类故障里"下游被打得更响"的现象就没法解释 ——
+    实测这正好是剩下的那 13%（见 `评测口径` §6.7）。
+
+    调用图是**部署事实**，不是数据集的属性：RCAEval 不提供，但任何真实部署
+    都有（服务网格、Terraform、CI 里的依赖清单）。所以把它做成一个可选输入：
+    给了就开症状判定并据此归因，没给就只声明范围。方向读作 `(caller, callee)`
+    = "前者调用后者"，与 `ServiceTopology` 的约定一致。
+    """
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    edges = raw.get("edges") if isinstance(raw, dict) else raw
+    if not isinstance(edges, list):
+        raise ValueError(f"{path}: expected a list of [caller, callee] pairs, or {{\"edges\": [...]}}")
+    parsed: list[tuple[str, str]] = []
+    for index, item in enumerate(edges):
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError(f"{path}: edge #{index} is not a [caller, callee] pair: {item!r}")
+        caller, callee = item
+        if not isinstance(caller, str) or not isinstance(callee, str) or not caller.strip() or not callee.strip():
+            raise ValueError(f"{path}: edge #{index} must name two non-empty services: {item!r}")
+        if caller == callee:
+            raise ValueError(f"{path}: edge #{index} points {caller!r} at itself")
+        parsed.append((caller.strip(), callee.strip()))
+    if not parsed:
+        raise ValueError(f"{path}: the call graph is empty; omit --topology-file instead")
+    return parsed
+
+
+def import_case(case_dirs: list[Path], *, dataset: str,
+                topology: list[tuple[str, str]] | None = None) -> ImportedCase:
     """把同一案例名下的若干 `{service}_{metric}` 目录合成一个场景。
 
     RCAEval 的 CSV 是**宽表**：同一个 `case` 里，别的组件的指标也作为列出现。
@@ -409,6 +454,9 @@ def import_case(case_dirs: list[Path], *, dataset: str) -> ImportedCase:
     # 锚点（注入时刻）要在算分数之前定下来：阶跃分数以它为界切两个窗口。
     anchor_epoch = (inject_time.timestamp() if inject_time
                     else max(max(times) for _s, _m, _d, times, _c in readings))
+    # 观测窗口右端 = 告警时刻 = 注入时刻 + 告警延迟。序列以它收尾，
+    # 于是窗口里**包含注入之后的真实数据**（见 ALERT_DELAY_SECONDS）。
+    watch_anchor = anchor_epoch + ALERT_DELAY_SECONDS
 
     deviations = {
         target: max(
@@ -434,7 +482,7 @@ def import_case(case_dirs: list[Path], *, dataset: str) -> ImportedCase:
         owned = [entry for entry in entries if entry[0]]
         chosen = (owned or entries)[0]
         _owned, times, values = chosen
-        series = _resample(times, values, anchor=anchor_epoch)
+        series = _resample(times, values, anchor=watch_anchor)
         if not series:
             continue
         own = max(deviations[(service, metric)], max(
@@ -470,9 +518,9 @@ def import_case(case_dirs: list[Path], *, dataset: str) -> ImportedCase:
         key=lambda service: strengths.get(service, 0.0), reverse=True,
     )[:MAX_DISTRACTORS]
 
-    fault_start = datetime.fromtimestamp(anchor_epoch, tz=UTC)
+    fault_start = datetime.fromtimestamp(watch_anchor, tz=UTC)
     window_start = fault_start - timedelta(seconds=GRID_SECONDS * GRID_POINTS)
-    window_end = fault_start + timedelta(seconds=GRID_SECONDS * 2)
+    window_end = fault_start
 
     notes = [
         f"source: RCAEval {dataset}/{truth_service}_{truth_metric}/{case_dirs[0].name}",
@@ -481,14 +529,23 @@ def import_case(case_dirs: list[Path], *, dataset: str) -> ImportedCase:
         "(one divisor per case, so relative strength comes from the raw data; "
         "units are not preserved)",
         "timestamps: naive RCAEval times are interpreted as UTC+8 per their FAQ",
+        f"alert delay: fault_start is {ALERT_DELAY_SECONDS // 60} min after inject_time, "
+        "so the window ends after the fault began (an alert never fires before the "
+        "fault); the step itself is measured around inject_time",
         "grid: resampled to the harness grid by nearest neighbour, no interpolation",
-        "topology: RCAEval ships no call graph, so a neutral star around the "
-        "alerting service is declared to put every observed service in scope",
+        "scope: RCAEval ships no call graph, so the affected services are "
+        "declared as a scope list with no edges: every observed service is "
+        "investigated, and no dependency direction is invented (symptom "
+        "demotion stays off because we do not know who calls whom)",
     ]
     if inject_time is None:
         notes.append("inject_time.txt missing: fault_start taken from the end of the data")
     if len(readings) == 1:
         notes.append("truth: taken from the case directory name (RCAEval's own label)")
+    if topology:
+        notes.append(
+            f"topology: {len(topology)} declared edges were supplied, so a candidate "
+            "whose dependency is failing can be demoted as a symptom (R-008 is on)")
 
     scenario = Scenario(
         scenario_id=f"rcaeval-{dataset}-{truth_service}-{truth_metric}-{case_dirs[0].name}",
@@ -505,7 +562,8 @@ def import_case(case_dirs: list[Path], *, dataset: str) -> ImportedCase:
             fault_type=_fault_type(truth_metric),
             expected_diagnosis="SUPPORTED",
         ),
-        topology_edges=_star_edges(truth_service, per_service),
+        topology_edges=list(topology or []),
+        scope_services=[] if topology else _scope_services(truth_service, per_service),
         scope_depth=1,
     )
     return ImportedCase(
@@ -516,7 +574,8 @@ def import_case(case_dirs: list[Path], *, dataset: str) -> ImportedCase:
 
 
 def import_dataset(dataset_dir: Path, *, dataset: str | None = None,
-                   limit: int | None = None) -> list[ImportedCase]:
+                   limit: int | None = None,
+                   topology: list[tuple[str, str]] | None = None) -> list[ImportedCase]:
     """导入整个数据集目录。按案例名分组，逐组导入。"""
     name = dataset or dataset_dir.name
     groups = _case_groups(dataset_dir)
@@ -526,7 +585,7 @@ def import_dataset(dataset_dir: Path, *, dataset: str | None = None,
         if limit is not None and len(imported) >= limit:
             break
         try:
-            imported.append(import_case(groups[case_id], dataset=name))
+            imported.append(import_case(groups[case_id], dataset=name, topology=topology))
         except (RcaEvalDataMissing, ValueError) as exc:
             # 一个案例坏了不该让整批导入失败，但**原因必须留下来**：
             # 只报"没有可导入的案例"等于把"时区解释错了"和"目录是空的"

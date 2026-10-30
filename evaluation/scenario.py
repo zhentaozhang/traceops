@@ -140,6 +140,14 @@ class Scenario(BaseModel):
         description="依赖边列表 [[caller, callee], ...]；为空则不启用拓扑扩展",
     )
     scope_depth: int = 1
+    #: **没有拓扑时**要查哪些服务。与 `topology_edges` 的区别是它不带方向：
+    #: 真实数据集（RCAEval）不发布调用图，而我们曾经编过一个"以告警服务为中心的
+    #: 星形"，等于宣称"告警的服务依赖所有别的服务"——症状判定于是把真因降级。
+    #: 服务清单只决定取证范围，让"排序"这件事能发生，而不替我们猜方向。
+    scope_services: list[str] = Field(
+        default_factory=list,
+        description="无拓扑时的取证范围（服务名清单，不含方向）",
+    )
 
     @model_validator(mode="after")
     def _validate_times(self) -> Scenario:

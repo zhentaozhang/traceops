@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import timedelta
+from typing import Any
 
 from traceops.domain.models import (
     Evidence,
@@ -131,6 +132,24 @@ def earliest_anomaly(evidence_list: list[Evidence], *, evidence_types: set[Evide
     if not candidates:
         return None
     return min(candidates, key=lambda e: (e.observed_at, e.id))
+
+
+def metric_peak(data: dict[str, Any]) -> float | None:
+    """指标序列的最大值（没有可解析的点时返回 None）。
+
+    放在这里而不是 `orchestration/graph.py`：排序（`rca/ranking.py` 的 R-011
+    幅度裁决）、渲染层、证据摘要三处都要用同一份判据。此前有两份拷贝，任何
+    一份被改动都会让"排序认为的幅度"与"报告写出来的峰值"不一致。
+    """
+    peak: float | None = None
+    for item in (data or {}).get("series") or []:
+        for point in item.get("values") or []:
+            try:
+                value = float(point[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            peak = value if peak is None else max(peak, value)
+    return peak
 
 
 def ordering_violations(evidence_list: list[Evidence], *, expected_order: list[str]) -> list[str]:

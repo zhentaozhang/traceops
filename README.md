@@ -10,7 +10,7 @@ Evidence-driven Agentic RCA Platform —— 面向微服务系统的智能故障
 | 平面 | 状态 | 测试 |
 |---|---|---|
 | Control Plane（Java / Spring Boot） | ✅ 告警接入、事故关联、状态机、Outbox、结果消费、**诊断结论 REST 查询**、**失败自动重试**、**契约运行时校验**、**负责人 / 认领 / 结论确认**、**出站通知** | **237 passing** |
-| Investigation Plane（Python / LangGraph） | ✅ 8 节点图（含判别回路）、双层采集、传播链、重试分类、**证据读回**、**跨事故记忆**、**查询缓存**、**真实数据集（RCAEval RE1-OB）跑通** | **1327 passing** |
+| Investigation Plane（Python / LangGraph） | ✅ 8 节点图（含判别回路）、双层采集、传播链、重试分类、**证据读回**、**跨事故记忆**、**查询缓存**、**真实数据集（RCAEval RE1-OB）跑通** | **1339 passing** |
 | Evidence Plane（Python） | ✅ 4 类归一化、内容寻址校验、**SQLite 持久化**、查询模板、证据图 | 同上 |
 | Evaluation Plane（Python） | ✅ 12 合成场景（含三服务级联 F-005、F-011 自然语言线索）+ **盲测包** + **漏斗拆解与朴素基线** + **RCAEval 真实数据导入** + 18 指标 | **162 passing** |
 | Execution Plane（受控修复） | ✅ Action Registry + Policy + Approval + **执行后重新观测** + **不达标自动回滚** + **CLI 入口** | 93 passing |
@@ -152,7 +152,7 @@ cd traceops
 python -m venv --system-site-packages .venv
 .venv/bin/python -m pip install -e agent-runtime --no-build-isolation
 
-# 全部测试（agent-runtime 1327 + evaluation 169 + contracts 13 = 1509）
+# 全部测试（agent-runtime 1339 + evaluation 177 + contracts 13 = 1529）
 PYTHONPATH=agent-runtime .venv/bin/python -m pytest agent-runtime/tests evaluation contracts -q
 
 # 跑评估：12 场景 + 指标 + 每个场景一份可读诊断（reports/reports/<id>.md）
@@ -166,6 +166,14 @@ PYTHONPATH=agent-runtime:. .venv/bin/python -m evaluation.blind export --out /tm
 PYTHONPATH=agent-runtime:. .venv/bin/python -m evaluation.blind score --pack /tmp/blind-pack --predictions preds.json
 # 自检：用我们自己的报告当预测，和内部 AC@1 对账
 PYTHONPATH=agent-runtime:. .venv/bin/python -m evaluation.blind selfscore --pack /tmp/blind-pack
+
+# 真实数据集（RCAEval RE1-OB，需先下载，见 运行手册 §3.6）
+PYTHONPATH=agent-runtime .venv/bin/python -m evaluation.importers.cli import-rcaeval \
+    --dataset-dir /tmp/rcaeval-data --out /tmp/re1ob --name re1ob
+# 部署知道调用关系就交进来：同 124 个案例，AC@1 0.86 → 0.89（峰值基线 0.87 / 0.90）
+PYTHONPATH=agent-runtime .venv/bin/python -m evaluation.importers.cli import-rcaeval \
+    --dataset-dir /tmp/rcaeval-data --out /tmp/re1ob-graph --name re1ob \
+    --topology-file frontend/apps/console/src/fixtures/topology.json
 ```
 
 ### Java 侧（Control Plane）

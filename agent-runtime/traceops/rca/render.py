@@ -235,9 +235,9 @@ def _metric_peak(data: dict[str, Any]) -> float | None:
     直接复用编排层那个函数，而不是在这里再写一遍 —— 两处各算一遍的结果迟早不一致，
     而不一致的那一刻报告与摘要会开始互相矛盾。
     """
-    from traceops.orchestration.graph import _metric_peak as peak
+    from traceops.evidence.graph import metric_peak
 
-    return peak(data)
+    return metric_peak(data)
 
 
 def _log_keyword_hits(data: dict[str, Any]) -> list[str]:

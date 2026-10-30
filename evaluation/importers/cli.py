@@ -6,7 +6,7 @@
 * `probe --dataset-dir <dir>`：只看数据集形状（有几个案例、几个服务、
   候选池多大），不写文件 —— 用于"数据集下载对不对"的第一眼判断。
 
-退出码：0 成功；2 数据集缺失或不可导入（**不返回空列表**：空列表会让
+退出码：0 成功；2 数据集缺失、不可导入，或 `--topology-file` 读不动（**不返回空列表**：空列表会让
 "还没下载"看起来像"这数据集没有异常"）。
 """
 from __future__ import annotations
@@ -19,6 +19,7 @@ from pathlib import Path
 from evaluation.adapters.rcaeval_adapter import RcaEvalDataMissing
 from evaluation.importers.rcaeval import (
     import_dataset,
+    load_topology,
     summarise,
     write_scenarios,
 )
@@ -34,6 +35,10 @@ def _parser() -> argparse.ArgumentParser:
                          help="directory to write <scenario_id>.json into")
     convert.add_argument("--name", default=None, help="dataset name (defaults to the directory name)")
     convert.add_argument("--limit", type=int, default=None, help="stop after N imported cases")
+    convert.add_argument(
+        "--topology-file", type=Path, default=None,
+        help="declared call graph (JSON: [[caller, callee], ...]); without it "
+             "symptom demotion stays off and only the scope list is declared")
 
     probe = sub.add_parser("probe", help="report the dataset shape without writing anything")
     probe.add_argument("--dataset-dir", required=True, type=Path)
@@ -43,8 +48,17 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    topology = None
+    if getattr(args, "topology_file", None) is not None:
+        try:
+            topology = load_topology(args.topology_file)
+        except (OSError, ValueError) as exc:
+            print(json.dumps({"status": "BAD_TOPOLOGY", "reason": str(exc)}, ensure_ascii=False))
+            return 2
     try:
-        imported = import_dataset(args.dataset_dir, dataset=args.name, limit=getattr(args, "limit", None))
+        imported = import_dataset(
+            args.dataset_dir, dataset=args.name,
+            limit=getattr(args, "limit", None), topology=topology)
     except RcaEvalDataMissing as exc:
         print(json.dumps({"status": "MISSING_DATA", "reason": str(exc)}, ensure_ascii=False))
         return 2

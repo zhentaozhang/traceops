@@ -66,6 +66,16 @@ class CandidateSignals:
     #: 症状总在下游开始受苦之后才出现。
     #: 注意它是"调权"而不是"定论"：只加 1 分，被矛盾证据压过时仍会输。
     is_earliest_anomaly: bool = False
+    #: R-011：该候选自己的观测**偏离自身基线多少**（0..1，跨候选可比）。
+    #:
+    #: 为什么需要：在真实数据（RCAEval RE1-OB）上，13 个服务里只有被注入的那条
+    #: 曲线发生了阶跃，但它的"异常"在我们的信号里只体现为 `has_anomaly_observation`
+    #: 这个布尔 —— 于是所有候选同分，排序退化成服务名字母序，AC@1 只有 0.54，
+    #: 而"取幅度最大的服务"这条一行代码的启发式能到 0.87。
+    #:
+    #: 它**不进分值**（不改 `_evaluate`）：只做同分裁决，因为"幅度大"不等于
+    #: "就是根因"（上游网关的幅度通常更大）。详见 `_sort_key` 与 R-011 注释。
+    severity: float = 0.0
     #: R-010：这个 (服务, 机制, 组件) 以前真的这样坏过（净值 > 0）。
     #:
     #: 由 `traceops.runtime.incident_memory.IncidentMemory` 提供。
@@ -81,6 +91,12 @@ class RankedCandidate:
     rank: int
     status: HypothesisStatus
     applied_rules: list[str] = field(default_factory=list)
+    #: 该候选的观测幅度（0..1，与 `CandidateSignals.severity` 同源）。
+    #:
+    #: 排序用它破平，报告的歧义闸门也用它：两个候选规则分相同但幅度差一个
+    #: 数量级时，"分不清谁是真因"就不成立 —— 幅度本身就是一条证据。
+    #: 没有它，闸门会在 45% 的真实案例上把**已经排对了的**结论降级成不确定。
+    severity: float = 0.0
 
 
 def _evaluate(signals: CandidateSignals) -> tuple[int, HypothesisStatus, list[str]]:
@@ -151,6 +167,27 @@ def _evaluate(signals: CandidateSignals) -> tuple[int, HypothesisStatus, list[st
         status = HypothesisStatus.INVESTIGATING
 
     return score, status, rules
+
+
+def _relative_severity(supports: list, scale: float) -> float:
+    """该候选的指标峰值 / 全池最大峰值。
+
+    只看 METRIC 证据：日志条数与 span 耗时都不与指标同量纲，混进来会让
+    "幅度"变成"哪种证据更多"。没有指标证据或分母为 0 时返回 0 ——
+    缺数据就不参与这个裁决，而不是当成 0 幅度去输给别人。
+    """
+    from traceops.domain.models import EvidenceType
+    from traceops.evidence.graph import metric_peak
+
+    if scale <= 0:
+        return 0.0
+    own = [peak for peak in (
+        metric_peak(ev.normalized_data or {}) for ev in supports
+        if ev.evidence_type is EvidenceType.METRIC
+    ) if peak is not None]
+    if not own:
+        return 0.0
+    return max(0.0, min(1.0, max(own) / scale))
 
 
 def _observed_markers_for(supports: list, service: str | None) -> set[str]:
@@ -243,6 +280,10 @@ def rank_hypotheses(
             # 字母序兜底是已知成本（ARCHITECTURE §2.12），现在用有依据的
             # 判据替换它。判据对所有来源一致：规则/模型/人工都走这里。
             -_mechanism_fit(h, signals),
+            # R-011 同分裁决：**偏离自身基线更多的那条观测更有说服力**。
+            # 放在机制匹配度之后、服务名之前：字母序是已知成本
+            # （ARCHITECTURE §2.12），任何有依据的判据都该排在它前面。
+            -round(signals.severity, 6),
             (h.candidate_service or "").lower(),
             h.candidate_component is None,  # False(有组件) 排前面
             (h.fault_type or "").lower(),
@@ -257,10 +298,31 @@ def rank_hypotheses(
         ranked.append(RankedCandidate(
             hypothesis_id=hid, score=score, rank=i,
             status=status, applied_rules=rules,
+            severity=round(s.severity, 6),
         ))
 
+    _annotate_severity_ties(ranked, by_id)
     _apply_symptom_rule(ranked, by_id_full, topology)
     return ranked
+
+
+def _annotate_severity_ties(ranked: list[RankedCandidate], by_id: dict) -> None:
+    """给"靠幅度赢下同分"的候选记一条 R-011，让排序结果可被复核。
+
+    不标注的话，报告里两个候选都是 1 分、一个排前面，读者无从判断
+    "为什么是它" —— 而排序的全部价值就在这一点上。
+    """
+    for higher, lower in zip(ranked, ranked[1:]):
+        if higher.score != lower.score:
+            continue
+        high = by_id.get(higher.hypothesis_id)
+        low = by_id.get(lower.hypothesis_id)
+        if high is None or low is None:
+            continue
+        if round(high.severity, 6) > round(low.severity, 6):
+            higher.applied_rules.append(
+                f"R-011 (larger deviation than {low.hypothesis_id}: "
+                f"{high.severity:.3f} > {low.severity:.3f})")
 
 
 # 症状服务的异常可以完全由上游根因解释，因此不应被断言为独立根因。
@@ -326,7 +388,9 @@ def derive_signals(
     *,
     fault_start,
     earliest_anomaly_at: datetime | None = None,
+    earliest_anomaly_count: int = 1,
     previously_seen: bool = False,
+    severity_scale: float = 0.0,
 ) -> CandidateSignals:
     """从 证据-假设 关联派生二元信号（R3: 二元特征 + 确定性规则）。
 
@@ -341,6 +405,15 @@ def derive_signals(
         earliest_anomaly_at: 全网最早一条异常观测的时间。传进来是为了让
             "谁先坏"可以比较 —— 单个候选看不到别的候选，规则也只能算绝对分。
             缺省 None 表示调用方不提供该信息，R-009 就不参与排序（与旧行为一致）。
+        earliest_anomaly_count: **有几条候选的服务**同样落在最早那个时刻上。
+            只有恰好 1 个才算"它最先坏"。真实数据里所有服务的序列都以故障
+            发生时刻收尾，于是"最早"对所有人同时成立 —— 那种情况下 R-009
+            只是给每个候选都加 1 分（常数不改变排序），却让人以为排序用上了
+            时间信息。并列即弃权，与 `decomposition.earliest_pick` 同一判据。
+        severity_scale: 全池最大指标峰值（跨候选的公共分母）。候选自己的峰值
+            除以它得到 0..1 的 `severity`；不传或为 0 时 `severity` 保持 0，
+            即"没有幅度信息"，排序退回原来的判据。只用于同分裁决，
+            详见 `CandidateSignals.severity`。
     """
     from traceops.domain.models import EvidenceType, RelationType
 
@@ -411,6 +484,8 @@ def derive_signals(
             own_earliest is not None
             and earliest_anomaly_at is not None
             and own_earliest == earliest_anomaly_at
+            and earliest_anomaly_count == 1
         ),
         previously_seen=previously_seen,
+        severity=_relative_severity(supports, severity_scale),
     )

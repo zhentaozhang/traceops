@@ -37,6 +37,7 @@ from traceops.domain.models import (
 from traceops.evidence.graph import (
     build_evidence_graph,
     earliest_anomaly,
+    metric_peak,
     ordering_violations,
     promote_relations,
 )
@@ -135,6 +136,15 @@ class InvestigationRequest(BaseModel):
     budget: dict[str, Any] | None = None
     #: 沿下游依赖展开的层数（契约 payload.scope_depth）。
     scope_depth: int | None = None
+    #: **没有拓扑时**要查哪些服务（契约 payload.scope_services）。
+    #:
+    #: 存在的理由：拓扑只回答"谁依赖谁"，而"这次故障波及哪些服务"是告警
+    #: 自带的另一件事（标签、受影响实例列表、值班人看到的面板）。两者混成
+    #: 一个字段时，没有调用图就只剩一条路——编一个方向出来。我们编过一次
+    #: （以告警服务为中心的星形），代价是 124 个真实案例里 52 个把真因判成
+    #: "告警服务的症状"，AC@1 从 0.87 掉到 0.54。
+    #: 服务清单不进假设、不排序，只决定取证范围（见 `_scope_services`）。
+    scope_services: list[str] | None = None
     #: 本次调查可用的依赖边 [[caller, callee], ...]。
     topology_edges: list[list[str]] | None = None
     #: 这一轮在重做哪一轮（契约 payload.retry_of）。首次尝试为 None。
@@ -417,6 +427,9 @@ def _parse_dt(value: str | datetime) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+#: 观测类证据（不含 EVENT：变更事件不是"谁坏了"的观测）。
+_OBSERVED_TYPES = frozenset({EvidenceType.METRIC, EvidenceType.LOG, EvidenceType.TRACE})
+
 INVESTIGATION_TIER = "investigation"
 IMPACT_TIER = "impact"
 
@@ -432,7 +445,11 @@ def _scope_services(request: InvestigationRequest, ctx: "RunContext") -> list[tu
     让它成为候选等于制造错误根因。
     """
     if ctx.topology is None:
-        return [(request.service_hint, INVESTIGATION_TIER)]
+        # 没有方向信息时仍然可以有一份"要查谁"的清单：它只决定范围，
+        # 不产生依赖边，因此 R-008（症状降级）保持关闭 —— 我们不知道谁在上游。
+        declared = [s for s in (request.scope_services or []) if s and s != request.service_hint]
+        ordered = [request.service_hint] + sorted(set(declared))
+        return [(service, INVESTIGATION_TIER) for service in ordered]
 
     investigation = ctx.topology.expand_scope(request.service_hint, depth=ctx.scope_depth)
     ordered = [request.service_hint] + sorted(investigation - {request.service_hint})
@@ -1175,16 +1192,12 @@ def _session_record(ctx: Any, kind: str, **fields: Any) -> None:
 
 
 def _metric_peak(data: dict[str, Any]) -> float | None:
-    """指标序列的最大值 —— 数字是安全的，且模型需要它判断严重程度。"""
-    peak: float | None = None
-    for item in data.get("series") or []:
-        for point in item.get("values") or []:
-            try:
-                value = float(point[1])
-            except (TypeError, ValueError, IndexError):
-                continue
-            peak = value if peak is None else max(peak, value)
-    return peak
+    """指标序列的最大值 —— 数字是安全的，且模型需要它判断严重程度。
+
+    唯一实现在 `traceops.evidence.graph.metric_peak`：排序的 R-011 幅度裁决
+    与报告里的峰值必须是同一个数，否则"排序按 0.9 判赢、报告写 0.4"。
+    """
+    return metric_peak(data)
 
 
 def _cache_fetch_time(note: dict[str, Any] | None) -> datetime | None:
@@ -1554,12 +1567,28 @@ def _rank_node(state: InvestigationState, config: RunnableConfig) -> dict[str, A
     # 规则本身也只能算绝对分。这里算一次，分给每个候选自己比对。
     earliest = earliest_anomaly(state.get("evidence", []))
     earliest_at = earliest.observed_at if earliest is not None else None
+    # 有几条候选的服务同样落在最早那个时刻 —— 只有恰好 1 个才算"它最先坏"。
+    # 真实数据上所有服务的序列都以故障时刻收尾，于是"最早"对所有人同时成立，
+    # R-009 就成了给每个候选的常数加分：分数都 +1，谁排前面由服务名决定。
+    observed = [e for e in state.get("evidence", [])
+                if e.evidence_type in _OBSERVED_TYPES]
+    earliest_count = len({
+        e.service_id for e in observed
+        if earliest_at is not None and e.observed_at == earliest_at
+    })
+    # R-011 幅度的归一化分母：全池最大指标峰值。跨候选可比的前提是**同一个分母**，
+    # 每个候选各自归一等于把"谁更严重"变成"谁跟自己比变化了多少"。
+    peaks = [p for p in (metric_peak(e.normalized_data or {}) for e in observed
+                         if e.evidence_type is EvidenceType.METRIC) if p is not None]
+    severity_scale = max(peaks) if peaks else 0.0
     memory = _ctx_from(config).memory
     signals = [
         derive_signals(
             h, state.get("links", []), _ctx_from(config).store,
             fault_start=request.fault_start, earliest_anomaly_at=earliest_at,
+            earliest_anomaly_count=earliest_count,
             previously_seen=_previously_seen(memory, h),
+            severity_scale=severity_scale,
         )
         for h in hypotheses
     ]

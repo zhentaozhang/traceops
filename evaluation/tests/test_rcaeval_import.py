@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -20,6 +20,8 @@ from evaluation.adapters.rcaeval_adapter import RcaEvalDataMissing
 from evaluation.harness import error_rate_payload
 from evaluation.importers.cli import main as cli_main
 from evaluation.importers.rcaeval import (
+    ALERT_DELAY_SECONDS,
+    load_topology,
     GRID_POINTS,
     PEAK,
     import_case,
@@ -78,7 +80,9 @@ class TestConversionIsFaithful:
         """RCAEval 的时间戳无时区且按 UTC+8 记录；按本机时区解释会错 8 小时。
 
         夹具里的 "2026-11-02T08:10:00" 就是 UTC+8 的写法，对应的真实时刻是
-        00:10Z；数据行也按这个时刻摆，所以只要时区解释对了，窗口就是吻合的。
+        00:10Z。窗口右端 = 注入时刻 + 告警延迟（告警不会早于故障），
+        所以断言落在窗口上：`window_end == injected + ALERT_DELAY_SECONDS`。
+        只断言 `fault_start` 会漏掉时区——两者一起偏移 8 小时时它仍然"自洽"。
         """
         injected = datetime(2026, 11, 2, 0, 10, tzinfo=UTC)
         epoch = injected.timestamp()
@@ -90,7 +94,8 @@ class TestConversionIsFaithful:
             f"{epoch},40.0",
         ], inject="2026-11-02T08:10:00")
         case = import_dataset(root, dataset="re2-ob")[0]
-        assert case.scenario.fault_start == injected
+        assert case.scenario.window_end == injected + timedelta(seconds=ALERT_DELAY_SECONDS)
+        assert case.scenario.window_start < injected
 
     def test_an_inject_time_outside_the_data_is_refused(self, tmp_path):
         """时区解释错了、或 inject_time 与 CSV 不是同一案例时，必须报错而不是产出空场景。"""
@@ -138,10 +143,62 @@ class TestConversionIsFaithful:
         assert "nearest neighbour" in description
 
 
+class TestDeclaredCallGraph:
+    """调用图是**部署事实**，不是数据集属性：给了才开症状判定，没给只声明范围。"""
+
+    def _edges(self, path: Path) -> list[str]:
+        path.write_text(json.dumps({"edges": [["frontend", "checkoutservice"],
+                                              ["checkoutservice", "emailservice"]]}),
+                        encoding="utf-8")
+        return path
+
+    def test_a_call_graph_turns_the_symptom_rule_on(self, dataset, tmp_path):
+        topology = load_topology(self._edges(tmp_path / "graph.json"))
+        scenario = import_dataset(dataset, dataset="re2-ob", topology=topology)[0].scenario
+        assert [tuple(edge) for edge in scenario.topology_edges] == [
+            ("frontend", "checkoutservice"), ("checkoutservice", "emailservice")]
+        assert scenario.scope_services == [], (
+            "有边时范围由拓扑展开，不该再单独声明一份可能与之矛盾的服务清单")
+        assert "declared edges were supplied" in scenario.description
+
+    def test_without_a_call_graph_only_the_scope_is_declared(self, dataset):
+        scenario = import_dataset(dataset, dataset="re2-ob")[0].scenario
+        assert scenario.topology_edges == []
+        assert scenario.scope_services, "没有调用图时仍要知道这次波及哪些服务"
+
+    def test_a_bare_list_and_an_edges_object_are_both_accepted(self, tmp_path):
+        bare = tmp_path / "bare.json"
+        bare.write_text(json.dumps([["a", "b"]]), encoding="utf-8")
+        assert load_topology(bare) == [("a", "b")]
+        wrapped = self._edges(tmp_path / "wrapped.json")
+        assert load_topology(wrapped)[0] == ("frontend", "checkoutservice")
+
+    @pytest.mark.parametrize("payload, reason", [
+        ("[]", "empty"),
+        (json.dumps({"edges": ["frontend->checkout"]}), r"not a \[caller, callee\]"),
+        (json.dumps([["a"]]), r"not a \[caller, callee\]"),
+        (json.dumps([["a", "a"]]), "itself"),
+        (json.dumps([["a", ""]]), "non-empty"),
+    ])
+    def test_a_broken_graph_is_refused_with_a_reason(self, tmp_path, payload, reason):
+        path = tmp_path / "bad.json"
+        path.write_text(payload, encoding="utf-8")
+        with pytest.raises(ValueError, match=reason):
+            load_topology(path)
+
+
 class TestTheScenarioIsUsableDownstream:
     def test_the_window_contains_the_fault(self, dataset):
+        """窗口必须**包含故障开始之后的数据**，而不是停在故障之前。
+
+        告警时刻（`fault_start`）是窗口右端，注入时刻在它之前 `ALERT_DELAY_SECONDS`。
+        早先两者相等、窗口完全落在注入之前：检测器看到的全是故障前的平静曲线，
+        "严重程度"只能从窗口外偷算 —— 那种数字衡量的是转换，不是检测。
+        """
         scenario = import_dataset(dataset, dataset="re2-ob")[0].scenario
-        assert scenario.window_start < scenario.fault_start < scenario.window_end
+        assert scenario.window_start < scenario.fault_start == scenario.window_end
+        injected = scenario.fault_start - timedelta(seconds=ALERT_DELAY_SECONDS)
+        assert scenario.window_start < injected < scenario.fault_start
 
     def test_the_harness_sees_the_injected_spike(self, dataset):
         """真正的验收：喂给 harness 之后，注入时刻前后确实超过错误率阈值。"""

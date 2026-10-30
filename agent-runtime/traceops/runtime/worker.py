@@ -660,6 +660,9 @@ def derive_request_from_event(message: dict[str, Any]) -> InvestigationRequest:
         alert_summary=payload.get("alert_summary"),
         budget=payload.get("budget"),
         scope_depth=payload.get("scope_depth"),
+        # 没有调用图时的取证范围。契约里加了这个字段却不在这里读，
+        # 等于又造一个"定义了但没人读"的字段（R-009 的老毛病）。
+        scope_services=payload.get("scope_services"),
         topology_edges=payload.get("topology_edges"),
         # 重试上下文：在重做哪一轮、上一轮哪些源够不到。
         # 前一轮缺什么直接决定这一轮的**收集顺序**（见 _prioritise_plan）——

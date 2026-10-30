@@ -111,6 +111,7 @@ def _task_of(scenario: Scenario, case_id: str) -> dict[str, Any]:
         "window_start": scenario.window_start.isoformat(),
         "window_end": scenario.window_end.isoformat(),
         "topology_edges": [list(edge) for edge in scenario.topology_edges],
+        "scope_services": list(scenario.scope_services),
         "scope_depth": scenario.scope_depth,
         "services": services_of(scenario),
         "config_change": (

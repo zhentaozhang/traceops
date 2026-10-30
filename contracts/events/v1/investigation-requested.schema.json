@@ -12,8 +12,16 @@
   "properties": {
     "envelope": {
       "allOf": [
-        {"$ref": "../../common/event-envelope.schema.json"},
-        {"properties": {"event_type": {"const": "investigation.requested"}}}
+        {
+          "$ref": "../../common/event-envelope.schema.json"
+        },
+        {
+          "properties": {
+            "event_type": {
+              "const": "investigation.requested"
+            }
+          }
+        }
       ]
     },
     "payload": {
@@ -59,7 +67,10 @@
         "known_unavailable": {
           "type": "array",
           "maxItems": 50,
-          "items": {"type": "string", "minLength": 1},
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
           "description": "上一轮够不到的数据源。新一轮必须**先查这些**：把预算花在上一轮已经成功的源上、还没轮到失败的那个就把预算耗尽，只是把同一次失败重演一遍。"
         },
         "alert_summary": {
@@ -111,6 +122,16 @@
               "minLength": 1
             }
           }
+        },
+        "scope_services": {
+          "type": "array",
+          "maxItems": 100,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "没有调用图时要查哪些服务（服务名清单）。只决定取证范围，不产生依赖边：方向未知时症状判定（R-008）保持关闭。与 topology_edges 同时给出时以拓扑展开为准。"
         },
         "scope_depth": {
           "type": "integer",
