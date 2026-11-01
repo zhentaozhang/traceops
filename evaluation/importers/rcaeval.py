@@ -80,7 +80,13 @@ from evaluation.adapters.rcaeval_adapter import (
     _read_metric_rows,
     fault_type_for,
 )
-from evaluation.scenario import GroundTruth, Scenario, ServiceSignals, Signals
+from evaluation.scenario import (
+    GroundTruth,
+    Scenario,
+    ServiceSignals,
+    Signals,
+    SlowSpan,
+)
 
 #: 目标网格间距，与 `evaluation.harness.STEP_SECONDS` 保持一致。
 GRID_SECONDS = 60
@@ -127,6 +133,16 @@ def _read_columns(path: Path) -> tuple[list[float], dict[str, list[float | None]
     if path.suffix == ".parquet":
         return _read_parquet(path)
     return _read_metric_rows(path)
+
+
+def _read_parquet_table(path: Path):
+    """读任意一张 parquet 表（pyarrow 惰性导入）。"""
+    try:
+        from pyarrow import parquet as arrow_parquet
+    except ImportError as exc:  # pragma: no cover - 取决于本地环境
+        raise RcaEvalDataMissing(
+            f"reading {path} needs pyarrow (pip install pyarrow)") from exc
+    return arrow_parquet.read_table(path)
 
 
 def _read_parquet(path: Path) -> tuple[list[float], dict[str, list[float | None]]]:
@@ -455,6 +471,146 @@ def _kind_for_service(service: str, chosen_metric: str,
     return "latency"
 
 
+#: 一条 span 的自耗时越过"基线多少倍"才被当成"这个服务自己慢"。
+SELF_TIME_RATIO = 3.0
+#: 自耗时的绝对下限（微秒）。慢 10ms 的服务不值得进证据。
+SELF_TIME_FLOOR_US = 500_000
+#: 每个服务最多带几条日志 / span，避免把整份日志塞进报告。
+MAX_LOGS_PER_SERVICE = 5
+MAX_SPANS_PER_SERVICE = 3
+#: 日志里出现这些词的记录才算"错误日志"。这是**检索条件**，不是结论：
+#: 它决定"要不要把这条给人看"，不决定根因。
+_LOG_ERROR_HINTS = ("error", "exception", "timeout", "timed out", "fail",
+                    "refused", "unavailable", "exhausted", "panic", "fatal")
+
+
+def _read_logs(path: Path) -> list[tuple[float, str, str]]:
+    """读 `logs.parquet` → [(epoch 秒, 容器名, 消息)]。"""
+    table = _read_parquet_table(path)
+    times = table.column("timestamp").to_pylist()
+    names = table.column("container_name").to_pylist()
+    messages = table.column("message").to_pylist()
+    rows: list[tuple[float, str, str]] = []
+    for stamp, name, message in zip(times, names, messages):
+        if stamp is None or not message:
+            continue
+        rows.append((float(stamp), str(name or ""), str(message)))
+    return rows
+
+
+def _read_spans(path: Path) -> list[dict[str, object]]:
+    """读 `traces.parquet` → span 列表，并算出**自耗时**。
+
+    自耗时 = 本 span 时长 − 所有直接子 span 时长之和。父 span 的时长包含子 span，
+    所以"上游被打得更响"在总时长上永远成立；只有自耗时能回答"慢在谁身上"。
+    这正是 OpenRCA FAQ 里那条经验：网络类故障只看 KPI 看不出来，要看父子 span 延迟。
+    """
+    table = _read_parquet_table(path)
+    spans: list[dict[str, object]] = []
+    children: dict[tuple[str, str], int] = {}
+    for trace, span_id, parent, start, duration, service, operation, method in zip(
+        table.column("traceID").to_pylist(),
+        table.column("spanID").to_pylist(),
+        table.column("parentSpanID").to_pylist(),
+        table.column("startTime").to_pylist(),
+        table.column("duration").to_pylist(),
+        table.column("serviceName").to_pylist(),
+        table.column("operationName").to_pylist(),
+        table.column("methodName").to_pylist(),
+    ):
+        if start is None or duration is None or not service:
+            continue
+        key = (str(trace), str(parent))
+        span = {
+            "at": float(start) / 1e6,          # startTime 是微秒纪元
+            "duration_us": float(duration),    # duration 也是微秒
+            "service": str(service),
+            "name": str(operation or method or "span"),
+            "trace": str(trace),
+            "span": str(span_id),
+            "parent": str(parent),
+        }
+        spans.append(span)
+        children[key] = children.get(key, 0) + int(span["duration_us"])
+    for span in spans:
+        # 子 span 按 (traceID, parentSpanID) 归组；某个 span 的"子"就是
+        # parentSpanID 等于它自己 spanID 的那些 —— 只减直接子，不能减整棵子树。
+        child_total = children.get((span["trace"], span["span"]), 0)
+        span["self_us"] = max(0.0, float(span["duration_us"]) - child_total)
+    return spans
+
+
+def _slow_spans_and_logs(
+    case_dir: Path, *, anchor_epoch: float,
+) -> tuple[dict[str, list[SlowSpan]], dict[str, list[str]]]:
+    """从真实 logs / traces 里取"这个服务自己慢"的证据与错误日志。
+
+    只认**自耗时**越过基线的 span：上游调用的总时长天然包含下游，
+    拿总时长排序会把最上游的服务排在第一位，而那只是"它等了别人"。
+    """
+    spans_by_service: dict[str, list[SlowSpan]] = {}
+    logs_by_service: dict[str, list[str]] = {}
+    traces_path = case_dir / "traces.parquet"
+    logs_path = case_dir / "logs.parquet"
+    if traces_path.exists():
+        try:
+            spans = _read_spans(traces_path)
+        except RcaEvalDataMissing:
+            spans = []
+        base: dict[str, list[float]] = {}
+        after: dict[str, list[dict[str, object]]] = {}
+        for span in spans:
+            service = str(span["service"])
+            if float(span["at"]) < anchor_epoch:
+                base.setdefault(service, []).append(float(span["self_us"]))
+            elif float(span["at"]) < anchor_epoch + STEP_AFTER_MINUTES * 60:
+                after.setdefault(service, []).append(span)
+        for service, rows in after.items():
+            baseline = _median(base.get(service, []))
+            threshold = max(SELF_TIME_FLOOR_US, SELF_TIME_RATIO * baseline)
+            slow = [row for row in rows if float(row["self_us"]) >= threshold]
+            if not slow:
+                continue
+            slow.sort(key=lambda row: float(row["self_us"]), reverse=True)
+            picked: list[SlowSpan] = []
+            seen: set[str] = set()
+            for row in slow:
+                name = str(row["name"])
+                if name in seen:
+                    continue
+                seen.add(name)
+                picked.append(SlowSpan(name=name, duration_ms=round(float(row["duration_us"]) / 1000.0, 3)))
+                if len(picked) >= MAX_SPANS_PER_SERVICE:
+                    break
+            if picked:
+                spans_by_service[service] = picked
+    if logs_path.exists():
+        try:
+            rows = _read_logs(logs_path)
+        except RcaEvalDataMissing:
+            rows = []
+        for stamp, container, message in rows:
+            if not (anchor_epoch <= stamp < anchor_epoch + STEP_AFTER_MINUTES * 60):
+                continue
+            lowered = message.lower()
+            if not any(hint in lowered for hint in _LOG_ERROR_HINTS):
+                continue
+            bucket = logs_by_service.setdefault(container, [])
+            if message not in bucket and len(bucket) < MAX_LOGS_PER_SERVICE:
+                bucket.append(message)
+    return spans_by_service, logs_by_service
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
 def import_case(case_dirs: list[Path], *, dataset: str,
                 topology: list[tuple[str, str]] | None = None) -> ImportedCase:
     """把同一案例名下的若干 `{service}_{metric}` 目录合成一个场景。
@@ -546,6 +702,25 @@ def import_case(case_dirs: list[Path], *, dataset: str,
         # 代价是"同一个服务既变慢又出错"只能保留一半——这写进 description。
         if existing is None or max(candidate.error_rate_series) > max(existing.error_rate_series):
             per_service[service] = candidate
+
+    # 真实日志与链路：只在案例目录里确实有这两份文件时才用。
+    # 它们回答的是指标回答不了的问题 ——"慢在谁自己身上"（自耗时）。
+    spans_by_service: dict[str, list[SlowSpan]] = {}
+    logs_by_service: dict[str, list[str]] = {}
+    for case_dir in dict.fromkeys(case_dirs):
+        found_spans, found_logs = _slow_spans_and_logs(case_dir, anchor_epoch=anchor_epoch)
+        for service, spans in found_spans.items():
+            spans_by_service.setdefault(service, spans)
+        for service, messages in found_logs.items():
+            logs_by_service.setdefault(service, messages)
+    for service, spans in spans_by_service.items():
+        entry = per_service.get(service)
+        if entry is not None:
+            entry.slow_spans = spans
+    for service, messages in logs_by_service.items():
+        entry = per_service.get(service)
+        if entry is not None:
+            entry.error_logs = messages
 
     truth_service, truth_metric = truth_key
     if not per_service:

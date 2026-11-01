@@ -513,3 +513,83 @@ class TestMetricKinds:
         """保留了哪一条、丢掉了哪一条，必须写在场景说明里。"""
         scenario, _ = _import_one(tmp_path, "delay")
         assert "most anomalous column" in scenario.description
+
+
+class TestRealLogsAndTraces:
+    """RE2 带 `logs.parquet` 与 `traces.parquet`：慢在谁身上，由**自耗时**回答。
+
+    这是这一层唯一不能省的一条规则。父 span 的时长天然包含子 span，
+    所以"总时长最长的服务"永远是调用链的最上游 —— 用它排序，等于把
+    "我等了别人 30 秒"误判成"我慢"。只有减掉直接子 span 的自耗时能区分二者。
+    """
+
+    def _write(self, root: Path, name: str, *, slow_upstream: bool = True) -> Path:
+        pyarrow = pytest.importorskip("pyarrow")
+        import pyarrow.parquet as pq
+
+        case = root / name
+        case.mkdir(parents=True)
+        inject = INJECT_EPOCH
+        times = [inject - 30 * 60 + i * 60 for i in range(60)]
+        pq.write_table(
+            pyarrow.table({"time": times,
+                           "checkoutservice_cpu": [1.0 if t < inject else 60.0 for t in times],
+                           "frontend_cpu": [1.0 for _ in times]}),
+            case / "metrics.parquet")
+        # 一条 trace：frontend(总 31s) → checkout(总 31s)，checkout 无子 span。
+        # checkout 自耗时 31s，frontend 自耗时 ~0.5s。
+        base_us = int(inject) * 1_000_000 + 5_000_000
+        rows = {
+            "traceID": ["t1", "t1"],
+            "spanID": ["front", "pay"],
+            "parentSpanID": ["", "front"],
+            "serviceName": ["frontend", "checkoutservice"],
+            "operationName": ["frontend", "PlaceOrder"],
+            "methodName": [None, "PlaceOrder"],
+            "startTime": [base_us, base_us + 500_000],
+            "duration": [31_000_000, 30_950_000],
+            "statusCode": [0, 0],
+        }
+        pq.write_table(pyarrow.table(rows), case / "traces.parquet")
+        pq.write_table(
+            pyarrow.table({
+                "timestamp": [inject + 5, inject + 6, inject + 7],
+                "container_name": ["checkoutservice", "checkoutservice", "frontend"],
+                "message": ["rpc error: code = DeadlineExceeded", "cart updated",
+                            "request started"],
+            }),
+            case / "logs.parquet")
+        (case / "inject_time.txt").write_text(str(inject), encoding="utf-8")
+        return case
+
+    def test_only_the_span_that_is_slow_on_its_own_counts(self, tmp_path):
+        self._write(tmp_path, "re2ob_checkoutservice_cpu_1")
+        scenario = import_dataset(tmp_path, dataset="re2-ob")[0].scenario
+        services = scenario.signals.per_service
+        assert services["checkoutservice"].slow_spans, "checkout 自己慢，必须进证据"
+        assert not services["frontend"].slow_spans, "frontend 只是在等，不算自己慢"
+        assert services["checkoutservice"].slow_spans[0].name == "PlaceOrder"
+
+    def test_only_error_shaped_log_lines_become_evidence(self, tmp_path):
+        self._write(tmp_path, "re2ob_checkoutservice_cpu_2")
+        scenario = import_dataset(tmp_path, dataset="re2-ob")[0].scenario
+        messages = scenario.signals.per_service["checkoutservice"].error_logs
+        assert any("DeadlineExceeded" in m for m in messages)
+        assert not any("cart updated" in m for m in messages)
+
+    def test_a_case_without_logs_or_traces_still_imports(self, tmp_path):
+        pyarrow = pytest.importorskip("pyarrow")
+        import pyarrow.parquet as pq
+
+        case = tmp_path / "re2ob_adservice_cpu_1"
+        case.mkdir(parents=True)
+        inject = INJECT_EPOCH
+        times = [inject - 10 * 60 + i * 60 for i in range(20)]
+        pq.write_table(pyarrow.table({"time": times,
+                                      "adservice_cpu": [1.0 if t < inject else 50.0
+                                                        for t in times]}),
+                       case / "metrics.parquet")
+        (case / "inject_time.txt").write_text(str(inject), encoding="utf-8")
+        scenario = import_dataset(tmp_path, dataset="re2-ob")[0].scenario
+        assert not scenario.signals.per_service["adservice"].slow_spans
+        assert not scenario.signals.per_service["adservice"].error_logs
