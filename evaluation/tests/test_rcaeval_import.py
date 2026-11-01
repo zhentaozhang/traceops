@@ -441,3 +441,75 @@ class TestScenarioLoader:
             scenario.model_dump_json(indent=2), encoding="utf-8")
         loaded = load_scenarios(tmp_path)
         assert [s.scenario_id for s in loaded] == ["synthetic-two-service"]
+
+
+def _import_one(tmp_path_cases, fault: str = "delay"):
+    """造一个 parquet 案例并导入，返回 (scenario, case)。"""
+    pyarrow = __import__("pytest").importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    index = len(list(tmp_path_cases.glob("*")))
+    root = tmp_path_cases / "dataset"
+    case = root / f"re1ob_adservice_{fault}_{index}"
+    case.mkdir(parents=True, exist_ok=True)
+    inject = INJECT_EPOCH
+    times = [inject - 30 * 60 + i * 60 for i in range(60)]
+    values = {
+        "adservice_cpu": [1.0 if t < inject else 1.02 for t in times],
+        "adservice_latency-90": [0.004 if t < inject else 0.220 for t in times],
+        "frontend_latency-90": [0.15 if t < inject else 0.14 for t in times],
+    }
+    if fault != "delay":
+        values["adservice_cpu"] = [1.0 if t < inject else 80.0 for t in times]
+    table = pyarrow.table({"time": times, **values})
+    pq.write_table(table, case / "metrics.parquet")
+    (case / "inject_time.txt").write_text(str(inject), encoding="utf-8")
+    imported = import_dataset(root, dataset="re1-ob")
+    return imported[0].scenario, imported[0]
+
+
+class TestMetricKinds:
+    """指标的**类别**跟着数据走：时延、错误、资源是三种不同的观测。
+
+    这一节钉住的是本轮修 FT@1 的那条规则。它有两半：
+    ① 指标名决定类别（`latency` / `resource` / `error`）；
+    ② 只有"时延在动、别的都没动"才叫延迟劣化 —— 否则叫可用性下降。
+
+    第二半是实测逼出来的：RCAEval 的 `disk` / `loss` 故障也会把时延推上去，
+    只按"最异常那列叫什么"命名，会把 14 个可用性案例说成延迟劣化。
+    """
+
+    def test_the_name_decides_the_kind_not_the_value(self, tmp_path):
+        from evaluation.importers.rcaeval import metric_kind_of
+
+        assert metric_kind_of("latency-90") == "latency"
+        assert metric_kind_of("latency") == "latency"
+        assert metric_kind_of("cpu") == "resource"
+        assert metric_kind_of("mem") == "resource"
+        assert metric_kind_of("error") == "error"
+
+    def test_a_case_where_only_latency_moved_is_a_latency_case(self, tmp_path):
+        """时延列阶跃最大、其余列平 → 这个服务是"变慢"，不是"出错"。"""
+        scenario, _ = _import_one(tmp_path, "delay")
+        truth = scenario.ground_truth.service
+        assert scenario.signals.per_service[truth].metric_kind == "latency"
+
+    def test_a_case_where_errors_also_moved_is_not_pure_latency(self, tmp_path):
+        """错误/资源列也在动 → 不能说"只有响应时间变高了"。"""
+        scenario, _ = _import_one(tmp_path, "cpu")
+        truth = scenario.ground_truth.service
+        assert scenario.signals.per_service[truth].metric_kind in ("resource", "error")
+
+    def test_the_kind_reaches_the_metric_name_in_the_payload(self, tmp_path):
+        """类别必须进到证据里：`__name__` 是下游判断机制的唯一依据。"""
+        from evaluation.harness import error_rate_payload
+
+        scenario, _ = _import_one(tmp_path, "delay")
+        payload = error_rate_payload(scenario)
+        names = [item["metric"].get("__name__") for item in payload["data"]["result"]]
+        assert names == ["service_latency_seconds"]
+
+    def test_the_description_says_one_series_per_service(self, tmp_path):
+        """保留了哪一条、丢掉了哪一条，必须写在场景说明里。"""
+        scenario, _ = _import_one(tmp_path, "delay")
+        assert "most anomalous column" in scenario.description

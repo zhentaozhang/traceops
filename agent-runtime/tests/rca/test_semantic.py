@@ -56,6 +56,15 @@ def _metric(value="0.42"):
         "result_count": 1, "total_records": 1})
 
 
+def _latency_metric(value="0.42"):
+    """一条**时延**指标（名字说明它测的是时间，不是错误率）。"""
+    return _ev(EvidenceType.METRIC, {
+        "kind": "metric", "result_type": "matrix",
+        "series": [{"metric": {"__name__": "service_latency_seconds", "service": "redis"},
+                    "values": [[TS.timestamp(), value]]}],
+        "result_count": 1, "total_records": 1})
+
+
 def _log(message="ERROR redis timeout", level="error"):
     return _ev(EvidenceType.LOG, {
         "kind": "log", "total_records": 1,
@@ -98,9 +107,33 @@ class TestCoverage:
 
 
 class TestLatencyMechanismDistinction:
-    def test_latency_needs_only_slow_span(self):
+    def test_a_slow_span_is_full_evidence_of_latency(self):
+        """慢 span 同时证实两件事：响应时间上升、并且慢到了链路层面。
+
+        延迟劣化预期「时延指标过阈」与「慢 span」两项，慢 span 会同时产生
+        `latency_rise`，所以覆盖 2/2。这样它和"只有聚合指标"的部署（1/2）
+        在同一量纲上，跨机制比较不会因为数据源多少而偏。
+        """
         check = check_hypothesis(_hyp("latency_degradation"), [_slow_trace()])
         assert check.coverage == 1.0
+        assert set(check.observed) == {"latency_rise", "slow_span"}
+
+    def test_a_latency_metric_alone_is_half_the_evidence(self):
+        """只有聚合时延指标时能断言"变慢了"，但缺链路层面的证实。"""
+        check = check_hypothesis(_hyp("latency_degradation"), [_latency_metric()])
+        assert check.coverage == 0.5
+        assert check.observed == ("latency_rise",)
+        assert check.missing == ("slow_span",)
+
+    def test_an_error_rate_metric_does_not_prove_latency(self):
+        """错误率上升不是"变慢"的证据：机制之间不能互相顶替。
+
+        这是本轮修 FT@1 的反向保险 —— 如果按数值而不是按指标名分类，
+        这两者会被混成一个标记，24 个 delay 案例就会被答成可用性下降。
+        """
+        check = check_hypothesis(_hyp("latency_degradation"), [_metric()])
+        assert check.coverage == 0.0
+        assert "latency_rise" in check.missing
 
     def test_slow_span_does_not_cover_availability(self):
         """慢 span 不是"可用性下降"的预期观测 —— 机制之间不能互相顶替。"""
@@ -135,7 +168,7 @@ class TestSemanticGateInReport:
         from traceops.domain.models import HypothesisStatus
         from traceops.rca.ranking import RankedCandidate
         from traceops.rca.report import build_report
-        from traceops.rca.semantic import check_hypothesis
+        from traceops.rca.semantic import _observed_markers, check_hypothesis
         from traceops.evidence.store import EvidenceStore
 
         hypothesis = _hyp(fault_type)

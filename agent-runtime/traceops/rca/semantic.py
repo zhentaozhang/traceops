@@ -30,7 +30,7 @@ aurora 的 conclusion_gate 有一句话正是这个意思：
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from traceops.domain.models import Evidence, EvidenceType, RootCauseHypothesis
 
@@ -65,7 +65,11 @@ class SemanticCheck:
 EXPECTATIONS: dict[str, tuple[str, ...]] = {
     "availability_degradation": ("error_rate_rise", "error_logs"),
     "pool_exhaustion": ("error_rate_rise", "error_logs", "slow_span"),
-    "latency_degradation": ("slow_span",),
+    # 延迟劣化的两项预期观测，与 `_EXPECTED_BY_FAULT` 保持一致：
+    # 时延指标过阈与慢 span。两者都产生 `latency_rise`，
+    # 于是"有链路数据"的部署覆盖率 1.0、"只有聚合指标"的部署 0.5 ——
+    # 与可用性下降（指标过阈 + 错误日志）同一量纲，跨机制可比。
+    "latency_degradation": ("latency_rise", "slow_span"),
     "dependency_timeout": ("error_logs", "error_rate_rise"),
 }
 
@@ -87,12 +91,18 @@ def _observed_markers(evidence_list: list[Evidence], service: str, topology=None
             continue
 
         if evidence.evidence_type is EvidenceType.METRIC:
-            series = evidence.normalized_data.get("series") or []
-            for item in series:
+            for item in evidence.normalized_data.get("series") or []:
+                # 标记由**指标名**分类：`service_latency_seconds` 过阈说明"变慢"，
+                # 不是"出错"。混成一个标记会让延迟类故障永远被说成可用性下降。
+                name = str((item.get("metric") or {}).get("__name__", "")).lower()
+                marker = "latency_rise" if any(
+                    hint in name for hint in ("latency", "duration", "response_time", "rt_")
+                ) else "error_rate_rise"
                 for point in item.get("values") or []:
                     try:
                         if float(point[1]) >= 0.05:
-                            markers.add("error_rate_rise")
+                            markers.add(marker)
+                            break
                     except (TypeError, ValueError, IndexError):
                         continue
 
@@ -111,7 +121,10 @@ def _observed_markers(evidence_list: list[Evidence], service: str, topology=None
                 try:
                     if float(span.get("duration_us") or 0) / 1_000_000 >= 0.5:
                         markers.add("slow_span")
-                        break
+                        # 一个慢 span **就是**延迟上升的证据。不额外加这条标记，
+                        # 会让"只有链路数据"的部署把延迟劣化算成缺一半预期观测
+                        # （实测：合成的 F-011 因此从 SUPPORTED 掉成别的机制）。
+                        markers.add("latency_rise")
                 except (TypeError, ValueError):
                     continue
     return markers

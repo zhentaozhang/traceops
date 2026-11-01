@@ -11,7 +11,7 @@ missing_data，结论可以是 INCONCLUSIVE —— 这正是要评估的行为�
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 from evaluation.investigation_profile import DEFAULT_PROFILE
@@ -107,6 +107,26 @@ def _spans_for(scenario: Scenario, service: str) -> tuple[list, int]:
     return list(scenario.signals.slow_spans), 0
 
 
+#: `metric_kind` → 指标名。名字不是装饰：证据要自己说清"我测的是什么"，
+#: 否则下游只能假设"所有序列都是错误率"——那正是 FT@1 只有 0.79 的原因
+#: （延迟类故障被一律答成 availability_degradation）。
+METRIC_NAMES = {
+    "error": "service_errors_total",
+    "latency": "service_latency_seconds",
+    "resource": "service_resource_usage",
+}
+
+
+def _metric_name(scenario: Scenario, service: str) -> str:
+    return METRIC_NAMES.get(_kind_for(scenario, service), METRIC_NAMES["error"])
+
+
+def _kind_for(scenario: Scenario, service: str) -> str:
+    per_service = scenario.signals.per_service or {}
+    signals = per_service.get(service)
+    return getattr(signals, "metric_kind", "error") if signals is not None else "error"
+
+
 def error_rate_payload(scenario: Scenario, service: str | None = None) -> dict[str, Any]:
     service = service or scenario.service_hint
     series = _series_for(scenario, service)
@@ -122,7 +142,10 @@ def error_rate_payload(scenario: Scenario, service: str | None = None) -> dict[s
         "status": "success",
         "data": {
             "resultType": "matrix",
-            "result": [{"metric": {"service": service}, "values": values}],
+            "result": [{
+                "metric": {"__name__": _metric_name(scenario, service), "service": service},
+                "values": values,
+            }],
         },
     }
 

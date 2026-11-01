@@ -36,6 +36,18 @@ class ServiceSignals(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    #: 这条序列**测的是什么**。它不是装饰：故障机制的分类要由"哪个测量动了"决定。
+    #:
+    #: 三种取值对应三种真实指标：
+    #: * `error`   —— 请求错误率 / 错误计数（`service_errors_total`）
+    #: * `latency` —— 响应时延分位（`service_latency_seconds`），
+    #:   异常含义是"变慢"而不是"出错"
+    #: * `resource` —— CPU / 内存 / 磁盘等资源量（`service_resource_usage`）
+    #:
+    #: 把三者混成一条"错误率"，等于把"这个服务慢"和"这个服务错"说成同一件事。
+    #: 实测代价：RCAEval RE1-OB 上 24 个 delay 案例（真因机制是延迟劣化）被我们
+    #: 一律答成 availability_degradation，FT@1 因此只有 0.79。
+    metric_kind: Literal["error", "latency", "resource"] = "error"
     error_rate_series: list[float] = Field(default_factory=list)
     error_logs: list[str] = Field(default_factory=list)
     slow_spans: list[SlowSpan] = Field(default_factory=list)

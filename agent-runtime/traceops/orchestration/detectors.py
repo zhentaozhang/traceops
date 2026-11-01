@@ -33,9 +33,26 @@ _ERROR_HINTS = ("error", "exception", "timeout", "timed out", "pool", "refused",
 _EXPECTED_BY_FAULT: dict[str, tuple[str, ...]] = {
     "availability_degradation": ("error_rate_rise", "error_logs"),
     "pool_exhaustion": ("error_rate_rise", "error_logs", "slow_span"),
-    "latency_degradation": ("slow_span",),
+    # 延迟劣化的两项预期观测：时延指标过阈（`latency_rise`）与慢 span。
+    # 两者都算 `latency_rise` 的证实，所以"有链路数据"的部署能拿满分，
+    # "只有聚合指标"的部署拿一半 —— 覆盖率因此仍然跨机制可比
+    # （可用性下降同样是"指标过阈"+"错误日志"两项里的一项）。
+    "latency_degradation": ("latency_rise", "slow_span"),
     "dependency_timeout": ("error_logs", "error_rate_rise"),
 }
+
+#: 指标名里出现这些词 → 这条序列测的是**时延**，异常含义是"变慢"。
+#: 判据是名字而不是数值：数值只说明"变了多少"，名字才说明"什么变了"。
+_LATENCY_NAME_HINTS = ("latency", "duration", "response_time", "rt_")
+
+
+def _series_is_latency(evidence: Evidence) -> bool:
+    """这条指标证据测的是时延吗（看 `__name__`，不看数值）。"""
+    for series in evidence.normalized_data.get("series", []):
+        name = str((series.get("metric") or {}).get("__name__", "")).lower()
+        if any(hint in name for hint in _LATENCY_NAME_HINTS):
+            return True
+    return False
 
 
 def metric_is_anomalous(evidence: Evidence) -> bool:
@@ -241,8 +258,15 @@ def generate_hypotheses(
         if ev.service_id is None:
             continue
         if metric_is_anomalous(ev):
-            _add(ev.service_id, "availability_degradation", None,
-                 "error rate crossed baseline threshold", reported_by=ev.service_id)
+            # 机制由**哪个测量动了**决定，而不是由模板决定：
+            # 时延指标过阈 → 延迟劣化；错误/资源指标过阈 → 可用性下降。
+            # 合并成一种的代价是实测的：24 个 delay 案例全部答成可用性下降。
+            if _series_is_latency(ev):
+                _add(ev.service_id, "latency_degradation", None,
+                     "response time crossed baseline threshold", reported_by=ev.service_id)
+            else:
+                _add(ev.service_id, "availability_degradation", None,
+                     "error rate crossed baseline threshold", reported_by=ev.service_id)
         if logs_are_anomalous(ev):
             text = " ".join(str(r.get("message", "")) for r in ev.normalized_data.get("records", []))
             attribution = _attribute_dependency(text, ev.service_id, topology)

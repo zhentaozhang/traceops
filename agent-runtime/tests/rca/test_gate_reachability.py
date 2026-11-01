@@ -68,11 +68,15 @@ class TestSemanticGateIsUnreachableInDeterministicPath:
 
         这是精确表述：候选不能由"不在自己期望里"的证据生成。
         """
-        # metric 异常 -> error_rate_rise；错误日志 -> error_logs；慢 span -> slow_span
+        # metric 异常 -> error_rate_rise / latency_rise（由指标名决定）；
+        # 错误日志 -> error_logs；慢 span -> slow_span **且** latency_rise。
+        # 注意 latency_degradation 的生成证据是 `latency_rise` 而不是 `slow_span`：
+        # 慢 span 与"时延指标的异常"是同一种观测（响应时间变高）的两种证实方式，
+        # 两者都产生 latency_rise，所以期望里只写这一项。
         generation_evidence = {
             "availability_degradation": "error_rate_rise",
             "dependency_timeout": "error_logs",
-            "latency_degradation": "slow_span",
+            "latency_degradation": "latency_rise",
             "pool_exhaustion": "error_rate_rise",
         }
         for fault_type, marker in generation_evidence.items():

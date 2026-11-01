@@ -406,6 +406,55 @@ def load_topology(path: Path) -> list[tuple[str, str]]:
     return parsed
 
 
+#: 指标名 → 这条序列**测的是什么**。用途不是分类好看，而是让机制判定有依据：
+#: "延迟上升"和"错误率上升"是两种不同的故障机制（见 ServiceSignals.metric_kind）。
+_RESOURCE_METRICS = ("cpu", "mem", "diskio", "socket", "workload", "load", "disk")
+_LATENCY_METRICS = ("latency", "duration", "response_time", "rt")
+
+
+#: 判定"这条指标真的动了"的最小阶跃（单位是基线 MAD，即 σ）。
+#: 3σ 是统计上的常规门槛；低于它的列算"没动"，而不是"动了一点点"。
+STEP_SIGNIFICANT_SIGMA = 3.0
+
+
+def metric_kind_of(metric: str) -> str:
+    """由**指标名**判定序列的类别（error / latency / resource）。"""
+    lowered = metric.lower()
+    if any(hint in lowered for hint in _LATENCY_METRICS):
+        return "latency"
+    if any(hint in lowered for hint in _RESOURCE_METRICS):
+        return "resource"
+    return "error"
+
+
+def _kind_for_service(service: str, chosen_metric: str,
+                      readings_by_target: dict, anchor_epoch: float) -> str:
+    """这个服务的异常**该怎么命名**（error / latency / resource）。
+
+    规则不是"最异常的那列叫什么"，而是"是不是**只有**时延在动"：
+
+    * 只有时延列越过 3σ、其余列都在噪声里 → `latency`（"变慢但没出错"）
+    * 时延列之外还有错误/资源列越过 3σ → 按那一条的类别命名
+
+    理由是实测出来的：RCAEval 的 `loss` / `disk` 故障也会把时延推上去，
+    如果只按"最异常的那列"命名，这些案例会被一律答成延迟劣化，
+    而数据集的标签是按**注入的故障**给的 —— 两种说法都对，但不是同一个问题。
+    这条规则让"只有时延动"成为**必要条件**，从而只在数据真的只显示变慢时
+    才声称延迟劣化。
+    """
+    kind = metric_kind_of(chosen_metric)
+    if kind != "latency":
+        return kind
+    for (other_service, other_metric), entries in readings_by_target.items():
+        if other_service != service or metric_kind_of(other_metric) == "latency":
+            continue
+        step = max((_step_score(t, v, anchor=anchor_epoch) for _o, t, v in entries), default=0.0)
+        if step >= STEP_SIGNIFICANT_SIGMA:
+            # 时长在动之外还有别的测量在动 → 这是"出错/资源异常"，不是纯变慢。
+            return metric_kind_of(other_metric)
+    return "latency"
+
+
 def import_case(case_dirs: list[Path], *, dataset: str,
                 topology: list[tuple[str, str]] | None = None) -> ImportedCase:
     """把同一案例名下的若干 `{service}_{metric}` 目录合成一个场景。
@@ -489,9 +538,12 @@ def import_case(case_dirs: list[Path], *, dataset: str,
             (_step_score(t, v, anchor=anchor_epoch) for _o, t, v in entries), default=0.0))
         strengths[service] = max(strengths.get(service, 0.0), own)
         candidate = ServiceSignals(
+            metric_kind=_kind_for_service(
+                service, metric, readings_by_target, anchor_epoch),
             error_rate_series=_normalise(series, own=own, scale_to=case_scale))
         existing = per_service.get(service)
-        # 同一服务多条指标时，留"更异常"的那条：我们的错误率只有一条曲线。
+        # 同一服务多条指标时，留"更异常"的那条：我们的证据里每个服务只有一条曲线。
+        # 代价是"同一个服务既变慢又出错"只能保留一半——这写进 description。
         if existing is None or max(candidate.error_rate_series) > max(existing.error_rate_series):
             per_service[service] = candidate
 
@@ -533,6 +585,9 @@ def import_case(case_dirs: list[Path], *, dataset: str,
         "so the window ends after the fault began (an alert never fires before the "
         "fault); the step itself is measured around inject_time",
         "grid: resampled to the harness grid by nearest neighbour, no interpolation",
+        "metric kinds: each service keeps its most anomalous column, tagged with the "
+        "kind the column measures (error / latency / resource); a service that both "
+        "slowed down and errored keeps only the louder half",
         "scope: RCAEval ships no call graph, so the affected services are "
         "declared as a scope list with no edges: every observed service is "
         "investigated, and no dependency direction is invented (symptom "
