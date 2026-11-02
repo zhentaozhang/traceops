@@ -196,5 +196,35 @@ class TestMultiServiceChain:
         （那会丢掉传播链需要的证据）。
         """
         outcome = run_scenario(self._cascade())
-        assert outcome.citation_precision < 1.0, outcome.citation_precision
-        assert outcome.citation_precision > 0.0
+        # 整份报告的精度必然 < 1（级联场景一定引用症状服务的证据），
+        # 而结论自己那条证据链必须是干净的 —— 两个数分开断言，
+        # 否则"报告列全候选"会被误读成"引用不准"。
+        assert outcome.report_evidence_precision < 1.0, outcome.report_evidence_precision
+        assert outcome.report_evidence_precision > 0.0
+        assert outcome.citation_precision == 1.0, outcome.citation_precision
+
+
+class TestWhatThePrecisionNumbersMeasure:
+    """两个精度必须分开：结论证据链 vs 整份报告。
+
+    全量口径长期停在 0.10~0.30，只随候选池大小浮动 —— 它量的是"报告列了多宽"，
+    不是"引用得准不准"。把分母收窄到排第一那条结论的证据链，才测到证据质量；
+    整份报告的宽度另存一个字段，用于保证协同场景仍然引用症状服务的证据。
+    """
+
+    def test_the_conclusion_chain_is_scored_on_its_own(self):
+        outcome = run_scenario(self._cascade())
+
+        assert outcome.citation_precision == 1.0
+        assert outcome.report_evidence_precision < 1.0
+
+    def _cascade(self):
+        return TestMultiServiceChain()._cascade()
+
+    def test_a_specific_mechanism_is_not_penalised_for_being_specific(self):
+        from evaluation.metrics import _fault_type_matches
+
+        assert _fault_type_matches("pool_exhaustion", "availability_degradation")
+        assert _fault_type_matches("availability_degradation", "availability_degradation")
+        assert not _fault_type_matches("availability_degradation", "pool_exhaustion")
+        assert not _fault_type_matches("latency_degradation", "availability_degradation")

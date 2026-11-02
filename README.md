@@ -152,7 +152,7 @@ cd traceops
 python -m venv --system-site-packages .venv
 .venv/bin/python -m pip install -e agent-runtime --no-build-isolation
 
-# 全部测试（agent-runtime 1341 + evaluation 185 + contracts 13 = 1539）
+# 全部测试（agent-runtime 1341 + evaluation 187 + contracts 13 = 1541）
 PYTHONPATH=agent-runtime .venv/bin/python -m pytest agent-runtime/tests evaluation contracts -q
 
 # 跑评估：12 场景 + 指标 + 每个场景一份可读诊断（reports/reports/<id>.md）

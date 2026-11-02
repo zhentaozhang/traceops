@@ -141,6 +141,7 @@ def main(argv: list[str] | None = None) -> int:
         f"abstain={agg.abstention_rate:.2f} "
         f"recall={agg.evidence_recall_mean:.2f} "
         f"prec={agg.citation_precision_mean:.2f} "
+        f"report_prec={agg.report_evidence_precision_mean:.2f} "
         f"chain={agg.chain_order_accuracy:.2f} "
         f"affected={agg.affected_services_accuracy:.2f}"
     )

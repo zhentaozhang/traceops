@@ -61,6 +61,10 @@ class ScenarioOutcome:
     # 规则排序必须赢过它们，否则"证据推理"没有体现在结果上。
     heuristic_peak_top1: bool | None = None
     heuristic_earliest_top1: bool | None = None
+    #: 整份报告（含被排掉的候选）的引用精度。诊断要可审，所以必须列候选证据；
+    #: 但它量的是"报告宽度"，不随结论正确性变化 —— 与 `citation_precision`
+    #: （只算排第一那条结论的证据链）分开保留，谁都不许顶替谁。
+    report_evidence_precision: float = 0.0
 
     #: 本次调查的真实报告对象（不参与打分，也不进 JSON）。
     #: 保留它是为了让 runner 能渲染人类可读的诊断 —— 一个只有分数的评测
@@ -85,6 +89,7 @@ class AggregateMetrics:
     abstention_rate: float
     evidence_recall_mean: float
     citation_precision_mean: float
+    report_evidence_precision_mean: float
     mean_tool_calls: float
     mean_tokens: float
     chain_order_accuracy: float
@@ -175,6 +180,28 @@ def _affected_services_correct(ground_truth, report) -> bool | None:
     return expected == actual
 
 
+#: 机制子类 → 上层机制。评分按"等级匹配"而不是"逐字相等"：
+#: 导入的标签只能给出 `availability_degradation` 这一层（RCAEval 说的是"注入了
+#: 哪种故障"，不是"机制叫什么"）。我们若答出 `pool_exhaustion`（连接池耗尽）
+#: 这种更具体的机制，它**是**一次可用性下降，不该记成答错。
+#: 反过来不成立：答案是可用性下降、我们只说"可用性下降"却拿不到更细的分数。
+_FAULT_SUPERTYPES: dict[str, str] = {
+    "pool_exhaustion": "availability_degradation",
+    "dependency_timeout": "availability_degradation",
+}
+
+
+def _fault_type_matches(predicted: str, truth: str) -> bool:
+    if predicted == truth:
+        return True
+    chain = _FAULT_SUPERTYPES.get(predicted)
+    while chain is not None:
+        if chain == truth:
+            return True
+        chain = _FAULT_SUPERTYPES.get(chain)
+    return False
+
+
 def score_scenario(scenario: "Scenario", result: "InvestigationResult") -> ScenarioOutcome:
     report = result.report
     hypotheses = list(report.hypotheses) if report is not None else []
@@ -184,7 +211,9 @@ def score_scenario(scenario: "Scenario", result: "InvestigationResult") -> Scena
     rank = _rank_of_service(hypotheses, ground_truth.service)
     top = hypotheses[0] if hypotheses else None
 
-    fault_type_at_1 = bool(top is not None and top.fault_type == ground_truth.fault_type)
+    fault_type_at_1 = bool(
+        top is not None and _fault_type_matches(top.fault_type, ground_truth.fault_type)
+    )
 
     if ground_truth.component is None:
         component_at_1: bool | None = None
@@ -216,7 +245,22 @@ def score_scenario(scenario: "Scenario", result: "InvestigationResult") -> Scena
             or _attributed_service(e).strip().lower() == wanted_service
         )
     ]
-    citation_precision = len(attributable) / len(cited) if cited else 0.0
+    # 分母只算"结论自己引用的证据链"，不算整份报告列出的全部候选证据。
+    #
+    # 为什么必须收窄：报告的 `evidence` 是**全部候选**的证据行（诊断要可审，
+    # 评审者得看到被排掉的候选凭什么被排掉）。按全量算，"排第一对了、但报告里
+    # 还列着五个候选的证据"就会被记成精度 1/6 —— 实测该指标长期停在
+    # 0.10~0.30，只随候选池大小浮动，量的是报告宽度而不是证据质量。
+    conclusion_ids = {
+        link.evidence_id
+        for link in (getattr(report, "hypothesis_evidence", []) if report is not None else [])
+        if top is not None and link.hypothesis_id == top.id
+    }
+    conclusion = [e for e in cited if e.id in conclusion_ids] or cited
+    wanted = {id(e) for e in attributable}
+    conclusion_attributable = [e for e in conclusion if id(e) in wanted]
+    citation_precision = len(conclusion_attributable) / len(conclusion) if conclusion else 0.0
+    report_evidence_precision = len(attributable) / len(cited) if cited else 0.0
 
     # ---- rubric ----
     report_text = _report_text(report)
@@ -244,6 +288,7 @@ def score_scenario(scenario: "Scenario", result: "InvestigationResult") -> Scena
         evidence_recall=round(evidence_recall, 4),
         citation_precision=round(citation_precision, 4),
         cited_evidence=len(cited),
+        report_evidence_precision=round(report_evidence_precision, 4),
         fault_injected=ground_truth.fault_type != "none",
         tool_calls=result.tool_calls,
         tokens_used=result.tokens_used,
@@ -344,6 +389,7 @@ def aggregate(rows: Iterable[ScenarioOutcome]) -> AggregateMetrics:
             fault_type_accuracy=0.0, component_accuracy=0.0,
             diagnosis_accuracy=0.0, abstention_rate=0.0,
             evidence_recall_mean=0.0, citation_precision_mean=0.0,
+            report_evidence_precision_mean=0.0,
             mean_tool_calls=0.0, mean_tokens=0.0,
             chain_order_accuracy=0.0, affected_services_accuracy=0.0,
             wrong_answer_rate=0.0, must_identify_rate=0.0,
@@ -372,6 +418,7 @@ def aggregate(rows: Iterable[ScenarioOutcome]) -> AggregateMetrics:
         abstention_rate=_mean([1.0 if r.abstained else 0.0 for r in items]),
         evidence_recall_mean=_mean([r.evidence_recall for r in fault_rows]),
         citation_precision_mean=_mean([r.citation_precision for r in fault_rows]),
+        report_evidence_precision_mean=_mean([r.report_evidence_precision for r in fault_rows]),
         mean_tool_calls=_mean([float(r.tool_calls) for r in items]),
         mean_tokens=_mean([float(r.tokens_used) for r in items]),
         chain_order_accuracy=_mean(
