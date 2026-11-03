@@ -236,16 +236,21 @@ export function Copyable({
   value,
   display,
   mono = true,
+  label,
 }: {
   value: string;
   display?: ReactNode;
   mono?: boolean;
+  /** What the button copies. Defaults to the value itself; override it when
+   *  the visible text is a shortened id the operator would rather read. */
+  label?: string;
 }) {
   return (
     <button
       type="button"
       className={`copyable${mono ? " mono" : ""}`}
       title={value}
+      aria-label={label ? `复制${label}` : `复制 ${value}`}
       onClick={() => {
         void navigator.clipboard?.writeText(value);
       }}
@@ -258,8 +263,35 @@ export function Copyable({
 export function Hash({ value }: { value: string | null | undefined }) {
   if (!value) return <span className="faint">—</span>;
   return (
-    <span className="mono" title={value}>
+    <span className="mono" title={value} translate="no">
       {shortHash(value)}
+    </span>
+  );
+}
+
+/**
+ * An identifier rendered as-is: a service name, a run id, a checksum, a
+ * scenario id.
+ *
+ * These are names in a system, not prose — a browser that helpfully
+ * translates "checkout-service" into "结账-服务" has silently corrupted an
+ * identifier the operator is about to paste into a log query. `translate="no"`
+ * marks the text as untranslatable so the translation engine leaves it alone.
+ */
+export function Ident({
+  children,
+  className,
+  title,
+  style,
+}: {
+  children: ReactNode;
+  className?: string;
+  title?: string;
+  style?: React.CSSProperties;
+}) {
+  return (
+    <span className={className} title={title} style={style} translate="no">
+      {children}
     </span>
   );
 }
@@ -319,6 +351,7 @@ function JsonNode({
           className="json__toggle"
           onClick={() => setOpen((o) => !o)}
           aria-expanded={expanded}
+          aria-label={expanded ? "折叠数组" : "展开数组"}
           hidden={!foldable}
         >
           {expanded ? "▾" : "▸"}
@@ -351,6 +384,7 @@ function JsonNode({
         className="json__toggle"
         onClick={() => setOpen((o) => !o)}
         aria-expanded={expanded}
+        aria-label={expanded ? "折叠对象" : "展开对象"}
         hidden={!foldable}
       >
         {expanded ? "▾" : "▸"}
@@ -380,15 +414,26 @@ export function Meter({
   value,
   max = 1,
   tone = "accent",
+  label,
 }: {
   value: number;
   max?: number;
   tone?: "accent" | "success" | "critical";
+  /** What the meter measures. Without it a screen reader hears a bare
+   *  "42%", which tells the operator nothing about what is at 42%. */
+  label?: string;
 }) {
   const pct = max > 0 ? Math.min(100, Math.max(0, (value / max) * 100)) : 0;
+  const pctText = new Intl.NumberFormat("zh-CN", {
+    style: "percent",
+    maximumFractionDigits: 0,
+  }).format(pct / 100);
   return (
-    <div className="meter" role="img" aria-label={`${pct.toFixed(0)}%`}>
-      <div className={`meter__fill meter__fill--${tone}`} style={{ width: `${pct}%` }} />
+    <div className="meter" role="img" aria-label={label ? `${label}：${pctText}` : pctText}>
+      <div
+        className={`meter__fill meter__fill--${tone}`}
+        style={{ transform: `scaleX(${pct / 100})` }}
+      />
     </div>
   );
 }

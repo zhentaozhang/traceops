@@ -1,5 +1,5 @@
 {
-  "investigation_run_id": "run-demo-1",
+  "investigation_run_id": "run-2b9e04",
   "diagnosis_status": "INCONCLUSIVE",
   "summary": "Inconclusive: two candidates remain compatible with the observed evidence (redis pool exhaustion, payment-service thread starvation). The discriminator was not collectable in this window.",
   "hypotheses": [

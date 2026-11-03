@@ -1,7 +1,7 @@
 /**
  * Application root: data loading, routing, shell, command palette.
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { dataSource } from "../data/source";
 import type { IncidentVM } from "../domain/types";
 import { EvaluationPage } from "../pages/Evaluation";
@@ -97,21 +97,19 @@ export function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const go = useCallback(
-    (to: string) => {
-      navigate(to);
-    },
-    [navigate],
-  );
-
   const crumbs = useMemo(() => buildCrumbs(key, params, incidents), [key, params, incidents]);
 
   return (
     <div className="app">
-      <Rail path={path} incidents={incidents} onNavigate={go} />
+      {/* A skip link: the rail has six items, so reaching the page content
+          with the keyboard means a dozen tabs on every single navigation. */}
+      <a className="skip-link" href="#main-content">
+        跳到主内容
+      </a>
+      <Rail path={path} incidents={incidents} />
       <div className="main">
         <Topbar crumbs={crumbs} onOpenPalette={() => setPaletteOpen(true)} />
-        <main className="page">
+        <main className="page" id="main-content" tabIndex={-1}>
           <div className="page__inner">
             {key === "overview" && <OverviewPage incidents={incidents} />}
             {key === "incidents" && <IncidentsPage incidents={incidents} />}

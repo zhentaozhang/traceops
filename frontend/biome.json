@@ -6,7 +6,15 @@
     "useIgnoreFile": true
   },
   "files": {
-    "includes": ["**", "!**/dist", "!**/node_modules", "!**/apps/console/src/fixtures"]
+    "includes": [
+      "**",
+      "!**/dist",
+      "!**/node_modules",
+      "!**/coverage",
+      "!**/test-results",
+      "!**/playwright-report",
+      "!**/apps/console/src/fixtures"
+    ]
   },
   "formatter": {
     "enabled": true,

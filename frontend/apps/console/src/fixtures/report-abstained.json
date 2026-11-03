@@ -1,5 +1,5 @@
 {
-  "investigation_run_id": "run-demo-1",
+  "investigation_run_id": "run-1c4a6e",
   "diagnosis_status": "INCONCLUSIVE",
   "summary": "Abstained: evidence collected was insufficient to rank any candidate above the abstention threshold. Returning a guess here would be a fabricated answer.",
   "hypotheses": [

@@ -1,0 +1,57 @@
+name: Frontend
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend.yml"
+  pull_request:
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: frontend-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  console:
+    name: Console
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - name: Install pnpm
+        run: corepack enable
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Lint
+        # Biome 兼做格式与 lint：格式错和 lint 错在同一个命令里报出来，
+        # 不用再单独跑一次 prettier/eslint。
+        run: pnpm exec biome check .
+      - name: Format check
+        run: pnpm exec biome format .
+      - name: Typecheck
+        run: pnpm -C apps/console exec tsc -p tsconfig.json --noEmit
+      - name: Test
+        # 适配器层的硬约束（永不抛异常 / 未知枚举保留原值 / 缺失即 null）
+        # 是「后端怎么改前端都不散架」的保证，必须有测试兜着。
+        run: pnpm -C apps/console exec vitest run --coverage
+      - name: Fixture drift
+        # fixture 由仓库里真实产物派生；源文件变了而 fixture 没跟上，
+        # 说明有人在用过期数据骗界面。
+        run: node scripts/build-fixtures.mjs --check
+      - name: Build
+        run: pnpm -C apps/console exec vite build

@@ -50,6 +50,9 @@ export interface IncidentVM {
   acknowledgedAt: string | null;
   confirmedAt: string | null;
   confirmation: "ACCEPTED" | "REJECTED" | null;
+  /** Who signed the confirmation. The backend refuses to rewrite a
+   *  confirmation, so the person who signed it is part of the record. */
+  confirmedBy: string | null;
   currentRunId: string | null;
   retryAttempts: number | null;
   nextRetryAt: string | null;

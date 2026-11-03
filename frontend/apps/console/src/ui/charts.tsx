@@ -295,7 +295,9 @@ export function BarRow({
         <div
           className="bar-row__fill"
           style={{
-            width: pct === null ? "0%" : `${pct}%`,
+            // scaleX instead of width: animating width forces a layout on
+            // every frame, and the guidelines ask for transform/opacity only.
+            transform: `scaleX(${pct === null ? 0 : pct / 100})`,
             background: TONE_VAR[tone],
           }}
         />
@@ -326,7 +328,7 @@ export function CompareBars({
         <div className="compare__track">
           <div
             className="compare__fill compare__fill--ours"
-            style={{ width: `${Math.min(100, (ours.ratio ?? 0) * 100)}%` }}
+            style={{ transform: `scaleX(${Math.min(100, (ours.ratio ?? 0) * 100) / 100})` }}
           />
         </div>
         <span className="compare__value num">
@@ -338,7 +340,7 @@ export function CompareBars({
         <div className="compare__track">
           <div
             className="compare__fill"
-            style={{ width: `${Math.min(100, (theirs.ratio ?? 0) * 100)}%` }}
+            style={{ transform: `scaleX(${Math.min(100, (theirs.ratio ?? 0) * 100) / 100})` }}
           />
         </div>
         <span className="compare__value num">

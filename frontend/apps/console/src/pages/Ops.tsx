@@ -43,7 +43,7 @@ export function OpsPage() {
       <>
         <Head title="运维面板" sub="载入健康状态…" />
         <Panel>
-          <EmptyState title="载入中" />
+          <EmptyState title="载入中…" />
         </Panel>
       </>
     );

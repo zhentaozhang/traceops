@@ -165,6 +165,17 @@
   animation: pulse-dot 1.6s var(--ease-in-out) infinite;
 }
 
+/* The reduced-motion block in tokens.css only zeroes the duration tokens,
+   which stops timed transitions but leaves an infinite animation running.
+   An endlessly pulsing dot is exactly the kind of motion that causes
+   trouble for people with vestibular disorders — so stop it outright and
+   let the static dot carry the "this is live" meaning. */
+@media (prefers-reduced-motion: reduce) {
+  .stage-badge__dot.is-pulsing {
+    animation: none;
+  }
+}
+
 /* ── panel ──────────────────────────────────────────────────────────────── */
 
 .panel {
@@ -408,6 +419,39 @@
   cursor: pointer;
 }
 
+/* A row that navigates somewhere.
+   The row itself stays a plain <tr> — no tabindex, no role="link" — so
+   keyboard and screen-reader users land on a real link instead of a mystery
+   clickable cell. The link lives in the title cell and its hit area is
+   stretched over the whole row, so the mouse still gets one big target.
+   The focus ring is drawn on the stretched box, i.e. around the row. */
+.table tbody tr {
+  position: relative;
+}
+
+.table .row-link::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+
+.table .row-link:focus-visible {
+  outline: none;
+}
+
+.table .row-link:focus-visible::after {
+  outline: 1px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* Anything else interactive inside a row must sit above the stretched
+   link, otherwise the link swallows the click. */
+.table tbody tr > td .row-link ~ .btn,
+.table tbody tr > td .row-link ~ button {
+  position: relative;
+  z-index: 1;
+}
+
 .table .cell-primary {
   color: var(--text-primary);
   font-weight: 500;
@@ -435,8 +479,10 @@
 
 .meter__fill {
   height: 100%;
+  width: 100%;
   border-radius: 99px;
-  transition: width var(--dur-3) var(--ease-out);
+  transform-origin: left center;
+  transition: transform var(--dur-3) var(--ease-out);
 }
 
 .meter__fill--accent {

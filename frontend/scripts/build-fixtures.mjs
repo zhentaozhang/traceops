@@ -103,9 +103,18 @@ function emitFromSource(name, repoPath, volatile = []) {
 
 const report = read("frontend/apps/console/src/fixtures/report-supported.json");
 
-const withVerdict = (status, mutate) => {
+/**
+ * The variants keep identical evidence so the workbench layout is exercised
+ * with the same data volume under different conclusions.
+ *
+ * `investigation_run_id` has to be rewritten too: otherwise every variant
+ * still claims to be the original run, and the console shows the wrong run id
+ * next to the wrong verdict.
+ */
+const withVerdict = (status, runId, mutate) => {
   const r = clone(report);
   r.diagnosis_status = status;
+  r.investigation_run_id = runId;
   mutate(r);
   return r;
 };
@@ -114,7 +123,7 @@ emit("report-supported.json", report);
 
 emit(
   "report-refuted.json",
-  withVerdict("REFUTED", (r) => {
+  withVerdict("REFUTED", "run-e5b118", (r) => {
     r.abstained = false;
     r.summary =
       "Refuted: payment-service / payment-gateway (upstream_timeout). " +
@@ -136,7 +145,7 @@ emit(
 
 emit(
   "report-inconclusive.json",
-  withVerdict("INCONCLUSIVE", (r) => {
+  withVerdict("INCONCLUSIVE", "run-2b9e04", (r) => {
     r.abstained = false;
     r.summary =
       "Inconclusive: two candidates remain compatible with the observed evidence " +
@@ -154,7 +163,7 @@ emit(
 
 emit(
   "report-abstained.json",
-  withVerdict("INCONCLUSIVE", (r) => {
+  withVerdict("INCONCLUSIVE", "run-1c4a6e", (r) => {
     r.abstained = true;
     r.summary =
       "Abstained: evidence collected was insufficient to rank any candidate above " +

@@ -6,7 +6,7 @@
  */
 import { useEffect, useMemo, useState } from "react";
 import { ArrowRight, Clock, User, Worker } from "../app/icons";
-import { navigate } from "../app/router";
+import { Link } from "../app/link";
 import { dataSource } from "../data/source";
 import { urgencyOf } from "../domain/adapters";
 import {
@@ -19,7 +19,7 @@ import {
   WAITING_ON_LABELS,
 } from "../domain/format";
 import type { HealthVM, IncidentVM } from "../domain/types";
-import { EmptyState, Panel, SeverityBadge, StageBadge, Stat } from "../ui/primitives";
+import { EmptyState, Ident, Panel, SeverityBadge, StageBadge, Stat } from "../ui/primitives";
 
 const LANE_ORDER = ["waiting-person", "failed", "active", "waiting-clock", "finished"];
 
@@ -112,6 +112,13 @@ export function OverviewPage({ incidents }: { incidents: IncidentVM[] }) {
           <span className="section__meta">{incidents.length} 起事故</span>
         </div>
 
+        {/* The triage board loads asynchronously. Without a live region the
+            numbers arrive silently and a screen-reader user never learns
+            that incidents are waiting. */}
+        <p className="sr-only" role="status" aria-live="polite">
+          {`已载入 ${incidents.length} 起事故，其中 ${incidents.filter((i) => i.stage?.waitingOn === "PERSON").length} 起等人决策`}
+        </p>
+
         {lanes.length === 0 ? (
           <Panel>
             <EmptyState
@@ -145,17 +152,18 @@ export function OverviewPage({ incidents }: { incidents: IncidentVM[] }) {
                       </thead>
                       <tbody>
                         {items.map((inc) => (
-                          <tr
-                            key={inc.id}
-                            className="is-clickable"
-                            onClick={() => navigate(`/incidents/${inc.id}`)}
-                          >
+                          <tr key={inc.id} className="is-clickable">
                             <td>
                               <SeverityBadge severity={inc.severity} />
                             </td>
                             <td className="cell-primary mono">{inc.service}</td>
                             <td className="clip" style={{ maxWidth: 420 }}>
-                              {inc.title}
+                              {/* The link's hit area is stretched over the whole
+                                  row, so the mouse keeps one big target while
+                                  the keyboard gets a real <a>. */}
+                              <Link to={`/incidents/${inc.id}`} className="row-link">
+                                {inc.title}
+                              </Link>
                             </td>
                             <td>
                               <StageBadge
@@ -166,7 +174,7 @@ export function OverviewPage({ incidents }: { incidents: IncidentVM[] }) {
                             </td>
                             <td>
                               {inc.assignee ? (
-                                <span className="mono dim">{inc.assignee}</span>
+                                <Ident className="mono dim">{inc.assignee}</Ident>
                               ) : (
                                 <span className="faint">—</span>
                               )}

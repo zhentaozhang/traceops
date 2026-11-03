@@ -58,7 +58,7 @@ export function EvaluationPage() {
       <>
         <PageHead title="评测实验室" sub="载入评测报告…" />
         <Panel>
-          <EmptyState title="载入中" />
+          <EmptyState title="载入中…" />
         </Panel>
       </>
     );

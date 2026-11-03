@@ -1,5 +1,5 @@
 {
-  "investigation_run_id": "run-demo-1",
+  "investigation_run_id": "run-e5b118",
   "diagnosis_status": "REFUTED",
   "summary": "Refuted: payment-service / payment-gateway (upstream_timeout). The candidate survived candidate generation but its predicted observations did not hold in the window — redis pool saturation explains the same symptom at an earlier timestamp, and the gateway's own error rate stayed flat.",
   "hypotheses": [

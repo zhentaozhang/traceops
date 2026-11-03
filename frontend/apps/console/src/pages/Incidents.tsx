@@ -3,11 +3,11 @@
  */
 import { useMemo, useState } from "react";
 import { ArrowRight } from "../app/icons";
-import { navigate } from "../app/router";
+import { Link } from "../app/link";
 import { urgencyOf } from "../domain/adapters";
 import { formatInstant, formatRelative, LANE_LABELS, STAGE_LABELS } from "../domain/format";
 import type { IncidentVM } from "../domain/types";
-import { EmptyState, Panel, SeverityBadge, StageBadge } from "../ui/primitives";
+import { EmptyState, Ident, Panel, SeverityBadge, StageBadge } from "../ui/primitives";
 
 type SortKey = "urgency" | "created" | "severity";
 
@@ -74,6 +74,7 @@ export function IncidentsPage({ incidents }: { incidents: IncidentVM[] }) {
       <div className="filters">
         <select
           className="select"
+          name="service"
           value={service}
           onChange={(e) => setService(e.target.value)}
           aria-label="按服务过滤"
@@ -110,6 +111,7 @@ export function IncidentsPage({ incidents }: { incidents: IncidentVM[] }) {
 
         <select
           className="select"
+          name="sort"
           value={sort}
           onChange={(e) => setSort(e.target.value as SortKey)}
           aria-label="排序方式"
@@ -142,17 +144,18 @@ export function IncidentsPage({ incidents }: { incidents: IncidentVM[] }) {
               </thead>
               <tbody>
                 {visible.map((inc) => (
-                  <tr
-                    key={inc.id}
-                    className="is-clickable"
-                    onClick={() => navigate(`/incidents/${inc.id}`)}
-                  >
+                  <tr key={inc.id} className="is-clickable">
                     <td>
                       <SeverityBadge severity={inc.severity} />
                     </td>
                     <td className="cell-primary mono">{inc.service}</td>
                     <td className="clip" style={{ maxWidth: 460 }}>
-                      {inc.title}
+                      {/* The link's hit area is stretched over the whole row
+                          (see .row-link::after), so the mouse still gets one
+                          big target — but the keyboard gets a real <a>. */}
+                      <Link to={`/incidents/${inc.id}`} className="row-link">
+                        {inc.title}
+                      </Link>
                     </td>
                     <td>
                       <StageBadge
@@ -163,7 +166,7 @@ export function IncidentsPage({ incidents }: { incidents: IncidentVM[] }) {
                     </td>
                     <td>
                       {inc.assignee ? (
-                        <span className="mono dim">{inc.assignee}</span>
+                        <Ident className="mono dim">{inc.assignee}</Ident>
                       ) : (
                         <span className="faint">未指派</span>
                       )}

@@ -48,30 +48,42 @@ const STAGE_KINDS: StageKind[] = [
 ];
 const WAITING_ON: WaitingOn[] = ["WORKER", "CLOCK", "PERSON", "NOBODY"];
 
+/**
+ * `raw` is the value exactly as the backend sent it.
+ *
+ * The uppercased form is only used for *matching* against the known enum set —
+ * it must never be what we store, because the whole point of `raw*` is that an
+ * operator can match an unrecognised backend value against logs verbatim.
+ * Storing "CATASTROPHIC" when the backend said "catastrophic" loses that.
+ */
 function severityOf(raw: unknown): { value: Severity; raw: string } {
-  const s = str(raw)?.toUpperCase() ?? "";
-  if ((SEVERITIES as string[]).includes(s)) return { value: s as Severity, raw: s };
-  return { value: "UNKNOWN", raw: s };
+  const original = str(raw) ?? "";
+  const s = original.toUpperCase();
+  if ((SEVERITIES as string[]).includes(s)) return { value: s as Severity, raw: original };
+  return { value: "UNKNOWN", raw: original };
 }
 
 function stageKindOf(raw: unknown): { value: StageKind; raw: string } {
-  const s = str(raw)?.toUpperCase() ?? "";
-  if ((STAGE_KINDS as string[]).includes(s)) return { value: s as StageKind, raw: s };
-  return { value: "UNKNOWN", raw: s };
+  const original = str(raw) ?? "";
+  const s = original.toUpperCase();
+  if ((STAGE_KINDS as string[]).includes(s)) return { value: s as StageKind, raw: original };
+  return { value: "UNKNOWN", raw: original };
 }
 
 function waitingOnOf(raw: unknown): { value: WaitingOn; raw: string } {
-  const s = str(raw)?.toUpperCase() ?? "";
-  if ((WAITING_ON as string[]).includes(s)) return { value: s as WaitingOn, raw: s };
-  return { value: "UNKNOWN", raw: s };
+  const original = str(raw) ?? "";
+  const s = original.toUpperCase();
+  if ((WAITING_ON as string[]).includes(s)) return { value: s as WaitingOn, raw: original };
+  return { value: "UNKNOWN", raw: original };
 }
 
 function verdictOf(raw: unknown): { value: Verdict; raw: string } {
-  const s = str(raw)?.toUpperCase() ?? "";
+  const original = str(raw) ?? "";
+  const s = original.toUpperCase();
   if (s === "SUPPORTED" || s === "REFUTED" || s === "INCONCLUSIVE") {
-    return { value: s, raw: s };
+    return { value: s, raw: original };
   }
-  return { value: "UNKNOWN", raw: s };
+  return { value: "UNKNOWN", raw: original };
 }
 
 /**
@@ -143,6 +155,7 @@ export function toIncidentVM(wire: unknown): IncidentVM {
     confirmedAt: str(w.confirmedAt),
     confirmation:
       w.confirmation === "ACCEPTED" || w.confirmation === "REJECTED" ? w.confirmation : null,
+    confirmedBy: str(w.confirmedBy),
     currentRunId: str(w.currentRunId),
     retryAttempts: num(w.retryAttempts),
     nextRetryAt: str(w.nextRetryAt),

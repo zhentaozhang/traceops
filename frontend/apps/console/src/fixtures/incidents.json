@@ -5,14 +5,14 @@
       "service": "checkout-service",
       "title": "checkout-service 5xx 从 0.1% 升到 42%，错误日志命中连接池关键词",
       "severity": "CRITICAL",
-      "status": "INVESTIGATING",
+      "status": "DIAGNOSED",
       "origin": "ALERT",
       "createdAt": "2026-03-12T14:31:10Z",
       "updatedAt": "2026-03-12T14:40:22Z",
       "stage": {
         "kind": "NEEDS_DECISION",
         "waitingOn": "PERSON",
-        "detail": "结论待人工确认：SUPPORTED，引用 5 条证据",
+        "detail": "DIAGNOSED 没有自动出边，下一步得人决定；已指派给 lin.zhao（已认领）",
         "retryable": false
       },
       "assignee": "lin.zhao",
@@ -37,8 +37,8 @@
       "stage": {
         "kind": "RUNNING",
         "waitingOn": "WORKER",
-        "detail": "正在验证假设：redis / redis-connection-pool",
-        "retryable": false
+        "detail": "investigating: step 3 (hypothesize)",
+        "retryable": true
       },
       "assignee": null,
       "acknowledgedAt": null,
@@ -62,7 +62,7 @@
       "stage": {
         "kind": "RETRY_BACKOFF",
         "waitingOn": "CLOCK",
-        "detail": "第 2 次重试前退避：trace 后端连接被重置",
+        "detail": "retry 2/3 scheduled at 2026-03-12T14:42:20Z",
         "retryable": true
       },
       "assignee": "wang.yu",
@@ -80,15 +80,15 @@
       "service": "redis",
       "title": "redis 连接数 1000/1000 打满，持续 6 分钟",
       "severity": "CRITICAL",
-      "status": "OPEN",
+      "status": "NEW",
       "origin": "ALERT",
       "createdAt": "2026-03-12T14:39:57Z",
       "updatedAt": "2026-03-12T14:39:57Z",
       "stage": {
         "kind": "QUEUED",
         "waitingOn": "WORKER",
-        "detail": "等待调查 worker 领取",
-        "retryable": false
+        "detail": "waiting for a worker to claim the investigation",
+        "retryable": true
       },
       "assignee": null,
       "acknowledgedAt": null,
@@ -105,14 +105,14 @@
       "service": "frontend",
       "title": "frontend 首屏 LCP 从 0.9s 升到 2.4s",
       "severity": "MINOR",
-      "status": "CONFIRMED",
+      "status": "RESOLVED",
       "origin": "ALERT",
       "createdAt": "2026-03-12T13:58:12Z",
       "updatedAt": "2026-03-12T14:21:40Z",
       "stage": {
         "kind": "DONE",
         "waitingOn": "NOBODY",
-        "detail": "已确认：productcatalogservice / 缓存命中率塌陷",
+        "detail": "已解决；结论已接受",
         "retryable": false
       },
       "assignee": "lin.zhao",
@@ -130,15 +130,15 @@
       "service": "shipping-service",
       "title": "shipping-service 超时集中在 quote 接口",
       "severity": "MAJOR",
-      "status": "CONFIRMED",
+      "status": "DIAGNOSED",
       "origin": "ALERT",
       "createdAt": "2026-03-12T13:41:05Z",
       "updatedAt": "2026-03-12T14:12:19Z",
       "stage": {
-        "kind": "DONE",
-        "waitingOn": "NOBODY",
-        "detail": "已驳回：建议根因被证据反驳，重新调查后重试",
-        "retryable": true
+        "kind": "NEEDS_DECISION",
+        "waitingOn": "PERSON",
+        "detail": "结论已被 wang.yu 拒绝；下一步得人决定",
+        "retryable": false
       },
       "assignee": "wang.yu",
       "acknowledgedAt": "2026-03-12T13:44:20Z",
@@ -162,7 +162,7 @@
       "stage": {
         "kind": "DEAD",
         "waitingOn": "NOBODY",
-        "detail": "重试 3 次全部失败：metrics 后端 503",
+        "detail": "failed: retry budget exhausted (3/3)",
         "retryable": false
       },
       "assignee": null,
@@ -180,15 +180,15 @@
       "service": "checkout-service",
       "title": "checkout-service 下单成功率跌破 95%",
       "severity": "MAJOR",
-      "status": "ACKNOWLEDGED",
+      "status": "INVESTIGATING",
       "origin": "ALERT",
       "createdAt": "2026-03-12T14:12:44Z",
       "updatedAt": "2026-03-12T14:14:02Z",
       "stage": {
         "kind": "RUNNING",
         "waitingOn": "WORKER",
-        "detail": "收集指标：checkout-service / payment-service",
-        "retryable": false
+        "detail": "investigating: step 2 (collect)",
+        "retryable": true
       },
       "assignee": "chen.qi",
       "acknowledgedAt": "2026-03-12T14:14:02Z",

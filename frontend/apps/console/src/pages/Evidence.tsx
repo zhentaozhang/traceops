@@ -30,6 +30,7 @@ import {
   EmptyState,
   ErrorState,
   Hash,
+  Ident,
   JsonViewer,
   KeyValue,
   Panel,
@@ -138,6 +139,7 @@ export function EvidencePage() {
             <span className="label">运行</span>
             <select
               className="select"
+              name="run"
               value={runId ?? ""}
               onChange={(e) => setRunId(e.target.value || null)}
               aria-label="选择调查运行"
@@ -163,21 +165,49 @@ export function EvidencePage() {
         />
         <Stat
           label="运行"
-          value={runId ? <span className="mono">{runId}</span> : "—"}
+          value={runId ? <Ident className="mono">{runId}</Ident> : "—"}
           hint="证据归属于一次调查运行"
         />
       </div>
 
+      {/* The list loads asynchronously; without a live region the result
+          arrives silently and a screen-reader user has no idea anything
+          changed. */}
+      <p className="sr-only" role="status" aria-live="polite">
+        {failed
+          ? "证据载入失败"
+          : `已载入 ${counts.total} 条证据，${counts.annotated} 条人工标注`}
+      </p>
+
       <div className="section">
-        <div className="tabs" role="tablist">
+        {/* A real tab pattern: one tab stop for the whole strip, arrow keys
+            move between tabs, and the panel is wired to the selected tab via
+            aria-controls / aria-labelledby. Without this, a screen-reader
+            user hears five unrelated buttons and no idea which pane the
+            content below belongs to. */}
+        <div className="tabs" role="tablist" aria-label="证据类型">
           {TABS.map((t) => (
             <button
               key={t}
               type="button"
               role="tab"
+              id={`evidence-tab-${t}`}
               aria-selected={tab === t}
+              aria-controls="evidence-panel"
+              tabIndex={tab === t ? 0 : -1}
               className={`tab${tab === t ? " is-active" : ""}`}
               onClick={() => setTab(t)}
+              onKeyDown={(e) => {
+                if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+                e.preventDefault();
+                const delta = e.key === "ArrowRight" ? 1 : -1;
+                const index = (TABS.indexOf(t) + delta + TABS.length) % TABS.length;
+                const next = TABS[index] ?? t;
+                setTab(next);
+                // Move focus with the selection — otherwise the arrow key
+                // changes the tab but the focus ring stays behind.
+                document.getElementById(`evidence-tab-${next}`)?.focus();
+              }}
             >
               {TAB_LABELS[t]}
               <span className="tab__count">
@@ -187,7 +217,12 @@ export function EvidencePage() {
           ))}
         </div>
 
-        <div style={{ marginTop: "var(--space-5)" }}>
+        <div
+          id="evidence-panel"
+          role="tabpanel"
+          aria-labelledby={`evidence-tab-${tab}`}
+          style={{ marginTop: "var(--space-5)" }}
+        >
           {failed ? (
             <Panel>
               <ErrorState />
@@ -264,9 +299,12 @@ function EvidenceDetail({ evidence }: { evidence: EvidenceDetailVM | null }) {
       <Panel title="来源">
         <KeyValue
           items={[
-            { label: "证据 ID", value: <span className="mono">{evidence.id}</span> },
+            { label: "证据 ID", value: <Ident className="mono">{evidence.id}</Ident> },
             { label: "类型", value: evidenceTypeLabel(evidence.evidenceType) },
-            { label: "服务", value: <span className="mono">{evidence.serviceId ?? "—"}</span> },
+            {
+              label: "服务",
+              value: <Ident className="mono">{evidence.serviceId ?? "—"}</Ident>,
+            },
             { label: "观测时间", value: formatInstant(evidence.observedAt) },
             {
               label: "窗口",
@@ -279,7 +317,7 @@ function EvidenceDetail({ evidence }: { evidence: EvidenceDetailVM | null }) {
             },
             {
               label: "查询模板",
-              value: <span className="mono">{evidence.queryTemplateId ?? "—"}</span>,
+              value: <Ident className="mono">{evidence.queryTemplateId ?? "—"}</Ident>,
             },
             { label: "checksum", value: <Hash value={evidence.checksum} /> },
           ]}
@@ -368,7 +406,7 @@ function PayloadView({ evidence }: { evidence: EvidenceDetailVM }) {
               {r.level && (
                 <Badge tone={r.level === "error" ? "critical" : "info"}>{r.level}</Badge>
               )}
-              {r.traceId && <span className="mono faint">{r.traceId.slice(0, 16)}</span>}
+              {r.traceId && <Ident className="mono faint">{r.traceId.slice(0, 16)}</Ident>}
             </div>
             <div className="logrec__msg">{r.message ?? "—"}</div>
             {Object.keys(r.labels).length > 0 && (
@@ -409,11 +447,15 @@ function PayloadView({ evidence }: { evidence: EvidenceDetailVM }) {
               <tr key={`${s.traceId}-${s.spanId}`}>
                 <td className="mono faint">{formatInstantShort(s.startTime)}</td>
                 <td className="cell-primary mono">{s.service ?? "—"}</td>
-                <td className="mono">{s.operation ?? "—"}</td>
+                <td className="mono">
+                  <Ident>{s.operation ?? "—"}</Ident>
+                </td>
                 <td className="cell-num">
                   {s.durationUs === null ? "—" : `${(s.durationUs / 1000).toFixed(1)}ms`}
                 </td>
-                <td className="mono faint">{s.traceId ? `${s.traceId.slice(0, 12)}…` : "—"}</td>
+                <td className="mono faint">
+                  <Ident>{s.traceId ? `${s.traceId.slice(0, 12)}…` : "—"}</Ident>
+                </td>
                 <td>
                   {s.error === true ? (
                     <Badge tone="critical">是</Badge>
@@ -444,9 +486,9 @@ function PayloadView({ evidence }: { evidence: EvidenceDetailVM }) {
             <div style={{ minWidth: 0 }}>
               <div className="evt__summary">{e.summary ?? "—"}</div>
               <div className="evt__meta">
-                {e.service && <span className="mono">{e.service}</span>}
+                {e.service && <Ident className="mono">{e.service}</Ident>}
                 {e.changeKind && <span>{e.changeKind}</span>}
-                {e.revision && <span className="mono">{e.revision}</span>}
+                {e.revision && <Ident className="mono">{e.revision}</Ident>}
               </div>
             </div>
           </div>

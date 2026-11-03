@@ -7,18 +7,52 @@
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-export function usePath() {
-  const [path, setPath] = useState(() => window.location.pathname);
+/**
+ * The current location.
+ *
+ * `pathname` is what routes match on; `search` is the query string. Both are
+ * tracked because a link that changes only the filters still has to re-render
+ * — a list filtered by `?service=checkout-service` is a different list.
+ */
+export interface Location {
+  pathname: string;
+  search: string;
+  hash: string;
+}
+
+function readLocation(): Location {
+  return {
+    pathname: window.location.pathname,
+    search: window.location.search,
+    hash: window.location.hash,
+  };
+}
+
+export function useLocation(): Location {
+  const [location, setLocation] = useState(readLocation);
   useEffect(() => {
-    const onPop = () => setPath(window.location.pathname);
+    const onPop = () => setLocation(readLocation());
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
   }, []);
-  return path;
+  return location;
 }
 
+/** The current pathname. */
+export function usePath(): string {
+  return useLocation().pathname;
+}
+
+/**
+ * Navigate in-app.
+ *
+ * The full URL (path + query + hash) is pushed, so a link to the same page
+ * with different filters still works. Comparing against the whole URL rather
+ * than just the pathname is what makes "filter this list" shareable.
+ */
 export function navigate(to: string) {
-  if (to === window.location.pathname) return;
+  const current = window.location.pathname + window.location.search + window.location.hash;
+  if (to === current) return;
   window.history.pushState({}, "", to);
   window.dispatchEvent(new PopStateEvent("popstate"));
 }

@@ -72,6 +72,25 @@ export interface EvidenceRelationVM {
   hypothesisId: string | null;
 }
 
+/**
+ * A write against an incident.
+ *
+ * These mirror the control plane's ownership endpoints. The console used to
+ * render the three action buttons with no handler at all — the API existed,
+ * the UI just lied. Keeping the operations on the `DataSource` seam means
+ * the HTTP implementation can drop in without the page changing.
+ */
+export interface IncidentAction {
+  /** Who is taking it. The backend rejects blank names. */
+  assignee?: string;
+  /** Who pressed the button. Recorded so the decision is traceable later. */
+  by?: string;
+  /** Accept (true) or reject (false) the diagnosis. */
+  accepted?: boolean;
+  /** Target status for a transition. */
+  target?: string;
+}
+
 export interface DataSource {
   listIncidents(filter?: IncidentFilter): Promise<IncidentVM[]>;
   getIncident(id: string): Promise<IncidentVM | null>;
@@ -84,6 +103,15 @@ export interface DataSource {
   getHealth(): Promise<HealthVM>;
   getEvaluation(): Promise<EvaluationVM>;
   getTopology(): Promise<{ edges: Array<[string, string]> }>;
+
+  /** `POST /incidents/{id}/assign` — hand the incident to someone. */
+  assignIncident(id: string, assignee: string): Promise<IncidentVM>;
+  /** `POST /incidents/{id}/ack` — "I'm on it". */
+  acknowledgeIncident(id: string): Promise<IncidentVM>;
+  /** `POST /incidents/{id}/confirm` — accept or reject the diagnosis. */
+  confirmIncident(id: string, by: string, accepted: boolean): Promise<IncidentVM>;
+  /** `POST /incidents/{id}/transitions` — move along the status machine. */
+  transitionIncident(id: string, target: string): Promise<IncidentVM>;
 }
 
 const reports: Record<string, unknown> = {
@@ -248,6 +276,92 @@ class FixtureDataSource implements DataSource {
   async getTopology(): Promise<{ edges: Array<[string, string]> }> {
     return delay(topologyFixture as { edges: Array<[string, string]> });
   }
+
+  /* ── writes ──────────────────────────────────────────────────────────────
+   *
+   * The fixture simulates the control plane's rules, not just its endpoints.
+   * A fixture that accepts everything would let the UI ship a button that
+   * looks right and then fails on the first real deployment, which is the
+   * exact failure mode the three dead buttons already had.
+   */
+
+  async assignIncident(id: string, assignee: string): Promise<IncidentVM> {
+    const name = assignee.trim();
+    if (!name) throw new Error("负责人不能为空");
+    const incident = requireIncident(id);
+    return delay({
+      ...incident,
+      assignee: name,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  async acknowledgeIncident(id: string): Promise<IncidentVM> {
+    const incident = requireIncident(id);
+    if (incident.status === "RESOLVED") {
+      throw new Error("事故已解决，没有可认领");
+    }
+    return delay({
+      ...incident,
+      // Repeat acknowledgements keep the first timestamp — matching the
+      // backend, so "how long was it unattended" stays truthful.
+      acknowledgedAt: incident.acknowledgedAt ?? new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  async confirmIncident(id: string, by: string, accepted: boolean): Promise<IncidentVM> {
+    const name = by.trim();
+    if (!name) throw new Error("确认需要署名");
+    const incident = requireIncident(id);
+    if (incident.status !== "DIAGNOSED") {
+      throw new Error(`事故当前是 ${incident.status}，只有 DIAGNOSED 才有结论可确认`);
+    }
+    if (incident.confirmation) {
+      throw new Error(
+        `事故已由 ${incident.confirmedBy} ${incident.confirmation === "ACCEPTED" ? "确认" : "拒绝"}，结论不能改写`,
+      );
+    }
+    return delay({
+      ...incident,
+      confirmation: accepted ? "ACCEPTED" : "REJECTED",
+      confirmedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  async transitionIncident(id: string, target: string): Promise<IncidentVM> {
+    const incident = requireIncident(id);
+    const allowed: Record<string, string[]> = {
+      NEW: ["INVESTIGATING", "FAILED"],
+      INVESTIGATING: ["DIAGNOSED", "FAILED"],
+      DIAGNOSED: ["RESOLVED", "FAILED"],
+      RESOLVED: [],
+      FAILED: [],
+    };
+    const from = incident.status;
+    const reachable = allowed[from] ?? [];
+    if (!reachable.includes(target)) {
+      throw new Error(
+        reachable.length === 0
+          ? `事故已处于终态 ${from}，无法流转`
+          : `${from} 只能流转到 ${reachable.join(" / ")}`,
+      );
+    }
+    return delay({ ...incident, status: target, updatedAt: new Date().toISOString() });
+  }
+}
+
+/**
+ * Look up an incident in the fixture.
+ *
+ * Throws rather than returning null: a write against a missing incident is a
+ * programming error, not an empty state.
+ */
+function requireIncident(id: string): IncidentVM {
+  const raw = (incidentsFixture.incidents as Array<{ id: string }>).find((i) => i.id === id);
+  if (!raw) throw new Error(`事故不存在：${id}`);
+  return toIncidentVM(raw);
 }
 
 export const dataSource: DataSource = new FixtureDataSource();

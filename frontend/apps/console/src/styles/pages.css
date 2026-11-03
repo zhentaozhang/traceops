@@ -417,7 +417,10 @@
   background: transparent;
   font-size: var(--text-xs);
   color: var(--text-secondary);
-  transition: all var(--dur-1) var(--ease-out);
+  transition:
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out),
+    background var(--dur-1) var(--ease-out);
 }
 
 .chip:hover {
@@ -624,15 +627,28 @@
   font-size: var(--text-2xs);
   color: var(--text-secondary);
   white-space: nowrap;
+  cursor: pointer;
   transition:
     border-color var(--dur-1) var(--ease-out),
-    color var(--dur-1) var(--ease-out);
+    color var(--dur-1) var(--ease-out),
+    background var(--dur-1) var(--ease-out);
+}
+
+.topo__node:hover {
+  border-color: var(--border-strong);
+  background: var(--hover-wash);
+  color: var(--text-primary);
 }
 
 .topo__node--hot {
   border-color: color-mix(in oklab, var(--severity-critical) 55%, transparent);
   color: var(--severity-critical);
   background: color-mix(in oklab, var(--severity-critical) 10%, var(--surface-overlay));
+}
+
+.topo__node--hot:hover {
+  background: color-mix(in oklab, var(--severity-critical) 16%, var(--surface-overlay));
+  color: var(--severity-critical);
 }
 
 .topo__svg {
@@ -763,8 +779,10 @@
 
 .bar-row__fill {
   height: 100%;
+  width: 100%;
   border-radius: 99px;
-  transition: width var(--dur-3) var(--ease-out);
+  transform-origin: left center;
+  transition: transform var(--dur-3) var(--ease-out);
 }
 
 .bar-row__value {
@@ -808,9 +826,11 @@
 
 .compare__fill {
   height: 100%;
+  width: 100%;
   border-radius: 99px;
   background: var(--border-strong);
-  transition: width var(--dur-3) var(--ease-out);
+  transform-origin: left center;
+  transition: transform var(--dur-3) var(--ease-out);
 }
 
 .compare__fill--ours {

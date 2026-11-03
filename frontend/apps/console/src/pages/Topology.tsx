@@ -9,11 +9,11 @@
  * same graph must draw the same way every time, or operators lose the map.
  */
 import { useEffect, useMemo, useState } from "react";
-import { navigate } from "../app/router";
+import { Link } from "../app/link";
 import { dataSource } from "../data/source";
 import { formatCount } from "../domain/format";
 import type { IncidentVM } from "../domain/types";
-import { Badge, EmptyState, Panel, Stat } from "../ui/primitives";
+import { Badge, EmptyState, Ident, Panel, Stat } from "../ui/primitives";
 
 interface Node {
   id: string;
@@ -132,9 +132,18 @@ export function TopologyPage() {
             <EmptyState title="没有拓扑数据" detail="接入控制面后这里会显示声明的依赖图。" />
           </Panel>
         ) : (
-          <div className="topo" role="img" aria-label="服务依赖图">
-            {/* biome-ignore lint/a11y/noSvgWithoutTitle: the wrapper carries the accessible name; the SVG is presentational */}
-            <svg className="topo__svg" viewBox="0 0 1000 520" preserveAspectRatio="none">
+          <div className="topo">
+            {/* The SVG is the picture; the node buttons below are real
+                controls. They must not sit inside a `role="img"` container —
+                that hides them from assistive technology entirely. */}
+            <svg
+              className="topo__svg"
+              viewBox="0 0 1000 520"
+              preserveAspectRatio="none"
+              role="img"
+              aria-label="服务依赖图"
+            >
+              <title>服务依赖图</title>
               {visible.edges.map(([from, to]) => {
                 const a = nodeMap.get(from);
                 const b = nodeMap.get(to);
@@ -201,12 +210,20 @@ export function TopologyPage() {
                 {services.map((s) => {
                   const incs = incidentsByService.get(serviceKey(s)) ?? [];
                   return (
-                    <tr
-                      key={s}
-                      className="is-clickable"
-                      onClick={() => setFocus(focus === s ? null : s)}
-                    >
-                      <td className="cell-primary mono">{s}</td>
+                    <tr key={s} className="is-clickable">
+                      <td className="cell-primary mono">
+                        {/* Focus (not navigation) is the row's action, so the
+                          service name is a real button: the keyboard reaches
+                          it, and it announces what pressing it does. */}
+                        <button
+                          type="button"
+                          className="mono linklike"
+                          aria-pressed={focus === s}
+                          onClick={() => setFocus(focus === s ? null : s)}
+                        >
+                          {s}
+                        </button>
+                      </td>
                       <td className="cell-num">
                         {graph.edges.filter(([f]) => f === s).length}
                       </td>
@@ -220,17 +237,13 @@ export function TopologyPage() {
                           <div className="row" style={{ gap: 4 }}>
                             <Badge tone="accent">{formatCount(incs.length)}</Badge>
                             {incs[0] && (
-                              <button
-                                type="button"
-                                className="mono"
-                                style={{ color: "var(--accent-strong)" }}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  navigate(`/incidents/${incs[0]!.id}`);
-                                }}
+                              <Link
+                                to={`/incidents/${incs[0].id}`}
+                                className="mono linklike"
+                                onClick={(e) => e.stopPropagation()}
                               >
                                 打开
-                              </button>
+                              </Link>
                             )}
                           </div>
                         )}
@@ -247,9 +260,9 @@ export function TopologyPage() {
           {focus ? (
             <div className="stack">
               <div className="row">
-                <span className="mono" style={{ color: "var(--text-primary)" }}>
+                <Ident className="mono" style={{ color: "var(--text-primary)" }}>
                   {focus}
-                </span>
+                </Ident>
                 <Badge tone="accent">聚焦中</Badge>
               </div>
               <div className="notes">
@@ -258,9 +271,9 @@ export function TopologyPage() {
                   .map(([f, t]) => (
                     <div className="note" key={`${f}->${t}`}>
                       <span className="note__bullet" />
-                      <span className="mono">
+                      <Ident className="mono">
                         {f} → {t}
-                      </span>
+                      </Ident>
                     </div>
                   ))}
               </div>

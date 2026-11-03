@@ -9,8 +9,9 @@
  *   missing_data — we could not look (a gap in the tooling)
  *   no_data      — we looked and found nothing (this can support a REFUTED)
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArrowRight, Check, External, X } from "../app/icons";
+import { Link } from "../app/link";
 import { dataSource, type EvidenceDetailVM } from "../data/source";
 import {
   evidenceTypeLabel,
@@ -25,13 +26,14 @@ import {
   WAITING_ON_LABELS,
 } from "../domain/format";
 import type { IncidentVM, ReportVM, RunVM } from "../domain/types";
+import { useEscape, useFocusTrap } from "../ui/overlay";
 import {
   Badge,
-  Button,
   Copyable,
   EmptyState,
   ErrorState,
   Hash,
+  Ident,
   JsonViewer,
   KeyValue,
   Meter,
@@ -40,6 +42,7 @@ import {
   StageBadge,
   VerdictBadge,
 } from "../ui/primitives";
+import { IncidentActions } from "./incident-actions";
 
 export function IncidentPage({
   incidentId,
@@ -166,23 +169,17 @@ export function IncidentPage({
               />
             )}
             <Badge>{incident.origin}</Badge>
-            <span className="mono faint" style={{ fontSize: "var(--text-xs)" }}>
+            <Ident className="mono faint" style={{ fontSize: "var(--text-xs)" }}>
               {incident.id}
-            </span>
+            </Ident>
           </div>
           <h1 className="wb-title">{incident.title}</h1>
           <p className="wb-sub">
-            <span className="mono">{incident.service}</span>
+            <Ident className="mono">{incident.service}</Ident>
             {stage?.detail ? ` · ${stage.detail}` : ""}
           </p>
         </div>
-        <div className="wb-actions">
-          <Button size="sm">指派</Button>
-          <Button size="sm">确认</Button>
-          <Button size="sm" variant="primary">
-            流转
-          </Button>
-        </div>
+        <IncidentActions incident={incident} onUpdated={(next) => setIncident(next)} />
       </div>
 
       <div className="stat-row" style={{ marginBottom: "var(--space-5)" }}>
@@ -423,7 +420,7 @@ export function IncidentPage({
                   </div>
                   {focusRun && (
                     <div className="section__note">
-                      这是运行 <span className="mono">{run.runId}</span> 的完整步骤。
+                      这是运行 <Ident className="mono">{run.runId}</Ident> 的完整步骤。
                     </div>
                   )}
                 </>
@@ -445,7 +442,7 @@ export function IncidentPage({
             <Panel>
               <KeyValue
                 items={[
-                  { label: "服务", value: <span className="mono">{incident.service}</span> },
+                  { label: "服务", value: <Ident className="mono">{incident.service}</Ident> },
                   { label: "状态", value: incident.status },
                   { label: "来源", value: incident.origin },
                   {
@@ -472,13 +469,14 @@ export function IncidentPage({
                   {
                     label: "运行",
                     value: incident.currentRunId ? (
-                      <a
-                        href={`/incidents/${incident.id}/runs/${incident.currentRunId}`}
+                      <Link
+                        to={`/incidents/${incident.id}/runs/${incident.currentRunId}`}
                         className="mono"
                         style={{ color: "var(--accent-strong)" }}
+                        translate="no"
                       >
                         {incident.currentRunId}
-                      </a>
+                      </Link>
                     ) : (
                       "—"
                     ),
@@ -653,6 +651,15 @@ function EvidenceDrawer({
   evidence: EvidenceDetailVM;
   onClose: () => void;
 }) {
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  // The drawer is a modal surface: the page behind it must not be reachable
+  // by Tab, and closing it must put the keyboard back on the button that
+  // opened it. Without this, an operator who opened the drawer with the
+  // keyboard ends up tabbing through the whole workbench behind it.
+  useFocusTrap(panelRef, true);
+  useEscape(true, onClose);
+
   return (
     <>
       {/* A real button: the backdrop is clickable, so it needs to be focusable
@@ -663,7 +670,14 @@ function EvidenceDrawer({
         aria-label="关闭证据详情"
         onClick={onClose}
       />
-      <aside className="drawer" role="dialog" aria-label="证据详情">
+      <aside
+        className="drawer"
+        role="dialog"
+        aria-modal="true"
+        aria-label="证据详情"
+        ref={panelRef}
+        tabIndex={-1}
+      >
         <header className="drawer__head">
           <span className="drawer__title">
             {evidenceTypeLabel(evidence.evidenceType)} · {evidence.serviceId ?? "—"}
@@ -674,8 +688,9 @@ function EvidenceDrawer({
               className="ghost-btn"
               href={evidence.sourceLink}
               target="_blank"
-              rel="noreferrer"
+              rel="noopener noreferrer"
               title="打开源链接"
+              aria-label="在新标签页打开源链接"
             >
               <External size={14} />
             </a>

@@ -1,10 +1,11 @@
 /**
  * Application shell: rail, topbar, command palette, theme & density controls.
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { dataSource } from "../data/source";
 import { LANE_LABELS } from "../domain/format";
 import type { IncidentVM } from "../domain/types";
+import { useFocusTrap } from "../ui/overlay";
 import {
   Activity,
   AlertTriangle,
@@ -16,6 +17,7 @@ import {
   Search,
   Sun,
 } from "./icons";
+import { Link } from "./link";
 
 /* ── theme ──────────────────────────────────────────────────────────────── */
 
@@ -87,15 +89,7 @@ export interface NavEntry {
   match?: (path: string) => boolean;
 }
 
-export function Rail({
-  path,
-  incidents,
-  onNavigate,
-}: {
-  path: string;
-  incidents: IncidentVM[];
-  onNavigate: (to: string) => void;
-}) {
+export function Rail({ path, incidents }: { path: string; incidents: IncidentVM[] }) {
   const pending = incidents.filter((i) => i.stage?.lane === "waiting-person").length;
   const active = incidents.filter((i) => i.stage?.lane === "active").length;
 
@@ -177,12 +171,14 @@ export function Rail({
               const Icon = item.icon;
               const isActive = item.match ? item.match(path) : path === item.to;
               const count = item.to === "/incidents" && active > 0 ? active : item.count;
+              // A real anchor, not a button: the browser then gives the
+              // operator middle-click, Cmd/Ctrl-click, "copy link address"
+              // and a status-bar preview for free.
               return (
-                <button
+                <Link
                   key={item.to}
-                  type="button"
+                  to={item.to}
                   className={`nav__item${isActive ? " is-active" : ""}`}
-                  onClick={() => onNavigate(item.to)}
                   aria-current={isActive ? "page" : undefined}
                 >
                   <Icon />
@@ -190,7 +186,7 @@ export function Rail({
                   {count !== undefined && count > 0 && (
                     <span className="nav__count">{count}</span>
                   )}
-                </button>
+                </Link>
               );
             })}
           </div>
@@ -226,7 +222,7 @@ export function Topbar({
           <span key={c.to ?? c.label} className="crumbs__item">
             {i > 0 && <span className="crumbs__sep">/</span>}
             {c.to ? (
-              <a href={c.to}>{c.label}</a>
+              <Link to={c.to}>{c.label}</Link>
             ) : (
               <span className="crumbs__here">{c.label}</span>
             )}
@@ -238,7 +234,7 @@ export function Topbar({
         <button type="button" className="search-trigger" onClick={onOpenPalette}>
           <Search />
           <span>搜索</span>
-          <span className="kbd">⌘K</span>
+          <span className="kbd">⌘ K</span>
         </button>
         <div className="topbar__divider" />
         <button
@@ -291,6 +287,11 @@ export function CommandPalette({
 }) {
   const [query, setQuery] = useState("");
   const [cursor, setCursor] = useState(0);
+  const paletteRef = useRef<HTMLDivElement>(null);
+
+  // The palette is modal: the page behind it must not be Tab-reachable, and
+  // closing it must return the keyboard to whatever opened it.
+  useFocusTrap(paletteRef, true, { autoFocus: false });
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -335,7 +336,7 @@ export function CommandPalette({
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="palette">
+      <div className="palette" ref={paletteRef}>
         <div className="palette__input">
           <Search />
           <input
@@ -344,6 +345,9 @@ export function CommandPalette({
             // biome-ignore lint/a11y/noAutofocus: focus belongs here on open
             autoFocus
             value={query}
+            name="command-palette-query"
+            autoComplete="off"
+            spellCheck={false}
             placeholder="搜索命令、事故、服务…"
             onChange={(e) => {
               setQuery(e.target.value);
