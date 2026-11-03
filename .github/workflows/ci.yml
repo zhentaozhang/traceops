@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: agent-runtime/pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "agent-runtime[test,datasets]"
+      - name: Test
+        # evaluation/ 与 contracts/ 不是安装包，靠仓库根目录 + PYTHONPATH 导入。
+        env:
+          PYTHONPATH: agent-runtime
+        run: pytest agent-runtime/tests evaluation contracts -q
+
+  java:
+    name: Java 21
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: control-plane
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      # 注意：不要传 -s .mvn/settings.xml —— 那是本机网络适配（镜像 + 工作区内仓库），
+      # CI 直接用默认的 Maven Central 与 ~/.m2 即可。
+      - name: Test
+        run: mvn -B -ntp test

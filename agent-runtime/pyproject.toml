@@ -6,10 +6,17 @@ requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.6",
     "jsonschema>=4.21",
+    # 编排层（orchestration/graph.py）在导入期就依赖这两个包，
+    # 不声明的话 `pip install -e agent-runtime` 装完跑不起来。
+    "langchain-core>=1.0",
+    "langgraph>=1.0",
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
+test = ["pytest>=8", "referencing>=0.30"]
+# RCAEval parquet 导入器用惰性导入的可选 pyarrow（见 evaluation/importers/rcaeval.py 文档字符串）。
+# 不装也能跑，但导入器那 10 条测试会被跳过 —— CI 装它，让真实数据那条路长期有人看着。
+datasets = ["pyarrow>=15"]
 
 [build-system]
 requires = ["setuptools>=68"]
