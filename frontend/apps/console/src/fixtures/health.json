@@ -1,0 +1,48 @@
+{
+  "checkedAt": "2026-03-12T14:41:02Z",
+  "components": [
+    {
+      "name": "control-plane",
+      "status": "UP",
+      "detail": "http 200 · 12ms",
+      "claimedButSilent": false
+    },
+    {
+      "name": "redis",
+      "status": "UP",
+      "detail": "outbox lag 2 · 消费组 1",
+      "claimedButSilent": false
+    },
+    {
+      "name": "investigation-worker",
+      "status": "DEGRADED",
+      "detail": "worker-2 领取 run-c41d77 已 312s 无心跳",
+      "claimedButSilent": true
+    },
+    {
+      "name": "evidence-store",
+      "status": "UP",
+      "detail": "sqlite · 1482 条证据 · 41 次读取降级",
+      "claimedButSilent": false
+    },
+    {
+      "name": "trace-backend",
+      "status": "DOWN",
+      "detail": "连接被重置 · 4 个窗口查询失败",
+      "claimedButSilent": false
+    }
+  ],
+  "funnel": {
+    "since": "2026-03-12T12:00:00Z",
+    "checkedAt": "2026-03-12T14:41:02Z",
+    "alertsSeen": 48,
+    "alertIncidents": 7,
+    "manualIncidents": 2,
+    "foldedDuplicates": 39,
+    "runsRequested": 9,
+    "runsCompleted": 6,
+    "runsFailed": 1,
+    "runsWithoutResult": 1,
+    "needsHumanReview": 2
+  }
+}

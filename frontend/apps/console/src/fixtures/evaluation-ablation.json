@@ -1,0 +1,337 @@
+{
+  "model": null,
+  "scenarios": [
+    "F-000",
+    "F-001",
+    "F-002",
+    "F-003",
+    "F-004",
+    "F-005",
+    "F-006",
+    "F-007",
+    "F-008",
+    "F-009",
+    "F-010",
+    "F-011"
+  ],
+  "runnable_arms": [
+    "E3",
+    "E4",
+    "E5"
+  ],
+  "arms": {
+    "E1": {
+      "digest": "1e4c2d4d8d51e21c1deb2d5d84320674"
+    },
+    "E2": {
+      "digest": "5deba5ec0ff228a5075d8565db44f828"
+    },
+    "E3": {
+      "digest": "5020fdf0c40b5522e60a7d54f16c8ac4"
+    },
+    "E4": {
+      "digest": "1b507b2b5108f294d93d9e704616b880"
+    },
+    "E5": {
+      "digest": "98e1802a37c6eb3e368776118f61a239"
+    }
+  },
+  "results": {
+    "E1": [],
+    "E2": [],
+    "E3": [
+      {
+        "scenario_id": "F-000",
+        "ac1": false,
+        "fault1": false,
+        "diagnosis_correct": true,
+        "abstained": true,
+        "ranked": null
+      },
+      {
+        "scenario_id": "F-001",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-002",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-003",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-004",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-005",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-006",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-007",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-008",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-009",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-010",
+        "ac1": false,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 2
+      },
+      {
+        "scenario_id": "F-011",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      }
+    ],
+    "E4": [
+      {
+        "scenario_id": "F-000",
+        "ac1": false,
+        "fault1": false,
+        "diagnosis_correct": true,
+        "abstained": true,
+        "ranked": null
+      },
+      {
+        "scenario_id": "F-001",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-002",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-003",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-004",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-005",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-006",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-007",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-008",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-009",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-010",
+        "ac1": false,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 2
+      },
+      {
+        "scenario_id": "F-011",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      }
+    ],
+    "E5": [
+      {
+        "scenario_id": "F-000",
+        "ac1": false,
+        "fault1": false,
+        "diagnosis_correct": true,
+        "abstained": true,
+        "ranked": null
+      },
+      {
+        "scenario_id": "F-001",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-002",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-003",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-004",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-005",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-006",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-007",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-008",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-009",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      },
+      {
+        "scenario_id": "F-010",
+        "ac1": false,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 2
+      },
+      {
+        "scenario_id": "F-011",
+        "ac1": true,
+        "fault1": true,
+        "diagnosis_correct": true,
+        "abstained": false,
+        "ranked": 1
+      }
+    ]
+  }
+}

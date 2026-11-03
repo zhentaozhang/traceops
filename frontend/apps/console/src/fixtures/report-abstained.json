@@ -1,0 +1,491 @@
+{
+  "investigation_run_id": "run-demo-1",
+  "diagnosis_status": "INCONCLUSIVE",
+  "summary": "Abstained: evidence collected was insufficient to rank any candidate above the abstention threshold. Returning a guess here would be a fabricated answer.",
+  "hypotheses": [
+    {
+      "id": "h-2354e36a-8e57-4881-ab26-7846dfddc50b",
+      "investigation_run_id": "run-demo-1",
+      "candidate_service": "redis",
+      "candidate_component": "redis-connection-pool",
+      "fault_type": "pool_exhaustion",
+      "failure_mechanism": "error reported by payment-service: dependency redis failing",
+      "predicted_observations": [
+        "error_rate_rise",
+        "error_logs",
+        "slow_span"
+      ],
+      "status": "inconclusive",
+      "rank": null
+    },
+    {
+      "id": "h-ad391ba4-3305-4799-be81-0e8316eb9296",
+      "investigation_run_id": "run-demo-1",
+      "candidate_service": "redis",
+      "candidate_component": null,
+      "fault_type": "latency_degradation",
+      "failure_mechanism": "slow span on redis observed by payment-service",
+      "predicted_observations": [
+        "slow_span"
+      ],
+      "status": "inconclusive",
+      "rank": null
+    },
+    {
+      "id": "h-2a6dd7b3-9524-492a-b061-b0a01bc5e91b",
+      "investigation_run_id": "run-demo-1",
+      "candidate_service": "checkout-service",
+      "candidate_component": null,
+      "fault_type": "availability_degradation",
+      "failure_mechanism": "error rate crossed baseline threshold",
+      "predicted_observations": [
+        "error_rate_rise",
+        "error_logs"
+      ],
+      "status": "inconclusive",
+      "rank": null
+    }
+  ],
+  "hypothesis_evidence": [
+    {
+      "hypothesis_id": "h-2a6dd7b3-9524-492a-b061-b0a01bc5e91b",
+      "evidence_id": "e-9310bce3-1110-4c1e-8be1-7b196d8df1e1",
+      "relation_type": "SUPPORTS",
+      "reason": "metric evidence about checkout-service (reported by checkout-service)",
+      "created_by": "rule",
+      "created_at": "2026-11-01T15:28:43.299858Z"
+    },
+    {
+      "hypothesis_id": "h-2354e36a-8e57-4881-ab26-7846dfddc50b",
+      "evidence_id": "e-f95eddf0-7a8a-407e-837a-181ee1a5f112",
+      "relation_type": "SUPPORTS",
+      "reason": "log evidence about redis (reported by payment-service)",
+      "created_by": "rule",
+      "created_at": "2026-11-01T15:28:43.299877Z"
+    },
+    {
+      "hypothesis_id": "h-2354e36a-8e57-4881-ab26-7846dfddc50b",
+      "evidence_id": "e-c85c66cf-95e1-4be4-aa04-04f28b1dc585",
+      "relation_type": "SUPPORTS",
+      "reason": "trace evidence about redis (reported by payment-service)",
+      "created_by": "rule",
+      "created_at": "2026-11-01T15:28:43.299882Z"
+    },
+    {
+      "hypothesis_id": "h-ad391ba4-3305-4799-be81-0e8316eb9296",
+      "evidence_id": "e-f95eddf0-7a8a-407e-837a-181ee1a5f112",
+      "relation_type": "SUPPORTS",
+      "reason": "log evidence about redis (reported by payment-service)",
+      "created_by": "rule",
+      "created_at": "2026-11-01T15:28:43.299888Z"
+    },
+    {
+      "hypothesis_id": "h-ad391ba4-3305-4799-be81-0e8316eb9296",
+      "evidence_id": "e-c85c66cf-95e1-4be4-aa04-04f28b1dc585",
+      "relation_type": "SUPPORTS",
+      "reason": "trace evidence about redis (reported by payment-service)",
+      "created_by": "rule",
+      "created_at": "2026-11-01T15:28:43.299897Z"
+    }
+  ],
+  "evidence": [
+    {
+      "id": "e-9310bce3-1110-4c1e-8be1-7b196d8df1e1",
+      "incident_id": "inc-demo-1",
+      "investigation_run_id": "run-demo-1",
+      "evidence_type": "metric",
+      "source_id": "prometheus",
+      "service_id": "checkout-service",
+      "observed_at": "2026-03-12T14:32:00Z",
+      "window_start": "2026-03-12T14:22:00Z",
+      "window_end": "2026-03-12T14:37:00Z",
+      "collected_at": "2026-11-01T15:28:43.298637Z",
+      "query_template_id": "qt-error-rate-v1",
+      "query_params": {
+        "service": "checkout-service",
+        "start": "2026-03-12T14:22:00+00:00",
+        "end": "2026-03-12T14:37:00+00:00",
+        "_tier": "investigation"
+      },
+      "rendered_query": "sum(rate(http_requests_total{service=\"checkout-service\",status=~\"5..\"}[1m])) / clamp_min(sum(rate(http_requests_total{service=\"checkout-service\"}[1m])), 0.000001)",
+      "normalized_data": {
+        "kind": "metric",
+        "result_type": "matrix",
+        "series": [
+          {
+            "metric": {
+              "service": "checkout-service"
+            },
+            "values": [
+              [
+                1773325560,
+                0.001
+              ],
+              [
+                1773325620,
+                0.001
+              ],
+              [
+                1773325680,
+                0.002
+              ],
+              [
+                1773325740,
+                0.004
+              ],
+              [
+                1773325800,
+                0.06
+              ],
+              [
+                1773325860,
+                0.42
+              ],
+              [
+                1773325920,
+                0.4
+              ]
+            ]
+          }
+        ],
+        "result_count": 1,
+        "total_records": 1,
+        "truncated": false
+      },
+      "raw_snapshot_ref": null,
+      "trace_id": null,
+      "span_id": null,
+      "source_link": null,
+      "checksum": "2f5c19b7992547beafbaa9678b52a01181605a551177e1aec50cf10135410e26",
+      "schema_version": "1.0"
+    },
+    {
+      "id": "e-28516be2-f169-4008-8925-1832d2353f60",
+      "incident_id": "inc-demo-1",
+      "investigation_run_id": "run-demo-1",
+      "evidence_type": "metric",
+      "source_id": "prometheus",
+      "service_id": "payment-service",
+      "observed_at": "2026-03-12T14:32:00Z",
+      "window_start": "2026-03-12T14:22:00Z",
+      "window_end": "2026-03-12T14:37:00Z",
+      "collected_at": "2026-11-01T15:28:43.298874Z",
+      "query_template_id": "qt-error-rate-v1",
+      "query_params": {
+        "service": "payment-service",
+        "start": "2026-03-12T14:22:00+00:00",
+        "end": "2026-03-12T14:37:00+00:00",
+        "_tier": "investigation"
+      },
+      "rendered_query": "sum(rate(http_requests_total{service=\"payment-service\",status=~\"5..\"}[1m])) / clamp_min(sum(rate(http_requests_total{service=\"payment-service\"}[1m])), 0.000001)",
+      "normalized_data": {
+        "kind": "metric",
+        "result_type": "matrix",
+        "series": [
+          {
+            "metric": {
+              "service": "payment-service"
+            },
+            "values": [
+              [
+                1773325560,
+                0.002
+              ],
+              [
+                1773325620,
+                0.002
+              ],
+              [
+                1773325680,
+                0.003
+              ],
+              [
+                1773325740,
+                0.003
+              ],
+              [
+                1773325800,
+                0.01
+              ],
+              [
+                1773325860,
+                0.02
+              ],
+              [
+                1773325920,
+                0.02
+              ]
+            ]
+          }
+        ],
+        "result_count": 1,
+        "total_records": 1,
+        "truncated": false
+      },
+      "raw_snapshot_ref": null,
+      "trace_id": null,
+      "span_id": null,
+      "source_link": null,
+      "checksum": "1d992ef4a10fc6c33cda758cf25362dd32a1e919e497b4c724a1dd1508c4fa98",
+      "schema_version": "1.0"
+    },
+    {
+      "id": "e-f95eddf0-7a8a-407e-837a-181ee1a5f112",
+      "incident_id": "inc-demo-1",
+      "investigation_run_id": "run-demo-1",
+      "evidence_type": "log",
+      "source_id": "loki",
+      "service_id": "payment-service",
+      "observed_at": "2026-03-12T14:32:00Z",
+      "window_start": "2026-03-12T14:22:00Z",
+      "window_end": "2026-03-12T14:37:00Z",
+      "collected_at": "2026-11-01T15:28:43.298963Z",
+      "query_template_id": "qt-error-logs-v1",
+      "query_params": {
+        "service": "payment-service",
+        "start": "2026-03-12T14:22:00+00:00",
+        "end": "2026-03-12T14:37:00+00:00",
+        "_tier": "investigation"
+      },
+      "rendered_query": "{service=\"payment-service\",level=\"error\"}",
+      "normalized_data": {
+        "kind": "log",
+        "records": [
+          {
+            "timestamp": "2026-03-12T14:32:00+00:00",
+            "message": "ERROR redis: could not get a resource from the pool (waited 3000ms)",
+            "labels": {
+              "service": "payment-service",
+              "level": "error"
+            },
+            "trace_id": null,
+            "span_id": null
+          },
+          {
+            "timestamp": "2026-03-12T14:32:01+00:00",
+            "message": "ERROR redis: connection pool exhausted (active=20 idle=0 max=20)",
+            "labels": {
+              "service": "payment-service",
+              "level": "error"
+            },
+            "trace_id": null,
+            "span_id": null
+          },
+          {
+            "timestamp": "2026-03-12T14:32:02+00:00",
+            "message": "WARN payment: charge request timed out after 3000ms",
+            "labels": {
+              "service": "payment-service",
+              "level": "error"
+            },
+            "trace_id": null,
+            "span_id": null
+          }
+        ],
+        "total_records": 3,
+        "truncated": false
+      },
+      "raw_snapshot_ref": null,
+      "trace_id": null,
+      "span_id": null,
+      "source_link": null,
+      "checksum": "d02cf1361aa0b90d3705473e4c069ba560686ce459b909f01d51f7cb458f4dd7",
+      "schema_version": "1.0"
+    },
+    {
+      "id": "e-c85c66cf-95e1-4be4-aa04-04f28b1dc585",
+      "incident_id": "inc-demo-1",
+      "investigation_run_id": "run-demo-1",
+      "evidence_type": "trace",
+      "source_id": "tempo",
+      "service_id": "payment-service",
+      "observed_at": "2026-03-12T14:32:00Z",
+      "window_start": "2026-03-12T14:22:00Z",
+      "window_end": "2026-03-12T14:37:00Z",
+      "collected_at": "2026-11-01T15:28:43.299124Z",
+      "query_template_id": "qt-slow-traces-v1",
+      "query_params": {
+        "service": "payment-service",
+        "start": "2026-03-12T14:22:00+00:00",
+        "end": "2026-03-12T14:37:00+00:00",
+        "_tier": "investigation"
+      },
+      "rendered_query": "{service.name=\"payment-service\"} && duration > 500ms",
+      "normalized_data": {
+        "kind": "trace",
+        "spans": [
+          {
+            "trace_id": "demo0000000000000000000000000001",
+            "span_id": "0000000000000000",
+            "service": "payment-service",
+            "operation_name": "POST /charge",
+            "start_time": 1773325920000000,
+            "duration_us": 940000,
+            "error": false,
+            "tags": {
+              "error": false
+            }
+          },
+          {
+            "trace_id": "demo0000000000000000000000000001",
+            "span_id": "0000000000000001",
+            "service": "payment-service",
+            "operation_name": "redis.command GET",
+            "start_time": 1773325920000000,
+            "duration_us": 3100000,
+            "error": false,
+            "tags": {
+              "error": false
+            }
+          },
+          {
+            "trace_id": "demo0000000000000000000000000001",
+            "span_id": "0000000000000002",
+            "service": "payment-service",
+            "operation_name": "redis.command SETEX",
+            "start_time": 1773325920000000,
+            "duration_us": 2880000,
+            "error": false,
+            "tags": {
+              "error": false
+            }
+          }
+        ],
+        "total_records": 3,
+        "truncated": false
+      },
+      "raw_snapshot_ref": null,
+      "trace_id": "demo0000000000000000000000000001",
+      "span_id": "0000000000000000",
+      "source_link": null,
+      "checksum": "0ab3453d887b4219a45ebeb1912fe2f858e13da2b34ec0c1c39474f8819d4f1c",
+      "schema_version": "1.0"
+    },
+    {
+      "id": "e-16fc78a4-297f-45cd-a670-51b927cc097f",
+      "incident_id": "inc-demo-1",
+      "investigation_run_id": "run-demo-1",
+      "evidence_type": "event",
+      "source_id": "control-plane",
+      "service_id": null,
+      "observed_at": "2026-03-12T14:29:00Z",
+      "window_start": "2026-03-12T14:29:00Z",
+      "window_end": "2026-03-12T14:29:00Z",
+      "collected_at": "2026-11-01T15:28:43.299279Z",
+      "query_template_id": "qt-deployment-v1",
+      "query_params": {
+        "_tier": "investigation"
+      },
+      "rendered_query": null,
+      "normalized_data": {
+        "kind": "event",
+        "events": [
+          {
+            "event": {
+              "changed_at": "2026-03-12T14:29:00+00:00",
+              "change_kind": "deployment",
+              "service": "payment-service",
+              "revision": "v2.31.0",
+              "summary": "payment-service v2.31.0: redis pool size 50 -> 20",
+              "type": "deployment"
+            },
+            "timestamp": null
+          }
+        ],
+        "total_records": 1,
+        "truncated": false
+      },
+      "raw_snapshot_ref": null,
+      "trace_id": null,
+      "span_id": null,
+      "source_link": null,
+      "checksum": "20c0d3c6c40a945e07508067a20481b262d80bb55190f6ed3e2c5e9567dba03f",
+      "schema_version": "1.0"
+    }
+  ],
+  "affected_services": [
+    "checkout-service",
+    "payment-service"
+  ],
+  "propagation_chain": [],
+  "missing_data": [
+    "trace backend unreachable for 4 of 5 windows (connection reset)",
+    "declared edges were not exercised in this window (not evidence that they are down): checkout-service→payment-service, checkout-service→redis"
+  ],
+  "no_data": [
+    "query_service_logs[checkout-service]: query succeeded but returned no data",
+    "query_service_traces[checkout-service]: query succeeded but returned no data",
+    "query_service_error_rate[redis]: query succeeded but returned no data",
+    "query_service_logs[redis]: query succeeded but returned no data",
+    "query_service_traces[redis]: query succeeded but returned no data"
+  ],
+  "abstained": true,
+  "root_cause_time": "2026-03-12T14:32:00Z",
+  "profile_digest": null,
+  "shadow_decisions": [],
+  "rejected_proposals": [
+    {
+      "reason_code": "INSUFFICIENT_EVIDENCE",
+      "proposal": "redis / redis-connection-pool / pool_exhaustion",
+      "detail": "supported by 1 of 2 required independent evidence items"
+    }
+  ],
+  "strategy_digest": "8181060597944442",
+  "run_snapshot": {
+    "scope_depth": 1,
+    "topology_digest": "f7677d035b227d35",
+    "prompt_version": null,
+    "prompt_parts": [],
+    "datasource_health": [],
+    "config_version": null,
+    "alert_summary_present": true,
+    "retry_of": null,
+    "known_unavailable": [],
+    "failed_sources": [],
+    "strategy_change": null,
+    "budget": {
+      "max_tool_calls": 40,
+      "max_rounds": 10,
+      "max_tokens": 100000,
+      "deadline_seconds": 900
+    }
+  },
+  "priors": [],
+  "topology_drift": {
+    "declared_edges": [
+      [
+        "checkout-service",
+        "payment-service"
+      ],
+      [
+        "checkout-service",
+        "redis"
+      ],
+      [
+        "payment-service",
+        "redis"
+      ]
+    ],
+    "observed_edges": [
+      [
+        "payment-service",
+        "redis"
+      ]
+    ],
+    "undeclared_edges": [],
+    "unobserved_declared_edges": [
+      [
+        "checkout-service",
+        "payment-service"
+      ],
+      [
+        "checkout-service",
+        "redis"
+      ]
+    ],
+    "has_drift": false
+  },
+  "cache_hits": [],
+  "degraded_reads": [],
+  "generated_at": "2026-11-01T15:28:43.301480Z"
+}

@@ -1,0 +1,135 @@
+{
+  "run-demo-1": {
+    "runId": "run-demo-1",
+    "startedAt": "2026-03-12T14:31:14Z",
+    "finishedAt": "2026-03-12T14:40:22Z",
+    "steps": [
+      {
+        "stepIndex": 0,
+        "node": "plan",
+        "description": "确定调查范围：checkout-service 上游 1 跳",
+        "evidenceCount": 0,
+        "at": "2026-03-12T14:31:14Z"
+      },
+      {
+        "stepIndex": 1,
+        "node": "collect",
+        "description": "指标 · checkout-service 错误率 / 延迟",
+        "evidenceCount": 2,
+        "at": "2026-03-12T14:31:52Z"
+      },
+      {
+        "stepIndex": 2,
+        "node": "collect",
+        "description": "日志 · checkout-service、payment-service",
+        "evidenceCount": 3,
+        "at": "2026-03-12T14:32:41Z"
+      },
+      {
+        "stepIndex": 3,
+        "node": "collect",
+        "description": "追踪 · payment-service 最慢 span",
+        "evidenceCount": 5,
+        "at": "2026-03-12T14:33:20Z"
+      },
+      {
+        "stepIndex": 4,
+        "node": "hypothesize",
+        "description": "生成 3 个候选：redis 连接池 / 支付网关超时 / 线程饥饿",
+        "evidenceCount": 5,
+        "at": "2026-03-12T14:34:05Z"
+      },
+      {
+        "stepIndex": 5,
+        "node": "verify",
+        "description": "验证 redis / redis-connection-pool：2 条独立证据支持",
+        "evidenceCount": 5,
+        "at": "2026-03-12T14:35:31Z"
+      },
+      {
+        "stepIndex": 6,
+        "node": "rank",
+        "description": "排序并检查覆盖：候选池 3，第一名 1 条反驳证据 → 保留",
+        "evidenceCount": 5,
+        "at": "2026-03-12T14:36:48Z"
+      },
+      {
+        "stepIndex": 7,
+        "node": "report",
+        "description": "生成报告：SUPPORTED，引用 5 条证据",
+        "evidenceCount": 5,
+        "at": "2026-03-12T14:40:22Z"
+      }
+    ]
+  },
+  "run-2b9e04": {
+    "runId": "run-2b9e04",
+    "startedAt": "2026-03-12T14:37:02Z",
+    "finishedAt": null,
+    "steps": [
+      {
+        "stepIndex": 0,
+        "node": "plan",
+        "description": "确定调查范围：payment-service 上游 1 跳",
+        "evidenceCount": 0,
+        "at": "2026-03-12T14:37:02Z"
+      },
+      {
+        "stepIndex": 1,
+        "node": "collect",
+        "description": "指标 · payment-service p99 / redis 连接数",
+        "evidenceCount": 2,
+        "at": "2026-03-12T14:37:40Z"
+      },
+      {
+        "stepIndex": 2,
+        "node": "collect",
+        "description": "日志 · payment-service redis 客户端",
+        "evidenceCount": 4,
+        "at": "2026-03-12T14:38:29Z"
+      },
+      {
+        "stepIndex": 3,
+        "node": "collect",
+        "description": "追踪 · redis.command GET 3100ms",
+        "evidenceCount": 6,
+        "at": "2026-03-12T14:39:12Z"
+      },
+      {
+        "stepIndex": 4,
+        "node": "hypothesize",
+        "description": "生成 2 个候选：redis 连接池 / 支付网关限流",
+        "evidenceCount": 6,
+        "at": "2026-03-12T14:40:03Z"
+      },
+      {
+        "stepIndex": 5,
+        "node": "verify",
+        "description": "验证 redis / redis-connection-pool",
+        "evidenceCount": 7,
+        "at": "2026-03-12T14:41:03Z"
+      }
+    ]
+  },
+  "run-1c4a6e": {
+    "runId": "run-1c4a6e",
+    "startedAt": "2026-03-12T14:13:20Z",
+    "finishedAt": null,
+    "steps": [
+      {
+        "stepIndex": 0,
+        "node": "plan",
+        "description": "确定调查范围：checkout-service 上游 1 跳",
+        "evidenceCount": 0,
+        "at": "2026-03-12T14:13:20Z"
+      },
+      {
+        "stepIndex": 1,
+        "node": "collect",
+        "description": "指标 · checkout-service 下单成功率",
+        "evidenceCount": 1,
+        "at": "2026-03-12T14:14:02Z"
+      }
+    ]
+  }
+}
